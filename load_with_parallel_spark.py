@@ -172,21 +172,20 @@ def load_with_parallel_spark(
         # Transform flight data for relationship loading
         print("🔄 Transforming data for relationship loading...")
 
-        # Create schedule DataFrame with temporal properties preserved as ISO strings
-        # Keep datetime objects as native types - Neo4j connector handles DateTime conversion
+        # Convert pandas datetime64[us] to ISO format strings for proper Neo4j DateTime parsing
+        # The Neo4j Spark connector converts datetime64 to epoch microseconds by default
+        # Using ISO format strings ensures Neo4j stores them as native DateTime objects
+        from pyspark.sql.functions import date_format
+        
         flight_df = df.select(
             col("id").alias("schedule_id"),
             col("icao_operator").alias("carrier_code"),
             col("adep").alias("departure_airport"),
             col("ades").alias("arrival_airport"),
-            # Keep as native datetime objects - no conversion to strings!
-            col("dof").alias("date_of_operation"),  # Native datetime → Neo4j DateTime
-            col("first_seen").alias(
-                "first_seen_time"
-            ),  # Native datetime → Neo4j DateTime
-            col("last_seen").alias(
-                "last_seen_time"
-            ),  # Native datetime → Neo4j DateTime
+            # Convert datetime columns to ISO 8601 strings for proper Neo4j DateTime parsing
+            date_format(col("dof"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("date_of_operation"),
+            date_format(col("first_seen"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("first_seen_time"), 
+            date_format(col("last_seen"), "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("last_seen_time"),
             col("unix_time").alias("timestamp"),  # Keep as integer (unix seconds)
             col("flt_id").alias("flight_id"),
             col("registration").alias("aircraft_registration"),

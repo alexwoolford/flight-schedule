@@ -71,3 +71,65 @@ class TestBasicFunctionality:
 
         # Test Python version compatibility
         assert sys.version_info >= (3, 9)
+
+    def test_datetime_types_in_graph(self):
+        """CRITICAL: Test that datetime properties are stored as native DateTime objects, not integers"""
+        try:
+            from neo4j import GraphDatabase
+            from dotenv import load_dotenv
+            import os
+            
+            load_dotenv(override=True)
+            uri = os.getenv('NEO4J_URI')
+            username = os.getenv('NEO4J_USERNAME') 
+            password = os.getenv('NEO4J_PASSWORD')
+            database = os.getenv('NEO4J_DATABASE', 'flights')
+            
+            # Skip test if Neo4j not available (CI without loaded data)
+            if not all([uri, username, password]):
+                pytest.skip("Neo4j credentials not available - skipping datetime type test")
+                
+            driver = GraphDatabase.driver(uri, auth=(username, password))
+            
+            query = '''
+            MATCH (s:Schedule)
+            RETURN 
+              s.date_of_operation,
+              s.first_seen_time,
+              s.last_seen_time
+            LIMIT 1
+            '''
+            
+            with driver.session(database=database) as session:
+                result = session.run(query)
+                record = result.single()
+                
+                if record:
+                    date_val = record["s.date_of_operation"]
+                    first_val = record["s.first_seen_time"] 
+                    last_val = record["s.last_seen_time"]
+                    
+                    # CRITICAL: These should be Neo4j DateTime objects, NOT integers
+                    assert not isinstance(date_val, int), f"date_of_operation should be DateTime, not int: {date_val}"
+                    assert not isinstance(first_val, int), f"first_seen_time should be DateTime, not int: {first_val}"
+                    assert not isinstance(last_val, int), f"last_seen_time should be DateTime, not int: {last_val}"
+                    
+                    # They should be Neo4j DateTime or Python datetime objects
+                    from neo4j.time import DateTime
+                    from datetime import datetime
+                    valid_types = (DateTime, datetime)
+                    
+                    assert isinstance(date_val, valid_types), f"date_of_operation type: {type(date_val)}"
+                    assert isinstance(first_val, valid_types), f"first_seen_time type: {type(first_val)}"
+                    assert isinstance(last_val, valid_types), f"last_seen_time type: {type(last_val)}"
+                else:
+                    pytest.skip("No Schedule nodes found - skipping datetime type test")
+                    
+            driver.close()
+            
+        except Exception as e:
+            # If Neo4j is not available, skip the test
+            if "Cannot resolve address" in str(e) or "Connection refused" in str(e):
+                pytest.skip(f"Neo4j not available - skipping datetime type test: {e}")
+            else:
+                pytest.fail(f"DateTime type test failed: {e}")
