@@ -29,6 +29,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
 
 # Add src to path for imports
 sys.path.insert(0, "src")
@@ -304,6 +305,13 @@ def load_full_dataset(batch_size: int = 10000):
     """Load the complete flight dataset using Neo4j Parallel Spark Loader"""
     print(f"\n⚡ Loading full dataset with Parallel Spark Loader...")
     print("📊 This will process ~23M records → ~7.7M schedules in <1 hour")
+    
+    # Load environment variables for Neo4j connection
+    load_dotenv(override=True)
+    uri = os.getenv("NEO4J_URI")
+    username = os.getenv("NEO4J_USERNAME")
+    password = os.getenv("NEO4J_PASSWORD")
+    database = os.getenv("NEO4J_DATABASE", "flights")
 
     # Check Java version and warn if not optimal
     try:
@@ -339,8 +347,6 @@ def load_full_dataset(batch_size: int = 10000):
 
             # Verify data was loaded by checking node/relationship counts
             try:
-                from neo4j import GraphDatabase
-
                 driver = GraphDatabase.driver(uri, auth=(username, password))
                 with driver.session(database=database) as session:
                     node_result = session.run("MATCH (n) RETURN count(n) as count")
@@ -364,12 +370,6 @@ def load_full_dataset(batch_size: int = 10000):
 
                 driver.close()
             except Exception as e:
-                load_dotenv(override=True)
-                uri = os.getenv("NEO4J_URI")
-                username = os.getenv("NEO4J_USERNAME")
-                password = os.getenv("NEO4J_PASSWORD")
-                database = os.getenv("NEO4J_DATABASE", "flights")
-
                 print(f"⚠️ Could not verify loading: {e}")
                 print("✅ Loading process completed (verification failed)")
                 return True
