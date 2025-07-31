@@ -34,7 +34,7 @@ cp .env.example .env
 ### Option 2: Docker Container
 
 ```bash
-# Build container (includes Java 11 + Python dependencies)
+# Build container (includes Java + Python dependencies)
 docker build -t flight-search .
 
 # Run with Neo4j connection
