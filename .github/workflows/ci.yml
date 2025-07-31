@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Code formatting check (black)
+      run: |
+        black --check --diff .
+    
+    - name: Import sorting check (isort)
+      run: |
+        isort --check-only --diff .
+    
+    - name: Linting (flake8)
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+    
+    - name: Type checking (mypy)
+      run: |
+        mypy --install-types --non-interactive .
+      continue-on-error: true  # Allow to pass for now during migration
+    
+    - name: Security check (bandit)
+      run: |
+        bandit -r . -x tests/ -f json -o bandit-report.json
+        bandit -r . -x tests/ -ll
+      continue-on-error: true
+    
+    - name: Dependency vulnerability check (safety)
+      run: |
+        safety check --json --output safety-report.json
+        safety check
+      continue-on-error: true
+    
+    - name: Run unit tests with coverage
+      run: |
+        pytest tests/ --cov=. --cov-report=xml --cov-report=term-missing
+      env:
+        # Mock environment for tests that don't need real Neo4j
+        NEO4J_URI: bolt://localhost:7687
+        NEO4J_USERNAME: neo4j
+        NEO4J_PASSWORD: test
+        NEO4J_DATABASE: test
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    services:
+      neo4j:
+        image: neo4j:5.11-community
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_dbms_default__database: flights
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Wait for Neo4j to be ready
+      run: |
+        timeout 60 bash -c 'until cypher-shell -u neo4j -p testpassword "RETURN 1"; do sleep 2; done'
+    
+    - name: Run integration tests
+      run: |
+        pytest tests/ -m integration --maxfail=1
+      env:
+        NEO4J_URI: bolt://localhost:7687
+        NEO4J_USERNAME: neo4j
+        NEO4J_PASSWORD: testpassword
+        NEO4J_DATABASE: flights
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build Docker image
+      run: |
+        docker build -t flight-search:${{ github.sha }} .
+      if: always()  # Build even if tests fail, for debugging

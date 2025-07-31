@@ -1,0 +1,45 @@
+# Customer-Specific Data - NEVER COMMIT
+/private_data/
+
+# Data Files (public but large - download separately)
+/data/*.parquet
+/data/*.csv
+/data/*.json
+/data/flight_list/
+
+# Environment & Credentials
+.env
+*.log
+
+# Conda environment (use environment.yml to recreate)
+.conda/
+**/envs/neo4j-flight-schedule/
+
+# Neo4j Server Reports
+neo4j_server_*/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+test_*.py
+quick_*.py

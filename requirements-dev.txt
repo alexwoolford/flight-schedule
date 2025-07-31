@@ -1,0 +1,31 @@
+# Development requirements (if not using conda)
+# For production environments or Docker
+
+# Core dependencies
+neo4j>=5.0.0
+pandas>=1.5.0
+python-dotenv>=0.19.0
+numpy>=1.21.0
+pyarrow>=10.0.0
+requests>=2.28.0
+
+# Spark (requires Java 11+ to be installed separately)
+pyspark>=3.4.0
+py4j>=0.10.9
+neo4j-parallel-spark-loader>=0.5.0
+
+# Development tools
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=22.0.0
+isort>=5.10.0
+flake8>=4.0.0
+flake8-docstrings>=1.6.0
+mypy>=1.0.0
+bandit>=1.7.0
+safety>=2.0.0
+
+# Optional: Jupyter for data exploration
+jupyter>=1.0.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
