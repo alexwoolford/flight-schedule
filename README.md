@@ -119,25 +119,31 @@ MATCH (s1)-[:ARRIVES_AT]->(hub:Airport)
 MATCH (s2:Schedule)-[:DEPARTS_FROM]->(hub)
 MATCH (s2)-[:ARRIVES_AT]->(arr:Airport {code: 'LFMN'})
 
-WHERE date(s1.date_of_operation) = date('2024-06-18')
-  AND date(s2.date_of_operation) = date('2024-06-18')
+WHERE date(datetime({epochmillis: s1.date_of_operation / 1000})) = date('2024-06-18')
+  AND date(datetime({epochmillis: s2.date_of_operation / 1000})) = date('2024-06-18')
   AND hub.code <> 'EGPH' AND hub.code <> 'LFMN'
-  AND s1.first_seen_time.hour >= 9
-  AND s1.first_seen_time.hour <= 13
+  AND datetime({epochmillis: s1.first_seen_time / 1000}).hour >= 9
+  AND datetime({epochmillis: s1.first_seen_time / 1000}).hour <= 13
 
 WITH s1, s2, hub,
-     duration.between(s1.last_seen_time, s2.first_seen_time).minutes AS connection_minutes
+     datetime({epochmillis: s1.last_seen_time / 1000}) AS hub_arrival,
+     datetime({epochmillis: s2.first_seen_time / 1000}) AS hub_departure
+
+WITH s1, s2, hub, hub_arrival, hub_departure,
+     duration.between(hub_arrival, hub_departure).minutes AS connection_minutes
 
 WHERE connection_minutes >= 45 AND connection_minutes <= 300
 
-RETURN hub.code, connection_minutes
-ORDER BY s1.first_seen_time
+RETURN hub.code, connection_minutes,
+       hub_arrival.hour + ':' + CASE WHEN hub_arrival.minute < 10 THEN '0' + toString(hub_arrival.minute) ELSE toString(hub_arrival.minute) END AS arrival_time,
+       hub_departure.hour + ':' + CASE WHEN hub_departure.minute < 10 THEN '0' + toString(hub_departure.minute) ELSE toString(hub_departure.minute) END AS departure_time
+ORDER BY datetime({epochmillis: s1.first_seen_time / 1000})
 LIMIT 8
 ```
 
 **Performance**: 167ms on 19M+ records  
-**Business Logic**: 45-300 minute connection window with native DateTime math  
-**Graph Advantage**: 6-hop traversal + native temporal operations in single query  
+**Business Logic**: 45-300 minute connection window with temporal validation  
+**Graph Advantage**: 6-hop traversal + temporal calculations in single query  
 
 ### Results
 ```
