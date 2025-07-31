@@ -183,42 +183,52 @@ def setup_database():
 def create_constraints():
     """Create database constraints for data integrity and performance"""
     print("\n🔒 Creating database constraints...")
-    
+
     load_dotenv(override=True)
-    
-    uri = os.getenv('NEO4J_URI')
-    username = os.getenv('NEO4J_USERNAME')
-    password = os.getenv('NEO4J_PASSWORD')
-    database = os.getenv('NEO4J_DATABASE', 'flights')
-    
+
+    uri = os.getenv("NEO4J_URI")
+    username = os.getenv("NEO4J_USERNAME")
+    password = os.getenv("NEO4J_PASSWORD")
+    database = os.getenv("NEO4J_DATABASE", "flights")
+
     print(f"📋 Target: {uri} → database '{database}'")
-    
+
     try:
         driver = GraphDatabase.driver(uri, auth=(username, password))
-        
+
         # Read and execute constraint creation queries
-        with open('src/queries/create_constraints.cypher', 'r') as f:
+        with open("src/queries/create_constraints.cypher", "r") as f:
             cypher_content = f.read()
-        
+
         # Split by semicolon and filter out comments/empty strings
-        queries = [q.strip() for q in cypher_content.split(';') 
-                  if q.strip() and not q.strip().startswith('//') and 'CREATE CONSTRAINT' in q.upper()]
-        
+        queries = [
+            q.strip()
+            for q in cypher_content.split(";")
+            if q.strip()
+            and not q.strip().startswith("//")
+            and "CREATE CONSTRAINT" in q.upper()
+        ]
+
         with driver.session(database=database) as session:
             for query in queries:
                 if query.strip():
-                    constraint_name = query.split('IF NOT EXISTS')[0].split()[-1] if 'IF NOT EXISTS' in query else 'constraint'
+                    constraint_name = (
+                        query.split("IF NOT EXISTS")[0].split()[-1]
+                        if "IF NOT EXISTS" in query
+                        else "constraint"
+                    )
                     print(f"  Creating: {constraint_name}")
                     session.run(query)
-        
+
         driver.close()
         print("✅ Constraints created successfully")
         print("💡 Constraints provide implicit indexes for faster MERGE operations")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error creating constraints: {e}")
         return False
+
 
 def create_indexes():
     """Create performance indexes"""
@@ -294,67 +304,81 @@ def load_full_dataset(batch_size: int = 10000):
     """Load the complete flight dataset using Neo4j Parallel Spark Loader"""
     print(f"\n⚡ Loading full dataset with Parallel Spark Loader...")
     print("📊 This will process ~23M records → ~7.7M schedules in <1 hour")
-    
+
     # Check Java version and warn if not optimal
     try:
         import subprocess
-        java_version = subprocess.check_output(['java', '-version'], stderr=subprocess.STDOUT, text=True)
-        if '21.' in java_version and '11.' not in java_version:
+
+        java_version = subprocess.check_output(
+            ["java", "-version"], stderr=subprocess.STDOUT, text=True
+        )
+        if "21." in java_version and "11." not in java_version:
             print("⚠️  JAVA COMPATIBILITY WARNING:")
             print("   Java 21 detected - PySpark works best with Java 11")
             print("   Please switch to Java 11:")
             print("   sdk use java 11.0.28-amzn")
-            
+
             proceed = input("Continue anyway? (y/N): ").strip().lower()
-            if proceed != 'y':
+            if proceed != "y":
                 print("Please switch to Java 11 and try again.")
                 return False
     except Exception:
         print("⚠️  Could not check Java version")
-    
+
     try:
-        print("\n🚀 Using Neo4j Parallel Spark Loader (deadlock-free, production-ready)...")
-        result = subprocess.run([sys.executable, "load_with_parallel_spark.py"], capture_output=False)
-        
+        print(
+            "\n🚀 Using Neo4j Parallel Spark Loader (deadlock-free, production-ready)..."
+        )
+        result = subprocess.run(
+            [sys.executable, "load_with_parallel_spark.py"], capture_output=False
+        )
+
         if result.returncode == 0:
             print("\n✅ Parallel Spark loading completed!")
             print("🔍 Verifying data was actually loaded...")
-            
+
             # Verify data was loaded by checking node/relationship counts
             try:
                 from neo4j import GraphDatabase
+
                 driver = GraphDatabase.driver(uri, auth=(username, password))
                 with driver.session(database=database) as session:
                     node_result = session.run("MATCH (n) RETURN count(n) as count")
-                    node_count = node_result.single()['count']
-                    
-                    rel_result = session.run("MATCH ()-[r]->() RETURN count(r) as count")
-                    rel_count = rel_result.single()['count']
-                    
-                    print(f"📊 Verification: {node_count:,} nodes, {rel_count:,} relationships")
-                    
+                    node_count = node_result.single()["count"]
+
+                    rel_result = session.run(
+                        "MATCH ()-[r]->() RETURN count(r) as count"
+                    )
+                    rel_count = rel_result.single()["count"]
+
+                    print(
+                        f"📊 Verification: {node_count:,} nodes, {rel_count:,} relationships"
+                    )
+
                     if node_count > 0 and rel_count > 0:
                         print("✅ Dataset loaded and verified successfully!")
                         return True
                     else:
                         print("❌ Loading completed but no data found in database!")
                         return False
-                        
+
                 driver.close()
             except Exception as e:
                 load_dotenv(override=True)
-                uri = os.getenv('NEO4J_URI')
-                username = os.getenv('NEO4J_USERNAME') 
-                password = os.getenv('NEO4J_PASSWORD')
-                database = os.getenv('NEO4J_DATABASE', 'flights')
-                
+                uri = os.getenv("NEO4J_URI")
+                username = os.getenv("NEO4J_USERNAME")
+                password = os.getenv("NEO4J_PASSWORD")
+                database = os.getenv("NEO4J_DATABASE", "flights")
+
                 print(f"⚠️ Could not verify loading: {e}")
                 print("✅ Loading process completed (verification failed)")
                 return True
         else:
-            print(f"\n❌ Parallel Spark loading failed (exit code: {result.returncode})")
+            print(
+                f"\n❌ Parallel Spark loading failed (exit code: {result.returncode})"
+            )
             return False
-            
+
     except Exception as e:
         print(f"❌ Error during parallel Spark loading: {e}")
         return False

@@ -21,7 +21,7 @@ except ImportError:
 
 try:
     from neo4j_parallel_spark_loader.bipartite import group_and_batch_spark_dataframe
-    
+
     PARALLEL_LOADER_AVAILABLE = True
 except ImportError:
     PARALLEL_LOADER_AVAILABLE = False
@@ -40,19 +40,24 @@ def create_spark_session(app_name: str = "ParallelFlightLoader"):
         .config("spark.driver.memory", "4g")
         .config("spark.executor.memory", "2g")
         .config("spark.sql.shuffle.partitions", "200")
-        .config("spark.jars.packages", "org.neo4j:neo4j-connector-apache-spark_2.12:4.1.5_for_spark_3")
+        .config(
+            "spark.jars.packages",
+            "org.neo4j:neo4j-connector-apache-spark_2.12:4.1.5_for_spark_3",
+        )
         .getOrCreate()
     )
 
     return spark
 
 
-def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, single_file=None):
+def load_with_parallel_spark(
+    data_path="data/flight_list", batch_size=50000, single_file=None
+):
     """Load flight data using Neo4j Parallel Spark Loader to avoid deadlocks
-    
+
     Args:
         data_path: Path to parquet files directory
-        batch_size: Batch size for processing  
+        batch_size: Batch size for processing
         single_file: Optional - load only this single file for testing
     """
 
@@ -80,14 +85,15 @@ def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, sin
     print("🔒 Creating constraints first (required for fast node creation)...")
     try:
         from neo4j import GraphDatabase
+
         driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
-        
+
         constraints = [
             "CREATE CONSTRAINT schedule_id_unique IF NOT EXISTS FOR (s:Schedule) REQUIRE s.schedule_id IS UNIQUE",
-            "CREATE CONSTRAINT airport_code_unique IF NOT EXISTS FOR (a:Airport) REQUIRE a.code IS UNIQUE", 
-            "CREATE CONSTRAINT carrier_code_unique IF NOT EXISTS FOR (c:Carrier) REQUIRE c.code IS UNIQUE"
+            "CREATE CONSTRAINT airport_code_unique IF NOT EXISTS FOR (a:Airport) REQUIRE a.code IS UNIQUE",
+            "CREATE CONSTRAINT carrier_code_unique IF NOT EXISTS FOR (c:Carrier) REQUIRE c.code IS UNIQUE",
         ]
-        
+
         with driver.session(database=neo4j_database) as session:
             for constraint in constraints:
                 constraint_name = constraint.split()[2]
@@ -99,10 +105,10 @@ def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, sin
                         print(f"   ✅ {constraint_name} (already exists)")
                     else:
                         print(f"   ⚠️  {constraint_name}: {e}")
-        
+
         driver.close()
         print("✅ Constraints ready - will speed up node creation by 3-5x")
-        
+
     except Exception as e:
         print(f"⚠️  Could not create constraints: {e}")
         print("Proceeding without constraints (will be slower)")
@@ -173,16 +179,18 @@ def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, sin
             col("icao_operator").alias("carrier_code"),
             col("adep").alias("departure_airport"),
             col("ades").alias("arrival_airport"),
-            
             # Keep as native datetime objects - no conversion to strings!
-            col("dof").alias("date_of_operation"),          # Native datetime → Neo4j DateTime
-            col("first_seen").alias("first_seen_time"),     # Native datetime → Neo4j DateTime  
-            col("last_seen").alias("last_seen_time"),       # Native datetime → Neo4j DateTime
-            col("unix_time").alias("timestamp"),            # Keep as integer (unix seconds)
-            
+            col("dof").alias("date_of_operation"),  # Native datetime → Neo4j DateTime
+            col("first_seen").alias(
+                "first_seen_time"
+            ),  # Native datetime → Neo4j DateTime
+            col("last_seen").alias(
+                "last_seen_time"
+            ),  # Native datetime → Neo4j DateTime
+            col("unix_time").alias("timestamp"),  # Keep as integer (unix seconds)
             col("flt_id").alias("flight_id"),
             col("registration").alias("aircraft_registration"),
-            col("typecode").alias("aircraft_type")
+            col("typecode").alias("aircraft_type"),
         ).filter(
             col("icao_operator").isNotNull()
             & col("adep").isNotNull()
@@ -199,60 +207,78 @@ def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, sin
 
         # First, create all nodes that relationships will reference
         print("\n📦 Creating nodes first (required for relationships)...")
-        
+
         # 1. Create Schedule nodes with temporal properties
         print("   Creating Schedule nodes with temporal properties...")
         schedule_nodes_df = flight_df.select(
             "schedule_id",
-            "date_of_operation", 
+            "date_of_operation",
             "first_seen_time",
-            "last_seen_time", 
+            "last_seen_time",
             "timestamp",
             "flight_id",
             "aircraft_registration",
-            "aircraft_type"
+            "aircraft_type",
         ).distinct()
-        
-        schedule_nodes_df.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("labels", ":Schedule") \
-            .option("node.keys", "schedule_id") \
-            .mode("append") \
-            .save()
+
+        schedule_nodes_df.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "labels", ":Schedule"
+        ).option(
+            "node.keys", "schedule_id"
+        ).mode(
+            "append"
+        ).save()
         print(f"   ✅ Created Schedule nodes with temporal properties")
-        
-        # 2. Create Airport nodes  
+
+        # 2. Create Airport nodes
         print("   Creating Airport nodes...")
-        departure_airports = flight_df.select(col("departure_airport").alias("code")).distinct()
-        arrival_airports = flight_df.select(col("arrival_airport").alias("code")).distinct()
+        departure_airports = flight_df.select(
+            col("departure_airport").alias("code")
+        ).distinct()
+        arrival_airports = flight_df.select(
+            col("arrival_airport").alias("code")
+        ).distinct()
         all_airports = departure_airports.union(arrival_airports).distinct()
-        
-        all_airports.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("labels", ":Airport") \
-            .option("node.keys", "code") \
-            .mode("append") \
-            .save()
+
+        all_airports.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "labels", ":Airport"
+        ).option(
+            "node.keys", "code"
+        ).mode(
+            "append"
+        ).save()
         print(f"   ✅ Created Airport nodes")
-        
+
         # 3. Create Carrier nodes
         print("   Creating Carrier nodes...")
-        carrier_nodes_df = flight_df.select(col("carrier_code").alias("code")).distinct()
-        carrier_nodes_df.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("labels", ":Carrier") \
-            .option("node.keys", "code") \
-            .mode("append") \
-            .save()
+        carrier_nodes_df = flight_df.select(
+            col("carrier_code").alias("code")
+        ).distinct()
+        carrier_nodes_df.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "labels", ":Carrier"
+        ).option(
+            "node.keys", "code"
+        ).mode(
+            "append"
+        ).save()
         print(f"   ✅ Created Carrier nodes")
 
         # Now create relationships using parallel loader to avoid deadlocks
@@ -261,84 +287,108 @@ def load_with_parallel_spark(data_path="data/flight_list", batch_size=50000, sin
         # 1. DEPARTS_FROM relationships (Schedule -> Airport) - Bipartite scenario
         print("   Processing DEPARTS_FROM relationships...")
         departure_df = flight_df.select("schedule_id", "departure_airport").distinct()
-        
+
         # Group and batch the DataFrame to avoid deadlocks
         grouped_departure_df = group_and_batch_spark_dataframe(
             departure_df,
             source_col="schedule_id",
-            target_col="departure_airport", 
-            num_groups=10
+            target_col="departure_airport",
+            num_groups=10,
         )
-        
+
         # Write DEPARTS_FROM relationships in batches to avoid deadlocks
         print("     Creating Schedule->Airport DEPARTS_FROM relationships...")
-        grouped_departure_df.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("relationship", "DEPARTS_FROM") \
-            .option("relationship.source.labels", ":Schedule") \
-            .option("relationship.source.node.keys", "schedule_id") \
-            .option("relationship.target.labels", ":Airport") \
-            .option("relationship.target.node.keys", "departure_airport:code") \
-            .option("relationship.save.strategy", "keys") \
-            .mode("append") \
-            .save()
+        grouped_departure_df.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "relationship", "DEPARTS_FROM"
+        ).option(
+            "relationship.source.labels", ":Schedule"
+        ).option(
+            "relationship.source.node.keys", "schedule_id"
+        ).option(
+            "relationship.target.labels", ":Airport"
+        ).option(
+            "relationship.target.node.keys", "departure_airport:code"
+        ).option(
+            "relationship.save.strategy", "keys"
+        ).mode(
+            "append"
+        ).save()
         print("     ✅ DEPARTS_FROM relationships created")
 
-        # 2. ARRIVES_AT relationships (Schedule -> Airport) - Bipartite scenario  
+        # 2. ARRIVES_AT relationships (Schedule -> Airport) - Bipartite scenario
         print("   Processing ARRIVES_AT relationships...")
         arrival_df = flight_df.select("schedule_id", "arrival_airport").distinct()
-        
+
         grouped_arrival_df = group_and_batch_spark_dataframe(
             arrival_df,
             source_col="schedule_id",
             target_col="arrival_airport",
-            num_groups=10
+            num_groups=10,
         )
-        
+
         print("     Creating Schedule->Airport ARRIVES_AT relationships...")
-        grouped_arrival_df.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("relationship", "ARRIVES_AT") \
-            .option("relationship.source.labels", ":Schedule") \
-            .option("relationship.source.node.keys", "schedule_id") \
-            .option("relationship.target.labels", ":Airport") \
-            .option("relationship.target.node.keys", "arrival_airport:code") \
-            .option("relationship.save.strategy", "keys") \
-            .mode("append") \
-            .save()
+        grouped_arrival_df.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "relationship", "ARRIVES_AT"
+        ).option(
+            "relationship.source.labels", ":Schedule"
+        ).option(
+            "relationship.source.node.keys", "schedule_id"
+        ).option(
+            "relationship.target.labels", ":Airport"
+        ).option(
+            "relationship.target.node.keys", "arrival_airport:code"
+        ).option(
+            "relationship.save.strategy", "keys"
+        ).mode(
+            "append"
+        ).save()
         print("     ✅ ARRIVES_AT relationships created")
 
         # 3. OPERATED_BY relationships (Schedule -> Carrier) - Bipartite scenario
         print("   Processing OPERATED_BY relationships...")
         carrier_df = flight_df.select("schedule_id", "carrier_code").distinct()
-        
+
         grouped_carrier_df = group_and_batch_spark_dataframe(
             carrier_df,
-            source_col="schedule_id", 
+            source_col="schedule_id",
             target_col="carrier_code",
-            num_groups=10
+            num_groups=10,
         )
-        
+
         print("     Creating Schedule->Carrier OPERATED_BY relationships...")
-        grouped_carrier_df.write.format("org.neo4j.spark.DataSource") \
-            .option("url", neo4j_uri) \
-            .option("authentication.basic.username", neo4j_user) \
-            .option("authentication.basic.password", neo4j_password) \
-            .option("database", neo4j_database) \
-            .option("relationship", "OPERATED_BY") \
-            .option("relationship.source.labels", ":Schedule") \
-            .option("relationship.source.node.keys", "schedule_id") \
-            .option("relationship.target.labels", ":Carrier") \
-            .option("relationship.target.node.keys", "carrier_code:code") \
-            .option("relationship.save.strategy", "keys") \
-            .mode("append") \
-            .save()
+        grouped_carrier_df.write.format("org.neo4j.spark.DataSource").option(
+            "url", neo4j_uri
+        ).option("authentication.basic.username", neo4j_user).option(
+            "authentication.basic.password", neo4j_password
+        ).option(
+            "database", neo4j_database
+        ).option(
+            "relationship", "OPERATED_BY"
+        ).option(
+            "relationship.source.labels", ":Schedule"
+        ).option(
+            "relationship.source.node.keys", "schedule_id"
+        ).option(
+            "relationship.target.labels", ":Carrier"
+        ).option(
+            "relationship.target.node.keys", "carrier_code:code"
+        ).option(
+            "relationship.save.strategy", "keys"
+        ).mode(
+            "append"
+        ).save()
         print("     ✅ OPERATED_BY relationships created")
 
         total_time = time.time() - start_time
@@ -379,7 +429,9 @@ def test_parallel_loader_requirements():
         print("✅ Neo4j Parallel Spark Loader available")
     else:
         print("❌ Neo4j Parallel Spark Loader not available")
-        issues.append("Install parallel loader: pip install neo4j-parallel-spark-loader")
+        issues.append(
+            "Install parallel loader: pip install neo4j-parallel-spark-loader"
+        )
 
     # Test Neo4j configuration
     load_dotenv(override=True)
