@@ -105,7 +105,7 @@ python setup.py --load-full-dataset
 python flight_search_demo.py
 
 # Simple traveler scenarios
-python traveler_flight_search.py
+python flight_search_demo.py
 ```
 
 ## 🔍 Query Performance & Business Logic
@@ -220,12 +220,10 @@ Hooks run automatically on `git commit` and prevent commits with quality issues.
 
 | Script | Purpose |
 |--------|---------|
-| `flight_search_demo.py` | Complete demo with query stats |
-| `traveler_flight_search.py` | Simple traveler scenarios |
+| `flight_search_demo.py` | Complete demo with query stats and business scenarios |
 | `download_schedule_data.py` | Download real flight data |
 | `load_with_parallel_spark.py` | Load data using Spark |
 | `setup.py` | Database setup and orchestration |
-| `clear_database.py` | Database cleanup |
 
 ## 📊 Dataset
 

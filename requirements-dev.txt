@@ -12,7 +12,7 @@ requests>=2.28.0
 # Spark (requires Java 11+ to be installed separately)
 pyspark>=3.4.0
 py4j>=0.10.9
-neo4j-parallel-spark-loader>=0.5.0
+# neo4j-parallel-spark-loader>=0.5.0  # Commented out for CI - install manually when needed
 
 # Development tools
 pytest>=7.0.0

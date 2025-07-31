@@ -31,7 +31,7 @@ RUN mkdir -p data/flight_list
 EXPOSE 8000
 
 # Default command
-CMD ["python", "traveler_flight_search.py"]
+CMD ["python", "flight_search_demo.py"]
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
