@@ -305,7 +305,7 @@ def load_full_dataset(batch_size: int = 10000):
     """Load the complete flight dataset using Neo4j Parallel Spark Loader"""
     print(f"\n⚡ Loading full dataset with Parallel Spark Loader...")
     print("📊 This will process ~23M records → ~7.7M schedules in <1 hour")
-    
+
     # Load environment variables for Neo4j connection
     load_dotenv(override=True)
     uri = os.getenv("NEO4J_URI")
