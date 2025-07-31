@@ -41,5 +41,5 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
-test_*.py
 quick_*.py
+# Note: test files in tests/ directory are included (not ignored)
