@@ -380,7 +380,9 @@ def load_full_dataset(batch_size: int = 10000):
                 print("✅ Loading process completed (verification failed)")
                 return True
         else:
-            print(f"\n❌ Parallel Spark loading failed (exit code: {result.returncode})")
+            print(
+                f"\n❌ Parallel Spark loading failed (exit code: {result.returncode})"
+            )
             return False
 
     except Exception as e:
