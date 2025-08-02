@@ -102,7 +102,9 @@ class BTSFlightDataDownloader:
         for attempt in range(self.max_retries):
             try:
                 # Download the ZIP file with progress bar
-                print(f"   💾 Downloading... (attempt {attempt + 1}/{self.max_retries})")
+                print(
+                    f"   💾 Downloading... (attempt {attempt + 1}/{self.max_retries})"
+                )
                 response = requests.get(url, stream=True, timeout=self.timeout)
                 response.raise_for_status()
 
