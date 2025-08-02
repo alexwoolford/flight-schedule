@@ -1,5 +1,5 @@
 # BTS Flight Data Processing System
-FROM python:3.12.8-slim
+FROM continuumio/miniconda3:latest
 
 # Install system dependencies including Java 11 for Spark
 RUN apt-get update && apt-get install -y \
@@ -14,11 +14,16 @@ ENV PATH=$PATH:$JAVA_HOME/bin
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt ./
+# Copy environment file for conda
+COPY environment.yml ./
 
-# Install Python dependencies (all in requirements.txt for reproducibility)
-RUN pip install --no-cache-dir -r requirements.txt
+# Create conda environment and install dependencies
+RUN conda env create -f environment.yml && \
+    conda clean -afy
+
+# Activate the environment by default
+ENV PATH /opt/conda/envs/neo4j/bin:$PATH
+ENV CONDA_DEFAULT_ENV neo4j
 
 # Copy source code
 COPY . .
@@ -30,8 +35,8 @@ RUN mkdir -p data/bts_flight_data logs
 EXPOSE 8000
 
 # Default command - run tests to verify setup
-CMD ["python", "-m", "pytest", "tests/test_ci_unit.py", "-v"]
+CMD ["/bin/bash", "-c", "source activate neo4j && python -m pytest tests/test_ci_unit.py -v"]
 
 # Health check - verify core dependencies
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import neo4j, pyspark, pandas, pyarrow; print('Health check passed')" || exit 1
+    CMD /bin/bash -c "source activate neo4j && python -c 'import neo4j, pyspark, pandas, pyarrow; print(\"Health check passed\")'" || exit 1
