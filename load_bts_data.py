@@ -305,19 +305,16 @@ def setup_database_schema(
     schema_queries = [
         # ✅ PROVEN USEFUL: This index gets 3.5M+ reads during loading
         "CREATE INDEX schedule_route IF NOT EXISTS FOR (s:Schedule) ON (s.origin, s.dest)",
-        # 🤔 POTENTIALLY USEFUL: Airport/Carrier lookups for MATCH operations
-        # These may be used by the Neo4j connector for node matching
+        # ✅ ESSENTIAL: Airport/Carrier lookups for MATCH operations (1M+ reads)
         "CREATE INDEX airport_code_lookup IF NOT EXISTS FOR (a:Airport) ON (a.code)",
         "CREATE INDEX carrier_code_lookup IF NOT EXISTS FOR (c:Carrier) ON (c.code)",
-        # ❌ REMOVED: These indexes showed 0 reads in usage analysis
-        # "CREATE INDEX schedule_flightdate IF NOT EXISTS FOR (s:Schedule) ON (s.flightdate)",
-        # "CREATE INDEX schedule_airline IF NOT EXISTS FOR (s:Schedule) ON (s.reporting_airline)",
-        # "CREATE INDEX schedule_origin IF NOT EXISTS FOR (s:Schedule) ON (s.origin)",
-        # "CREATE INDEX schedule_dest IF NOT EXISTS FOR (s:Schedule) ON (s.dest)",
-        # "CREATE INDEX schedule_flight_number IF NOT EXISTS FOR (s:Schedule) ON (s.flight_number_reporting_airline)",
-        # "CREATE INDEX schedule_airline_date IF NOT EXISTS FOR (s:Schedule) ON (s.reporting_airline, s.flightdate)",
-        # "CREATE INDEX schedule_departure_time IF NOT EXISTS FOR (s:Schedule) ON (s.scheduled_departure_time)",
-        # "CREATE INDEX schedule_arrival_time IF NOT EXISTS FOR (s:Schedule) ON (s.scheduled_arrival_time)",
+        # ✅ NEW: Temporal indexes for optimized query performance
+        "CREATE INDEX schedule_flightdate IF NOT EXISTS FOR (s:Schedule) ON (s.flightdate)",
+        "CREATE INDEX schedule_departure_time IF NOT EXISTS FOR (s:Schedule) ON (s.scheduled_departure_time)",
+        "CREATE INDEX schedule_arrival_time IF NOT EXISTS FOR (s:Schedule) ON (s.scheduled_arrival_time)",
+        # ✅ NEW: Composite indexes for connection queries (significant performance gain)
+        "CREATE INDEX schedule_date_departure IF NOT EXISTS FOR (s:Schedule) ON (s.flightdate, s.scheduled_departure_time)",
+        "CREATE INDEX schedule_date_arrival IF NOT EXISTS FOR (s:Schedule) ON (s.flightdate, s.scheduled_arrival_time)",
         # Constraints (may fail if duplicates exist, but that's OK)
         "CREATE CONSTRAINT airport_code_unique IF NOT EXISTS FOR (a:Airport) REQUIRE a.code IS UNIQUE",
         "CREATE CONSTRAINT carrier_code_unique IF NOT EXISTS FOR (c:Carrier) REQUIRE c.code IS UNIQUE",
