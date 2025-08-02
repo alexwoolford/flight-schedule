@@ -9,7 +9,6 @@ These tests ensure we don't break functionality when improving performance.
 
 import os
 import time
-from typing import Any, Dict, List
 
 import pytest
 from dotenv import load_dotenv
