@@ -13,7 +13,6 @@ Run with: pytest tests/test_integration_heavy.py -v --tb=short
 """
 
 import os
-from datetime import datetime
 
 import pytest
 from dotenv import load_dotenv

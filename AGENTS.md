@@ -209,6 +209,129 @@ logging.basicConfig(
 - ✅ Deadlock-free parallel data loading
 - ✅ Customer data protected
 
+## 🛡️ Code Quality & Pre-Commit Workflow
+
+### ⚠️ MANDATORY: Always Run Pre-Commit Checks Before Committing
+
+**🚨 CRITICAL RULE**: NEVER commit code without running ALL pre-commit checks and tests.
+
+### 📋 Complete Pre-Commit Checklist
+
+**1. Run All Tests**
+```bash
+# Fast CI tests (always run these)
+python -m pytest tests/test_ci_unit.py tests/test_flight_search_unit.py -v
+
+# Connection logic tests (critical for temporal validation)
+python -m pytest tests/test_connection_logic.py -v
+
+# Full test suite (when time permits)
+python -m pytest tests/ -v
+```
+
+**2. Run All Pre-Commit Hooks**
+```bash
+# Fix formatting automatically
+black .
+isort .
+
+# Run all quality checks
+pre-commit run --all-files
+
+# NEVER use --no-verify unless it's an emergency
+# If checks fail, FIX the issues, don't bypass them
+```
+
+**3. Manual Quality Checks**
+```bash
+# Check for long lines that need manual fixing
+flake8 . | grep E501 | head -10
+
+# Check for unused imports/variables
+flake8 . | grep F401
+flake8 . | grep F841
+
+# Security scan results (low severity issues are usually OK)
+bandit -r . --skip B101 --exclude tests/
+```
+
+**4. Performance & Integration Tests (for major changes)**
+```bash
+# Performance baseline tests
+python -m pytest tests/test_performance_baseline.py -v
+
+# Integration tests (require loaded database)
+python -m pytest tests/test_integration_heavy.py -v
+```
+
+### 🔧 Common Pre-Commit Fixes
+
+**Line Length Violations (E501)**
+- Break long lines at logical points (operators, commas)
+- Use parentheses for multi-line expressions
+- Consider shorter variable names for very long chains
+
+**Unused Imports (F401)**
+```python
+# Remove unused imports at the top of files
+# Check if import is actually used in the code
+```
+
+**F-String Issues (F541)**
+```python
+# Change f"static text" to "static text"
+# Only use f-strings when you have {placeholders}
+```
+
+**Unused Variables (F841)**
+```python
+# Remove variables that are assigned but never used
+# Use underscore for intentionally unused variables: _ = value
+```
+
+### 📝 Commit Message Standards
+
+**Good Commit Messages:**
+```
+feat: optimize query performance and index strategy
+
+• README connection query: 239ms → 110ms (44% improvement)
+• Add 5 temporal indexes for optimal performance
+• Update load_bts_data.py with optimized index creation
+• All existing functionality preserved
+
+✅ 40-60% performance improvement achieved
+✅ Data integrity maintained
+```
+
+**Bad Commit Messages:**
+```
+fix stuff
+update code
+wip
+```
+
+### 🚫 What NOT to Commit
+
+- Files with failing pre-commit hooks (unless emergency)
+- Code with known test failures
+- Temporary debugging files
+- Large datasets (use .gitignore)
+- Credentials or sensitive information
+- Work-in-progress code without proper testing
+
+### ⚡ Emergency Bypass (Use Sparingly)
+
+If you MUST commit with failing checks:
+```bash
+git commit --no-verify -m "emergency: critical fix for production issue
+
+Reason for bypass: [explain emergency]
+TODO: Fix code quality issues in follow-up commit"
+```
+
+**RULE**: Emergency bypass MUST be followed by a cleanup commit within 24 hours.
+
 ---
 *Created: $(date)*
 *Update this file when you learn something new!*
