@@ -79,7 +79,7 @@ class TestAirlineCodeValidation:
 
             # Most of these should be invalid (except A1 which is technically valid format)
             if code == "A1":
-                assert is_valid, f"A1 should be valid format even if not a real airline"
+                assert is_valid, "A1 should be valid format even if not a real airline"
             else:
                 assert not is_valid, f"Code should be invalid: '{code}'"
 
@@ -696,15 +696,9 @@ class TestRealWorldDataPatterns:
                 # Network type validation
                 if network_type == "Hub-and-spoke":
                     # At least one endpoint should be an airline hub
-                    airline_hubs_list = {
-                        "AA": ["DFW", "CLT", "MIA", "PHX"],
-                        "UA": ["ORD", "DEN", "SFO", "IAH"],
-                        "DL": ["ATL", "MSP", "DTW", "SLC"],
-                    }.get(airline, [])
-
                     # Note: Not all routes must touch hubs, but major routes typically do
-                    # has_hub = origin in airline_hubs_list or dest in airline_hubs_list
-
+                    # Future enhancement: validate hub usage patterns
+                    pass
                 elif network_type == "Point-to-point":
                     # Southwest-style operations
                     # Routes can be between any airports

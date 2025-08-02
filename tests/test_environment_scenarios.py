@@ -1150,12 +1150,8 @@ class TestCrossPlatformCompatibility:
             ), "Exact case should work"
 
             # Test different case (should fail on case-sensitive systems)
-            lower_case = test_var_name.lower()
-            mixed_case = "Test_Case_Sensitivity"
-
             # These may or may not work depending on platform
-            # lower_result = os.environ.get(lower_case)
-            # mixed_result = os.environ.get(mixed_case)
+            # Future: test case sensitivity if needed
 
             # The test is that we handle both cases gracefully
             assert True, "Case sensitivity handling should be platform-aware"

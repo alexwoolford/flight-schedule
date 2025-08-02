@@ -223,6 +223,72 @@ pytest tests/test_performance.py -v
 pytest tests/ --cov=. --cov-report=term-missing
 ```
 
+## 🚀 Load Testing
+
+The system includes production-grade load testing using **Locust** to measure database performance under realistic query loads.
+
+### Quick Start Load Testing
+
+```bash
+# 1. Generate realistic flight scenarios from your loaded data
+python generate_flight_scenarios.py
+
+# 2. Start the load test
+locust -f realistic_flight_search_load_test.py --host=bolt://localhost:7687
+
+# 3. Open web UI and configure test
+# http://localhost:8089
+```
+
+### What the Load Test Measures
+
+| Query Type | Percentage | Purpose | Expected Response Time |
+|------------|------------|---------|----------------------|
+| **Popular Routes** | 70% | Hub-to-hub searches (direct + 1-stop options) | <100ms |
+| **Medium Routes** | 20% | Hub-to-spoke routes (1-2 stop connections) | <200ms |
+| **Niche Routes** | 10% | Spoke-to-spoke (complex multi-hop routing) | <300ms |
+
+**Query Sophistication**: Each test simulates realistic flight booking with:
+- **Multi-hop routing**: Direct, 1-stop, and 2-stop connections
+- **Connection timing**: 45+ minute minimums, 300min max layovers
+- **Intelligent prioritization**: Efficiency scoring based on total travel time
+- **Realistic constraints**: 16-hour max journeys, proper temporal validation
+
+### Performance Baselines
+
+- **Concurrent Users**: 50-100 users sustainable
+- **Queries Per Second**: 200+ QPS on standard hardware
+- **Response Times**: 95th percentile <300ms
+- **Connection Pooling**: ✅ Enabled for pure DB performance measurement
+
+### Advanced Load Testing
+
+```bash
+# Headless mode with specific parameters
+locust -f realistic_flight_search_load_test.py \
+       --host=bolt://localhost:7687 \
+       --users 50 \
+       --spawn-rate 5 \
+       --run-time 300s \
+       --headless
+
+# Analyze results
+# 1. Use Locust's interactive web interface (recommended):
+#    Visit http://localhost:8089 for real-time charts and metrics
+# 2. Or get quick CLI analysis:
+python quick_load_test_analysis.py locust_stats.csv
+```
+
+### Load Test Architecture
+
+- **Pre-generated Scenarios**: Uses actual airport pairs and dates from your database
+- **Sophisticated Routing**: Single query handles direct, 1-stop, and 2-stop connections
+- **Real Booking Logic**: Connection timing validation, efficiency scoring, route prioritization
+- **Connection Pooling**: Measures pure query performance, not driver overhead
+- **Realistic Distribution**: Simulates actual user search patterns (70% popular, 20% medium, 10% niche)
+
+> 📖 **Detailed Guide**: See `LOAD_TESTING_GUIDE.md` for comprehensive setup, configuration, and interpretation instructions.
+
 ## 📋 Development
 
 ### Code Quality Setup
@@ -263,6 +329,16 @@ Hooks run automatically on `git commit` and prevent commits with quality issues.
 | `load_bts_data.py` | ✅ Load BTS data using Spark with Neo4j connector |
 | `setup.py` | Complete setup script for database, indexes, and demos |
 | `tests/` | Comprehensive test suite with unit, integration, and performance tests |
+
+### Load Testing Tools
+
+| Script | Purpose |
+|--------|---------|
+| `generate_flight_scenarios.py` | ✅ Generate realistic test scenarios from actual flight data |
+| `realistic_flight_search_load_test.py` | ✅ Locust load test simulating real user flight searches |
+| `quick_load_test_analysis.py` | ✅ Quick CLI analysis of load test results |
+
+**📊 Primary Analysis**: Use Locust's **interactive web interface** at `http://localhost:8089` for real-time charts, metrics, and professional visualizations.
 
 ## 📊 Dataset
 
@@ -305,6 +381,7 @@ graph TB
     subgraph "🧪 Quality Assurance"
         O[Unit Tests<br/>Core functionality]
         P[Integration Tests<br/>End-to-end validation]
+        R[Load Testing<br/>Performance under load]
         Q[CI/CD Pipeline<br/>Automated quality checks]
     end
 
@@ -325,7 +402,9 @@ graph TB
     M --> N
     D --> O
     G --> P
+    M --> R
     P --> Q
+    R --> Q
 
     style A fill:#e1f5fe
     style G fill:#f3e5f5

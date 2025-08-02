@@ -5,6 +5,60 @@
 ### 📋 Project Context
 This is a **Neo4j flight schedule system** for fast flight queries.
 
+### 🚨 CRITICAL: .gitignore File Handling Policy
+**ABSOLUTE RULE**: NEVER delete files that are excluded by `.gitignore` during cleanup operations.
+
+**🎯 UNDERSTANDING THE REPOSITORY STRUCTURE**:
+This repository contains TWO types of files:
+1. **Repository files** - Code, docs, configs that should be tracked in git
+2. **Development context files** - Customer data, generated reports, caches that are useful locally but excluded by `.gitignore`
+
+**✅ ALWAYS DO**:
+- Respect `.gitignore` boundaries completely
+- When asked to "cleanup for commit" - ONLY deal with tracked files or files that should be tracked
+- Use `git status --porcelain` to see what git cares about
+- Use `git check-ignore <file>` to verify if a file is ignored before touching it
+
+**❌ NEVER DO**:
+- Delete files from the filesystem just because they seem "non-essential"
+- Remove `.gitignore`d files during "cleanup" operations
+- Touch files in `private_data/`, generated caches, or other ignored directories
+- Delete customer development context (Neo4j reports, analysis files, etc.)
+
+**🔍 CLEANUP CHECKLIST**:
+```bash
+# CORRECT: Check what git actually tracks
+git status --porcelain
+git ls-files | grep -E "\.(png|jpg|json|log|tmp)$"
+
+# WRONG: Don't blindly delete files from filesystem
+# rm -rf some_directory/  # ❌ Could delete customer data!
+```
+
+**📁 PROTECTED DIRECTORIES** (always .gitignore'd, never delete):
+- `private_data/` - Customer-specific data and reports
+- `__pycache__/` - Python caches (auto-regenerate)
+- `.mypy_cache/` - Type checking cache (auto-regenerate)
+- `htmlcov/` - Coverage reports (regenerate with tests)
+- `logs/` - Application logs
+
+**⚠️ IF YOU VIOLATE THIS POLICY**: You may delete irreplaceable customer data, development context, or hours of generated analysis results.
+
+### 🐍 Dependency Management Policy
+**CRITICAL**: This is a **conda-only project**.
+
+**✅ DO:**
+- Add dependencies to `environment.yml`
+- Use `conda env update -f environment.yml` to install new packages
+- Use the `pip:` section within `environment.yml` for pip-only packages
+
+**❌ NEVER:**
+- Create `requirements.txt`, `requirements-dev.txt`, or `requirements-*.txt` files
+- Use `pip install` directly (outside of conda environment)
+- Mix conda and pip package management approaches
+
+**Rationale**: Conda provides better dependency resolution and environment isolation than mixing package managers. This avoids version conflicts and ensures reproducible environments across all development and deployment scenarios.
+
 ### 🔐 Data Classification
 
 #### PRIVATE (never commit):
@@ -28,6 +82,30 @@ flight-schedule-system/
 ├── setup.py               # Main setup script (commits)
 ├── README.md               # Main documentation (commits)
 └── .env                    # Credentials (gitignored, in root)
+```
+
+### 📄 Generated Files Policy
+**CRITICAL**: Some files are generated from source data and should NOT be committed:
+
+**✅ GENERATE (don't commit):**
+- `flight_test_scenarios.json` - Generated from actual loaded flight data
+- `data/*.parquet` - Downloaded BTS flight data files
+- `logs/*.log` - Runtime log files
+- Neo4j server reports
+
+**❌ NEVER commit generated files because:**
+- They change based on source data
+- They're environment-specific
+- They're large and change frequently
+- They can be regenerated from scripts
+
+**🔧 Regeneration Commands:**
+```bash
+# Regenerate flight scenarios from loaded data
+python generate_flight_scenarios.py
+
+# Regenerate flight data from BTS
+python download_bts_flight_data.py --year 2024 --month 3
 ```
 
 ### 🚨 Common Mistakes to Avoid
@@ -346,6 +424,80 @@ wip
 - Large datasets (use .gitignore)
 - Credentials or sensitive information
 - Work-in-progress code without proper testing
+
+## 🔐 Database Credentials & Environment Variables
+
+**🚨 ABSOLUTE SECURITY REQUIREMENT**: NEVER EVER hard-code database credentials, IP addresses, passwords, or connection strings in source code - ANYWHERE in the project. This is a security vulnerability and will be rejected in code review.
+
+### ✅ ALWAYS DO
+```python
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Correct: Use environment variables
+uri = os.getenv("NEO4J_URI")
+username = os.getenv("NEO4J_USERNAME")
+password = os.getenv("NEO4J_PASSWORD")
+database = os.getenv("NEO4J_DATABASE", "neo4j")
+
+# Validate required variables
+if not all([uri, username, password]):
+    raise ValueError("Missing required Neo4j environment variables")
+```
+
+### ❌ NEVER DO - ALL OF THESE ARE SECURITY VIOLATIONS
+```python
+# WRONG: Hard-coded credentials - MAJOR security risk!
+uri = "bolt://10.0.1.27:7687"           # ❌ Hard-coded IP + port
+username = "neo4j"                      # ❌ Hard-coded username
+password = "secretpassword"             # ❌ Hard-coded password
+password = "V1ctoria"                   # ❌ ANY hard-coded password
+database = "flights"                    # ❌ Hard-coded database name
+
+# ALSO WRONG: Connection strings with embedded credentials
+uri = "bolt://user:pass@server:7687"    # ❌ Credentials in URI
+DATABASE_URL = "neo4j://host:7687"      # ❌ Hard-coded connection URL
+
+# WRONG: Even IP addresses without credentials
+SERVER_IP = "10.0.1.27"                # ❌ Hard-coded IP address
+NEO4J_HOST = "production.company.com"   # ❌ Hard-coded hostname
+```
+
+**⚠️ REMEMBER**: If you can see credentials/IPs/hostnames in the source code, so can anyone with access to the repository!
+
+### 📋 Required Environment Variables
+Every script connecting to Neo4j MUST use these variables from `.env`:
+- `NEO4J_URI` - Database connection URI (e.g. bolt://localhost:7687)
+- `NEO4J_USERNAME` - Database username (usually "neo4j")
+- `NEO4J_PASSWORD` - Database password (never commit this!)
+- `NEO4J_DATABASE` - Database name (default: "neo4j" - compatible with Aura)
+
+### 🛠️ Setup Template
+```bash
+# Copy example and edit with real values
+cp .env.example .env
+# Edit .env with your actual credentials (never commit .env!)
+```
+
+### 📝 MANDATORY Code Review Checklist
+**🔒 SECURITY CHECK** - Before committing ANY code that connects to databases/services:
+
+- [ ] **NO hard-coded credentials**: Search file for any IP addresses, passwords, usernames, URIs
+- [ ] **Uses `python-dotenv`**: `from dotenv import load_dotenv` and `load_dotenv()` called
+- [ ] **Uses `os.getenv()`**: ALL connection parameters use environment variables
+- [ ] **Validates environment variables**: Checks that required variables exist
+- [ ] **Proper error handling**: Clear error messages if .env file misconfigured
+- [ ] **No credentials in comments**: Check comments don't contain sensitive info
+- [ ] **No debug prints**: Remove any debug statements that might log credentials
+
+**⚠️ SECURITY SCAN**: Run this command before committing:
+```bash
+grep -rn "bolt://.*:" --include="*.py" .
+grep -rn "password.*=" --include="*.py" . | grep -v "os.getenv"
+```
 
 ### ⚡ Emergency Bypass (Use Sparingly)
 

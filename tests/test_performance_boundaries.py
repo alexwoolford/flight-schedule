@@ -69,7 +69,7 @@ class TestMemoryUsagePatterns:
 
         # Basic operations
         unique_airlines = df["reporting_airline"].unique()
-        grouped = df.groupby("origin").size()
+        _grouped = df.groupby("origin").size()  # noqa: F841
         filtered = df[df["cancelled"] == 0]
 
         memory_after_ops = process.memory_info().rss / 1024 / 1024
@@ -281,7 +281,7 @@ class TestConfigurationPerformanceImpact:
 
             if partition_cols is None:
                 # Process entire dataset at once
-                result = df.groupby("reporting_airline").size()
+                _result = df.groupby("reporting_airline").size()  # noqa: F841
             elif isinstance(partition_cols, str):
                 # Process each partition separately
                 results = []
@@ -340,7 +340,7 @@ class TestScaleScenarios:
                 df.to_parquet(file_path, index=False)
                 total_records_many += len(df)
 
-            many_files_write_time = time.time() - start_time
+            _many_files_write_time = time.time() - start_time  # noqa: F841
 
             # Test scenario 2: Few large files (2 files, 500 records each)
             few_files_dir = temp_path / "few_files"
@@ -362,7 +362,7 @@ class TestScaleScenarios:
                 df.to_parquet(file_path, index=False)
                 total_records_few += len(df)
 
-            few_files_write_time = time.time() - start_time
+            _few_files_write_time = time.time() - start_time  # noqa: F841
 
             # Both should have same total records
             assert (
@@ -498,8 +498,8 @@ class TestScaleScenarios:
             df = pd.DataFrame(month_data)
 
             # Simulate typical processing operations
-            airline_stats = df.groupby("reporting_airline").size()
-            daily_stats = df.groupby("flightdate").size()
+            _airline_stats = df.groupby("reporting_airline").size()  # noqa: F841
+            _daily_stats = df.groupby("flightdate").size()  # noqa: F841
 
             processing_time = time.time() - start_time
             memory_after = process.memory_info().rss / 1024 / 1024  # MB
@@ -558,7 +558,7 @@ class TestResourceUtilizationBoundaries:
 
         # Monitor CPU usage during operations
         process = psutil.Process()
-        cpu_before = process.cpu_percent()
+        _cpu_before = process.cpu_percent()  # noqa: F841
 
         start_time = time.time()
 
@@ -593,7 +593,7 @@ class TestResourceUtilizationBoundaries:
         )
 
         operation_time = time.time() - start_time
-        cpu_after = process.cpu_percent()
+        _cpu_after = process.cpu_percent()  # noqa: F841
 
         # Operations should complete in reasonable time
         assert (
@@ -666,7 +666,7 @@ class TestResourceUtilizationBoundaries:
             }
 
             df = pd.DataFrame(chunk_data)
-            result = df.groupby("reporting_airline").size()
+            _result = df.groupby("reporting_airline").size()  # noqa: F841
 
             processing_time = time.time() - start_time
             memory_after = process.memory_info().rss / 1024 / 1024
