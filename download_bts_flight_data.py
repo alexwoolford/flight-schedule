@@ -213,9 +213,7 @@ class BTSFlightDataDownloader:
             print(f"   ❌ Error processing {year}-{month}: {e}")
             return None
 
-    def save_spark_compatible_parquet(
-        self, df: pd.DataFrame, output_file: Path
-    ):
+    def save_spark_compatible_parquet(self, df: pd.DataFrame, output_file: Path):
         """Save DataFrame to Parquet with microsecond precision for Spark
         compatibility."""
         # Ensure datetime columns are properly typed with microsecond precision
