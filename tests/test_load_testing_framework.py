@@ -93,9 +93,9 @@ class TestLoadTestScriptValidation:
     def test_realistic_load_test_imports(self):
         """Test that realistic load test script imports work"""
         try:
-            import realistic_flight_search_load_test  # noqa: F401
+            import neo4j_flight_load_test  # noqa: F401
         except ImportError as e:
-            pytest.fail(f"Failed to import realistic_flight_search_load_test: {e}")
+            pytest.fail(f"Failed to import neo4j_flight_load_test: {e}")
         except Exception as e:
             # If it fails due to missing scenarios file, that's OK for this test
             if "flight_test_scenarios.json" in str(e):
@@ -139,11 +139,11 @@ class TestLoadTestScriptValidation:
             Path(temp_file).rename("flight_test_scenarios.json")
 
             # Now import should work
-            import realistic_flight_search_load_test
+            import neo4j_flight_load_test
 
             # Test class structure
-            assert hasattr(realistic_flight_search_load_test, "FlightSearchUser")
-            user_class = realistic_flight_search_load_test.FlightSearchUser
+            assert hasattr(neo4j_flight_load_test, "Neo4jUser")
+            user_class = neo4j_flight_load_test.Neo4jUser
 
             # Should have required Locust methods
             assert hasattr(user_class, "on_start")
