@@ -128,11 +128,14 @@ pytest tests/test_flight_search_unit.py -v
 
 ## 📊 Performance Benchmarks
 
-**Test Environment**: MacBook Pro M1, Neo4j 5.x, Local Database
-**Dataset**: 586K+ real BTS flight schedules (March 2024), 331 US airports, 15 airlines
-**Load Time**: ~2 minutes with schema optimization (4,000+ records/sec)
-**Result**: 586K+ nodes, 1.76M relationships, native DateTime objects
-**✅ Note**: Real Bureau of Transportation Statistics data - 100% factual flight operations
+| Metric | Value |
+|--------|-------|
+| **Test Environment** | MacBook Pro M1, Neo4j 5.x, Local Database |
+| **Dataset** | 586K+ real BTS flight schedules (March 2024)<br/>331 US airports, 15 airlines |
+| **Load Time** | ~2 minutes with schema optimization<br/>4,000+ records/sec throughput |
+| **Graph Result** | 586K+ nodes, 1.76M relationships<br/>Native DateTime objects |
+
+> ✅ **Note**: Real Bureau of Transportation Statistics data - 100% factual flight operations
 
 ## 🔍 Query Performance & Business Logic
 
