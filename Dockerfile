@@ -3,12 +3,12 @@ FROM continuumio/miniconda3:latest
 
 # Install system dependencies including Java 11 for Spark
 RUN apt-get update && apt-get install -y \
-    openjdk-11-jre-headless \
+    default-jre-headless \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Java environment (Java 11 for Spark compatibility)
-ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+# Set Java environment (default JRE for Spark compatibility)
+ENV JAVA_HOME=/usr/lib/jvm/default-java
 ENV PATH=$PATH:$JAVA_HOME/bin
 
 # Set working directory
@@ -22,8 +22,8 @@ RUN conda env create -f environment.yml && \
     conda clean -afy
 
 # Activate the environment by default
-ENV PATH /opt/conda/envs/neo4j/bin:$PATH
-ENV CONDA_DEFAULT_ENV neo4j
+ENV PATH=/opt/conda/envs/neo4j/bin:$PATH
+ENV CONDA_DEFAULT_ENV=neo4j
 
 # Copy source code
 COPY . .
