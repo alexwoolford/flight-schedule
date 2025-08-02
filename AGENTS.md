@@ -215,54 +215,81 @@ logging.basicConfig(
 
 **🚨 CRITICAL RULE**: NEVER commit code without running ALL pre-commit checks and tests.
 
+**🔥 ABSOLUTE REQUIREMENT**: Before committing ANY new code, you MUST run the complete CI.yml test battery to ensure it will pass GitHub Actions.
+
 ### 📋 Complete Pre-Commit Checklist
 
-**1. Run All Tests**
+**1. Run Complete CI Test Suite (MANDATORY)**
 ```bash
-# Fast CI tests (always run these)
-python -m pytest tests/test_ci_unit.py tests/test_flight_search_unit.py -v
+# Run the EXACT same tests that CI.yml runs
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_data_transformations.py tests/test_business_rules.py tests/test_error_scenarios.py -v --cov=. --cov-report=xml --cov-report=term-missing
 
+# ALL tests must pass - no exceptions!
+```
+
+**2. Run ALL CI.yml Quality Checks (MANDATORY)**
+```bash
+# 1. Black formatting check (must pass)
+black --check --diff .
+# If it fails, run: black .
+
+# 2. Isort import sorting check (must pass)
+isort --check-only --diff .
+# If it fails, run: isort .
+
+# 3. Flake8 critical linting (must pass)
+flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+# 4. Flake8 secondary check (warnings OK, exit-zero)
+flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+
+# 5. MyPy type checking (continue-on-error, but run it)
+mypy --install-types --non-interactive .
+
+# 6. Bandit security check (continue-on-error, but run it)
+bandit -r . -x tests/ -ll
+
+# 7. Safety dependency check (continue-on-error, but run it)
+safety check
+```
+
+**3. Additional Tests for Major Changes**
+```bash
 # Connection logic tests (critical for temporal validation)
 python -m pytest tests/test_connection_logic.py -v
 
-# Full test suite (when time permits)
+# Performance baseline tests
+python -m pytest tests/test_performance_baseline.py -v
+
+# Integration tests (require loaded database)
+python -m pytest tests/test_integration_heavy.py -v
+
+# Full test suite (comprehensive verification)
 python -m pytest tests/ -v
 ```
 
-**2. Run All Pre-Commit Hooks**
+**4. Pre-Commit Hooks (After Manual Checks)**
 ```bash
-# Fix formatting automatically
-black .
-isort .
-
-# Run all quality checks
+# Run all pre-commit hooks
 pre-commit run --all-files
 
 # NEVER use --no-verify unless it's an emergency
 # If checks fail, FIX the issues, don't bypass them
 ```
 
-**3. Manual Quality Checks**
+### 🚨 CI.yml Compliance Status Check
+
+**BEFORE COMMITTING**, verify your changes pass CI by running this quick command:
 ```bash
-# Check for long lines that need manual fixing
-flake8 . | grep E501 | head -10
-
-# Check for unused imports/variables
-flake8 . | grep F401
-flake8 . | grep F841
-
-# Security scan results (low severity issues are usually OK)
-bandit -r . --skip B101 --exclude tests/
+echo "🔍 CI.yml Compliance Check" && \
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_data_transformations.py tests/test_business_rules.py tests/test_error_scenarios.py --quiet && \
+black --check . && \
+isort --check-only . && \
+flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics && \
+echo "✅ CI.yml WILL PASS - Safe to commit!"
 ```
 
-**4. Performance & Integration Tests (for major changes)**
-```bash
-# Performance baseline tests
-python -m pytest tests/test_performance_baseline.py -v
-
-# Integration tests (require loaded database)
-python -m pytest tests/test_integration_heavy.py -v
-```
+If ANY step fails, you MUST fix it before committing. The CI will fail otherwise.
 
 ### 🔧 Common Pre-Commit Fixes
 
