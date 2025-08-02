@@ -188,7 +188,7 @@ def create_constraints():
     uri = os.getenv("NEO4J_URI")
     username = os.getenv("NEO4J_USERNAME")
     password = os.getenv("NEO4J_PASSWORD")
-    database = os.getenv("NEO4J_DATABASE", "flights")
+    database = os.getenv("NEO4J_DATABASE", "neo4j")
 
     print(f"📋 Target: {uri} → database '{database}'")
 
@@ -345,7 +345,7 @@ def load_full_dataset(batch_size: int = 10000):
                 uri = os.getenv("NEO4J_URI")
                 username = os.getenv("NEO4J_USERNAME")
                 password = os.getenv("NEO4J_PASSWORD")
-                database = os.getenv("NEO4J_DATABASE", "flights")
+                database = os.getenv("NEO4J_DATABASE", "neo4j")
 
                 driver = GraphDatabase.driver(uri, auth=(username, password))
                 with driver.session(database=database) as session:
@@ -374,7 +374,7 @@ def load_full_dataset(batch_size: int = 10000):
                 uri = os.getenv("NEO4J_URI")
                 username = os.getenv("NEO4J_USERNAME")
                 password = os.getenv("NEO4J_PASSWORD")
-                database = os.getenv("NEO4J_DATABASE", "flights")
+                database = os.getenv("NEO4J_DATABASE", "neo4j")
 
                 print(f"⚠️ Could not verify loading: {e}")
                 print("✅ Loading process completed (verification failed)")

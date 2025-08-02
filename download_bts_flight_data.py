@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Download official US government flight data from Bureau of Transportation Statistics (BTS).
-This downloads 100% factual, real flight performance data that airlines are required to report.
+Download official US government flight data from Bureau of Transportation
+Statistics (BTS).
+This downloads 100% factual, real flight performance data that airlines are required
+to report.
 
 Source: https://transtats.bts.gov/
 Data: Airline On-Time Performance Data (1987-2025)
@@ -81,13 +83,21 @@ class BTSFlightDataDownloader:
         Returns:
             Path to downloaded parquet file
         """
-        # BTS filename format: On_Time_Reporting_Carrier_On_Time_Performance_1987_present_YYYY_M.zip
-        filename = f"On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
+        # BTS filename format:
+        # On_Time_Reporting_Carrier_On_Time_Performance_1987_present_YYYY_M.zip
+        filename = (
+            f"On_Time_Reporting_Carrier_On_Time_Performance_"
+            f"1987_present_{year}_{month}.zip"
+        )
         url = f"{self.base_url}/{filename}"
 
         zip_path = self.data_dir / filename
-        # The CSV inside has parentheses: On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_YYYY_M.csv
-        csv_filename = f"On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_{year}_{month}.csv"
+        # The CSV inside has parentheses:
+        # On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_YYYY_M.csv
+        csv_filename = (
+            f"On_Time_Reporting_Carrier_On_Time_Performance_"
+            f"(1987_present)_{year}_{month}.csv"
+        )
         csv_path = self.data_dir / csv_filename
         parquet_path = self.data_dir / f"bts_flights_{year}_{month:02d}.parquet"
 
@@ -163,7 +173,8 @@ class BTSFlightDataDownloader:
             # Clean up column names
             df.columns = df.columns.str.lower().str.replace(" ", "_")
 
-            # Convert to datetime types where appropriate with MICROSECOND precision (Spark compatible)
+            # Convert to datetime types where appropriate with MICROSECOND precision
+            # (Spark compatible)
             datetime_cols = [
                 "flightdate",
                 "crsdeptime",
@@ -202,8 +213,11 @@ class BTSFlightDataDownloader:
             print(f"   ❌ Error processing {year}-{month}: {e}")
             return None
 
-    def save_spark_compatible_parquet(self, df: pd.DataFrame, output_file: Path):
-        """Save DataFrame to Parquet with microsecond precision for Spark compatibility."""
+    def save_spark_compatible_parquet(
+        self, df: pd.DataFrame, output_file: Path
+    ):
+        """Save DataFrame to Parquet with microsecond precision for Spark
+        compatibility."""
         # Ensure datetime columns are properly typed with microsecond precision
         datetime_columns = [
             "flightdate",

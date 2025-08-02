@@ -86,7 +86,7 @@ class TestBasicFunctionality:
             uri = os.getenv("NEO4J_URI")
             username = os.getenv("NEO4J_USERNAME")
             password = os.getenv("NEO4J_PASSWORD")
-            database = os.getenv("NEO4J_DATABASE", "flights")
+            database = os.getenv("NEO4J_DATABASE", "neo4j")
 
             # Skip test if Neo4j not available (CI without loaded data)
             if not all([uri, username, password]):

@@ -10,6 +10,9 @@
 /data/**/*.json
 data/bts_flight_data/
 
+# Generated Load Test Scenarios (regenerate with generate_flight_scenarios.py)
+flight_test_scenarios.json
+
 
 # Environment & Credentials
 .env
@@ -44,6 +47,32 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Testing & Analysis Output
+test_*.txt
+test_*.csv
+*_charts/
+*_analysis/
+load_test_analysis/
+*-report.json
+*.report
+
+# Coverage Reports
+.coverage
+.coverage.*
+coverage.xml
+coverage.html
+htmlcov/
+
+# Load Testing Results
+locust_*.csv
+locust_*.html
+locust_stats*.csv
+locust_failures*.csv
+
+# Security Scan Reports
+bandit-report.json
+safety-report.json
 
 # Temporary files
 *.tmp

@@ -119,7 +119,8 @@ def create_spark_session(app_name: str = "BTSFlightLoader", custom_config: dict 
         # === ADAPTIVE QUERY EXECUTION (Configured for bulk loading) ===
         "spark.sql.adaptive.enabled": "true",
         "spark.sql.adaptive.coalescePartitions.enabled": "true",
-        "spark.sql.adaptive.coalescePartitions.minPartitionSize": "64MB",  # Updated for Spark 3.5.3
+        "spark.sql.adaptive.coalescePartitions.minPartitionSize": "64MB",
+        # Updated for Spark 3.5.3
         "spark.sql.adaptive.coalescePartitions.parallelismFirst": "true",
         "spark.sql.adaptive.advisoryPartitionSizeInBytes": "128MB",
         # === MEMORY CONFIGURATION (Aggressive for faster loading) ===
@@ -127,9 +128,11 @@ def create_spark_session(app_name: str = "BTSFlightLoader", custom_config: dict 
         "spark.driver.maxResultSize": "4g",  # Larger result sets
         "spark.executor.memory": "8g",  # More memory per executor
         "spark.executor.memoryFraction": "0.85",  # More memory for processing
-        "spark.executor.memoryStorageFraction": "0.3",  # Less for storage, more for execution
+        "spark.executor.memoryStorageFraction": "0.3",
+        # Less for storage, more for execution
         # === PARALLELISM (Configured for indexed database writes) ===
-        "spark.sql.shuffle.partitions": "16",  # Increased for better parallelism
+        "spark.sql.shuffle.partitions": "16",
+        # Increased for better parallelism
         "spark.default.parallelism": "16",  # Match shuffle partitions
         "spark.sql.sources.parallelPartitionDiscovery.threshold": "32",
         # === SERIALIZATION & COMPRESSION ===
@@ -144,10 +147,14 @@ def create_spark_session(app_name: str = "BTSFlightLoader", custom_config: dict 
         "spark.sql.parquet.writeLegacyFormat": "false",
         "spark.sql.parquet.mergeSchema": "false",  # Faster reads
         "spark.sql.parquet.filterPushdown": "true",
-        # === ADVANCED TIMESTAMP COMPATIBILITY (Fix nanosecond timestamp issues) ===
-        "spark.sql.legacy.parquet.int96RebaseModeInRead": "CORRECTED",  # Handle legacy timestamps
-        "spark.sql.legacy.parquet.datetimeRebaseModeInRead": "CORRECTED",  # Handle datetime rebasing
-        "spark.sql.parquet.respectSummaryFiles": "false",  # Ignore potentially problematic summary files
+        # === ADVANCED TIMESTAMP COMPATIBILITY
+        # (Fix nanosecond timestamp issues) ===
+        "spark.sql.legacy.parquet.int96RebaseModeInRead": "CORRECTED",
+        # Handle legacy timestamps
+        "spark.sql.legacy.parquet.datetimeRebaseModeInRead": "CORRECTED",
+        # Handle datetime rebasing
+        "spark.sql.parquet.respectSummaryFiles": "false",
+        # Ignore potentially problematic summary files
         "spark.sql.parquet.pushdown.date": "false",  # Disable date pushdown for compatibility
         "spark.sql.parquet.pushdown.timestamp": "false",  # Disable timestamp pushdown for compatibility
         "spark.sql.parquet.enableNestedColumnVectorizedReader": "false",  # Disable for complex timestamp handling
@@ -611,7 +618,7 @@ def load_bts_data(
     neo4j_uri = os.getenv("NEO4J_URI")
     neo4j_user = os.getenv("NEO4J_USERNAME")
     neo4j_password = os.getenv("NEO4J_PASSWORD")
-    neo4j_database = os.getenv("NEO4J_DATABASE", "flights")
+    neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
 
     if not all([neo4j_uri, neo4j_user, neo4j_password]):
         logger.error("Missing Neo4j connection details in .env file")
