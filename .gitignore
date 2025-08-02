@@ -5,11 +5,18 @@
 /data/*.parquet
 /data/*.csv
 /data/*.json
-/data/flight_list/
+/data/**/*.parquet
+/data/**/*.csv
+/data/**/*.json
+data/bts_flight_data/
+
 
 # Environment & Credentials
 .env
 *.log
+
+# Logs Directory
+logs/
 
 # Conda environment (use environment.yml to recreate)
 .conda/

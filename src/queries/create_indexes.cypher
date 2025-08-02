@@ -12,7 +12,7 @@ CREATE CONSTRAINT schedule_id_unique IF NOT EXISTS FOR (s:Schedule) REQUIRE s.sc
 // Note: No Day or CabinClass constraints needed - using bitmap properties on Schedule nodes
 
 // =======================
-// PERFORMANCE INDEXES  
+// PERFORMANCE INDEXES
 // =======================
 
 // Primary lookup indexes
@@ -67,16 +67,16 @@ CREATE FULLTEXT INDEX carrier_search IF NOT EXISTS FOR (c:Carrier) ON EACH [c.na
 SHOW INDEXES;
 
 // Verify constraint uniqueness
-MATCH (a:Airport) 
-WITH a.code AS code, count(*) AS cnt 
-WHERE cnt > 1 
+MATCH (a:Airport)
+WITH a.code AS code, count(*) AS cnt
+WHERE cnt > 1
 RETURN code, cnt;
 
 // Test index usage with EXPLAIN
 EXPLAIN MATCH (a:Airport {code: 'JFK'}) RETURN a;
 
 // Performance test - should use index
-EXPLAIN MATCH (s:Schedule) 
-WHERE s.effective_date <= date('2023-01-15') 
+EXPLAIN MATCH (s:Schedule)
+WHERE s.effective_date <= date('2023-01-15')
   AND s.discontinued_date >= date('2023-01-15')
 RETURN count(s);

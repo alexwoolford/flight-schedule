@@ -15,77 +15,86 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Set up Java (required for PySpark)
       uses: actions/setup-java@v3
       with:
         distribution: 'temurin'
         java-version: '11'
-    
-    - name: Cache pip dependencies
-      uses: actions/cache@v3
+
+    - name: Setup Conda
+      uses: conda-incubator/setup-miniconda@v3
       with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
+        environment-file: environment.yml
+        activate-environment: neo4j
+        auto-activate-base: false
+
     - name: Install dependencies
+      shell: bash -l {0}
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r requirements-dev.txt
-        # Install neo4j-parallel-spark-loader if available (for integration tests)
-        pip install neo4j-parallel-spark-loader>=0.5.0 || echo "neo4j-parallel-spark-loader not available - skipping"
-    
+        # Dependencies are already installed via environment.yml
+        echo "Dependencies installed via conda environment.yml"
+        # Verify key packages are available
+        python -c "import pyspark; print(f'PySpark: {pyspark.__version__}')"
+        python -c "import neo4j; print(f'Neo4j: {neo4j.__version__}')"
+
     - name: Code formatting check (black)
+      shell: bash -l {0}
       run: |
         black --check --diff .
-    
+
     - name: Import sorting check (isort)
+      shell: bash -l {0}
       run: |
         isort --check-only --diff .
-    
+
     - name: Linting (flake8)
+      shell: bash -l {0}
       run: |
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
-    
+
     - name: Type checking (mypy)
+      shell: bash -l {0}
       run: |
         mypy --install-types --non-interactive .
       continue-on-error: true  # Allow to pass for now during migration
-    
+
     - name: Security check (bandit)
+      shell: bash -l {0}
       run: |
         bandit -r . -x tests/ -f json -o bandit-report.json
         bandit -r . -x tests/ -ll
       continue-on-error: true
-    
+
     - name: Dependency vulnerability check (safety)
+      shell: bash -l {0}
       run: |
         safety check --json --output safety-report.json
         safety check
       continue-on-error: true
-    
+
     - name: Run unit tests with coverage
+      shell: bash -l {0}
       run: |
-        pytest tests/test_flight_search_unit.py -v --cov=. --cov-report=xml --cov-report=term-missing
+        pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py -v --cov=. --cov-report=xml --cov-report=term-missing
       env:
         # Mock environment for tests that don't need real Neo4j
         NEO4J_URI: bolt://localhost:7687
         NEO4J_USERNAME: neo4j
         NEO4J_PASSWORD: test
         NEO4J_DATABASE: test
-    
+
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
+      if: always()
       with:
+        token: ${{ secrets.CODECOV_TOKEN }}
         file: ./coverage.xml
         flags: unittests
         name: codecov-umbrella
@@ -94,7 +103,7 @@ jobs:
   integration-test:
     runs-on: ubuntu-latest
     needs: test
-    
+
     services:
       neo4j:
         image: neo4j:5.11-community
@@ -112,22 +121,23 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python 3.10
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r requirements-dev.txt
-    
+
+    - name: Setup Conda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        environment-file: environment.yml
+        activate-environment: neo4j
+        auto-activate-base: false
+
     - name: Wait for Neo4j to be ready
       run: |
         timeout 60 bash -c 'until curl -f http://localhost:7474; do sleep 2; done'
-    
+
     - name: Skip integration tests (require loaded data)
       run: |
         echo "Integration tests skipped - require loaded dataset"
@@ -140,10 +150,10 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     needs: test
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Build Docker image
       run: |
         docker build -t flight-search:${{ github.sha }} .

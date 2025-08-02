@@ -17,10 +17,10 @@ CREATE CONSTRAINT schedule_id_unique IF NOT EXISTS
 FOR (s:Schedule) REQUIRE s.schedule_id IS UNIQUE;
 
 // Ensure critical schedule properties exist
-CREATE CONSTRAINT schedule_properties IF NOT EXISTS  
+CREATE CONSTRAINT schedule_properties IF NOT EXISTS
 FOR (s:Schedule) REQUIRE (s.schedule_id, s.effective_date, s.discontinued_date) IS NOT NULL;
 
-// Airport Constraints  
+// Airport Constraints
 // ------------------
 // IATA codes must be unique (e.g., 'LAX', 'JFK')
 CREATE CONSTRAINT airport_code_unique IF NOT EXISTS
@@ -31,7 +31,7 @@ CREATE CONSTRAINT airport_code_exists IF NOT EXISTS
 FOR (a:Airport) REQUIRE a.code IS NOT NULL;
 
 // Carrier Constraints
-// ------------------  
+// ------------------
 // Airline codes must be unique (e.g., 'AA', 'UA')
 CREATE CONSTRAINT carrier_code_unique IF NOT EXISTS
 FOR (c:Carrier) REQUIRE c.code IS UNIQUE;
@@ -40,17 +40,17 @@ FOR (c:Carrier) REQUIRE c.code IS UNIQUE;
 CREATE CONSTRAINT carrier_code_exists IF NOT EXISTS
 FOR (c:Carrier) REQUIRE c.code IS NOT NULL;
 
-// Note: Day and cabin information is stored as bitmap properties 
+// Note: Day and cabin information is stored as bitmap properties
 // directly on Schedule nodes (service_days_bitmap, cabin_bitmap)
 // No separate Day or CabinClass nodes are used in this implementation
 
 // =============================================================================
 // PERFORMANCE BENEFITS:
-// 
-// 1. MERGE Operations: Constraints create implicit indexes that make 
+//
+// 1. MERGE Operations: Constraints create implicit indexes that make
 //    MERGE operations much faster during bulk loading
 //
-// 2. Uniqueness Enforcement: Prevents duplicate nodes during parallel 
+// 2. Uniqueness Enforcement: Prevents duplicate nodes during parallel
 //    loading, which could cause relationship inconsistencies
 //
 // 3. Query Performance: Implicit indexes speed up lookups in queries
