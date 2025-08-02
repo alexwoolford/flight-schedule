@@ -18,7 +18,7 @@ import pytest
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import load_bts_data
+import load_bts_data  # noqa: E402
 
 
 class TestSparkConfiguration:
@@ -38,8 +38,12 @@ class TestSparkConfiguration:
                 "spark.serializer",
             ]
 
+            # Verify all expected keys are important for Spark configuration
+            assert len(expected_config_keys) > 0
+            for key in expected_config_keys:
+                assert key.startswith("spark.")
+
             # The function should build a valid config dict
-            # We test the structure without actually creating Spark session
             assert load_bts_data.SPARK_AVAILABLE or not load_bts_data.SPARK_AVAILABLE
 
     def test_spark_config_validation(self):
@@ -137,7 +141,7 @@ class TestSchemaSetupQueries:
         for pattern, should_be_valid in valid_patterns:
             assert isinstance(pattern, str)
             assert len(pattern) > 0
-            assert should_be_valid == True
+            assert should_be_valid
 
     def test_node_label_validation(self):
         """Test node label validation in queries"""

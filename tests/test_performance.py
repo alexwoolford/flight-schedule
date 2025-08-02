@@ -152,7 +152,7 @@ class TestFlightSearchPerformance:
                 direct_flights >= 0 and connections >= 0
             ), "Queries should return valid counts"
 
-            print(f"   📊 Complete search performance:")
+            print("   📊 Complete search performance:")
             print(f"      • Direct flights: {direct_time:.0f}ms")
             print(f"      • Connections: {connection_time:.0f}ms")
             print(f"      • Total time: {total_time:.0f}ms")
@@ -236,6 +236,6 @@ class TestPerformanceBenchmarks:
             assert connections >= 0, "Should return valid result"
 
             print(f"   🎯 Complex multi-hop query: {query_time:.0f}ms")
-            print(f"      • SQL equivalent: 6+ table joins + subqueries")
-            print(f"      • Graph advantage: Single traversal query")
+            print("      • SQL equivalent: 6+ table joins + subqueries")
+            print("      • Graph advantage: Single traversal query")
             print(f"      • Results: {connections:,} valid connections")

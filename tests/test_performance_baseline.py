@@ -53,7 +53,7 @@ class TestPerformanceBaseline:
             if schedule_count == 0:
                 pytest.skip("Database is empty - no data to test performance against")
 
-            print(f"📊 Database contains:")
+            print("📊 Database contains:")
             print(f"   • {schedule_count:,} Schedule nodes")
             print(f"   • {airport_count:,} Airport nodes")
             print(f"   • {carrier_count:,} Carrier nodes")
@@ -109,7 +109,7 @@ class TestPerformanceBaseline:
             )
 
             indexes = list(result)
-            print(f"📈 Current index usage (top indexes by readCount):")
+            print("📈 Current index usage (top indexes by readCount):")
 
             for idx in indexes[:10]:  # Top 10 most used indexes
                 name = idx.get("name", "unknown")
@@ -223,7 +223,7 @@ class TestPerformanceBaseline:
             sample_origins = connection_data["sample_origins"]
             sample_destinations = connection_data["sample_destinations"]
 
-            print(f"📊 Connection flight baseline:")
+            print("📊 Connection flight baseline:")
             print(f"   • Query time: {query_time:.1f}ms")
             print(f"   • Connections found: {connection_count}")
             print(f"   • Avg connection time: {avg_connection_time:.1f} minutes")
@@ -271,7 +271,7 @@ class TestPerformanceBaseline:
             morning_flights = morning_data["morning_flights"]
             morning_airports = morning_data["morning_airports"]
 
-            print(f"📊 Temporal filtering baseline (6-10 AM flights):")
+            print("📊 Temporal filtering baseline (6-10 AM flights):")
             print(f"   • Query time: {query_time:.1f}ms")
             print(f"   • Morning flights: {morning_flights}")
             print(f"   • Airports with morning flights: {morning_airports}")
@@ -427,7 +427,7 @@ class TestQueryCorrectness:
             avg_conn = stats["avg_connection"]
             total = stats["total_connections"]
 
-            print(f"✅ Connection temporal validation:")
+            print("✅ Connection temporal validation:")
             print(f"   • {total} valid connections found")
             print(f"   • Connection time range: {min_conn}-{max_conn} minutes")
             print(f"   • Average connection time: {avg_conn:.1f} minutes")
@@ -506,7 +506,7 @@ class TestQueryCorrectness:
             max_dur = stats["max_duration"]
             avg_dur = stats["avg_duration"]
 
-            print(f"✅ Flight data consistency check:")
+            print("✅ Flight data consistency check:")
             print(f"   • Total flights: {total}")
             print(f"   • Same airport flights: {same_airport}")
             print(f"   • Flight duration range: {min_dur}-{max_dur} minutes")

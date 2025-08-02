@@ -178,5 +178,5 @@ class TestConnectionLogic:
                 f"❌ Old logic produces {negative_count} negative connections out of {total_count} total"
             )
             print(
-                f"   This is why the browser query failed with 'Cannot divide DateTime by Long'"
+                "   This is why the browser query failed with 'Cannot divide DateTime by Long'"
             )
