@@ -17,7 +17,7 @@ python download_bts_flight_data.py --year 2024
 
 - **7,079,061 real flights** from 2024
 - **15 major US airlines** (Southwest, Delta, American, United, etc.)
-- **347 real airports** 
+- **347 real airports**
 - **6,000+ real routes**
 - **Complete temporal data** (scheduled vs actual times)
 - **Government-verified accuracy**
@@ -32,12 +32,12 @@ python download_bts_flight_data.py --year 2024
 
 ## Features
 
-✅ **No re-downloads** - Skips existing files  
-✅ **Retry logic** - Handles network timeouts  
-✅ **Progress bars** - Shows download progress  
-✅ **Requirements check** - Validates dependencies  
-✅ **Error recovery** - Graceful failure handling  
-✅ **Summary stats** - Dataset overview  
+✅ **No re-downloads** - Skips existing files
+✅ **Retry logic** - Handles network timeouts
+✅ **Progress bars** - Shows download progress
+✅ **Requirements check** - Validates dependencies
+✅ **Error recovery** - Graceful failure handling
+✅ **Summary stats** - Dataset overview
 
 ## Usage Examples
 
@@ -66,7 +66,7 @@ data/bts_flight_data/
 
 Each flight record contains:
 - Flight date, airline, flight number
-- Origin/destination airports  
+- Origin/destination airports
 - Scheduled vs actual departure/arrival times
 - Delays, cancellations, diversions
 - Aircraft tail number, distance

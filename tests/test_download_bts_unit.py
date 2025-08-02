@@ -19,7 +19,7 @@ import pytest
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import download_bts_flight_data
+import download_bts_flight_data  # noqa: E402
 
 
 class TestBTSFlightDataDownloader:
@@ -135,8 +135,7 @@ class TestBTSFlightDataDownloader:
 
     def test_directory_creation_logic(self):
         """Test output directory handling"""
-        # Test with non-existent directory
-        new_dir = Path(self.temp_dir) / "new_subdir"
+        # Test with downloader directory creation
         downloader = download_bts_flight_data.BTSFlightDataDownloader()
 
         # Directory should be created when needed
@@ -160,10 +159,11 @@ class TestBTSFlightDataDownloader:
         current_year = datetime.now().year
         current_month = datetime.now().month
 
-        # Test valid date ranges
+        # Test valid date ranges including current month
         valid_combinations = [
             (current_year - 1, 12),  # Last year, December
             (current_year, 1),  # This year, January
+            (current_year, min(current_month, 12)),  # Current year/month
         ]
 
         for year, month in valid_combinations:
@@ -330,7 +330,7 @@ class TestIntegrationReadiness:
         try:
             # These should not crash the system
             url = f"{downloader.base_url}/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_2024_1.zip"
-            filename = f"bts_flights_2024_01.parquet"
+            filename = "bts_flights_2024_01.parquet"
 
             assert isinstance(url, str)
             assert isinstance(filename, str)

@@ -73,7 +73,7 @@ AIRLINE_COLUMNS = [
 ]
 
 AIRPORT_COLUMNS = [
-    'origin', 'dest',              # Airport codes  
+    'origin', 'dest',              # Airport codes
     'originairportid', 'destairportid'  # Unique IDs
 ]
 
@@ -82,10 +82,10 @@ SCHEDULE_CORE = [
     'flight_number_reporting_airline',  # Flight number
     'reporting_airline',           # Links to airline
     'origin', 'dest',             # Links to airports
-    
+
     # Temporal data (your requirement!)
     'crsdeptime', 'crsarrtime',   # Scheduled times
-    'deptime', 'arrtime',         # Actual times  
+    'deptime', 'arrtime',         # Actual times
     'crselapsedtime', 'actualelapsedtime'  # Durations
 ]
 ```
@@ -109,7 +109,7 @@ AIRPORT_METADATA = [
 
 ### Skip These Columns
 - `div1-div5*` columns - Diversion details (<1% populated)
-- `*delay` breakdown columns - Cause analysis (24.5% populated)  
+- `*delay` breakdown columns - Cause analysis (24.5% populated)
 - `firstdeptime`, `totaladdgtime` - Gate returns (0.8% populated)
 - `*timeblk` columns - Time groupings (can be derived)
 - `unnamed:_109` - Empty column
@@ -136,10 +136,10 @@ AIRPORT_METADATA = [
 ## 🎯 Neo4j Loading Strategy
 
 1. **Create unique constraints** on primary keys
-2. **Load in order**: Airlines → Airports → Schedules  
+2. **Load in order**: Airlines → Airports → Schedules
 3. **Use temporal types** for all time columns
 4. **Index temporal fields** for fast queries
-5. **Create relationships**: 
+5. **Create relationships**:
    - `(Schedule)-[:OPERATED_BY]->(Airline)`
    - `(Schedule)-[:DEPARTS_FROM]->(Airport)`
    - `(Schedule)-[:ARRIVES_AT]->(Airport)`

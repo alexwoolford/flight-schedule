@@ -10,15 +10,23 @@ No external dependencies, no large dataset queries.
 import os
 import tempfile
 from datetime import datetime
+
+
 class TestBasicFunctionality:
     """Basic functionality tests for CI"""
 
     def test_imports(self):
         """Test that core modules can be imported"""
-        import download_bts_flight_data
-        import load_bts_data
+        try:
+            import download_bts_flight_data
+            import load_bts_data
 
-        assert True
+            # Verify modules have expected classes/functions
+            assert hasattr(download_bts_flight_data, "BTSFlightDataDownloader")
+            assert hasattr(load_bts_data, "load_bts_data")
+            assert True
+        except ImportError:
+            assert False, "Failed to import core modules"
 
     def test_datetime_handling(self):
         """Test datetime operations work correctly"""

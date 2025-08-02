@@ -13,12 +13,11 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import download_bts_flight_data
-import load_bts_data
+import download_bts_flight_data  # noqa: E402
+import load_bts_data  # noqa: E402
 
 
 class TestDataFlowValidation:
@@ -28,6 +27,9 @@ class TestDataFlowValidation:
         """Test file format compatibility between download and load"""
         # Test that download produces what load expects
         downloader = download_bts_flight_data.BTSFlightDataDownloader()
+
+        # Verify downloader is properly initialized
+        assert downloader.data_dir.exists()
 
         # Test filename consistency
         year, month = 2024, 3
@@ -436,7 +438,7 @@ class TestSystemReadiness:
     def test_integration_points(self):
         """Test integration points"""
         # Test that modules can work together
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory():
             # Test download module setup
             downloader = download_bts_flight_data.BTSFlightDataDownloader()
             assert hasattr(downloader, "data_dir")
