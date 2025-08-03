@@ -376,8 +376,39 @@ if [ "$LOAD_DATA" = true ]; then
         exit 1
     fi
 
-    # Verify load
+    # Verify load - recreate check_data.py since it was deleted earlier
+    cat > check_data.py << 'EOF'
+import os
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+
+load_dotenv()
+
+try:
+    driver = GraphDatabase.driver(
+        os.getenv("NEO4J_URI"),
+        auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
+    )
+
+    with driver.session(database=os.getenv("NEO4J_DATABASE")) as session:
+        # Count schedules
+        result = session.run("MATCH (s:Schedule) RETURN count(s) as count")
+        schedule_count = result.single()["count"]
+
+        # Count airports
+        result = session.run("MATCH (a:Airport) RETURN count(a) as count")
+        airport_count = result.single()["count"]
+
+        print(f"{schedule_count},{airport_count}")
+
+    driver.close()
+
+except Exception as e:
+    print("0,0")
+EOF
+
     FINAL_COUNTS=$(python check_data.py 2>/dev/null)
+    rm -f check_data.py
     FINAL_SCHEDULE_COUNT=$(echo "$FINAL_COUNTS" | cut -d',' -f1)
     FINAL_AIRPORT_COUNT=$(echo "$FINAL_COUNTS" | cut -d',' -f2)
 
