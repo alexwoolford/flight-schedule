@@ -292,7 +292,10 @@ def validate_schema_consistency(data_dir: Path) -> dict:
                     if dtype != reference_types[col]:
                         results["consistent_schemas"] = False
                         results["critical_columns"][col]["consistent"] = False
-                        issue = f"{col}: {file_path.name} has {dtype}, expected {reference_types[col]}"
+                        issue = (
+                            f"{col}: {file_path.name} has {dtype}, "
+                            f"expected {reference_types[col]}"
+                        )
                         results["issues"].append(issue)
                         print(f"   ❌ {issue}")
                     else:

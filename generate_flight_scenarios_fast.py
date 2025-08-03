@@ -156,7 +156,9 @@ def generate_scenarios_fast():
             # Sample smaller airports
             sample_size = min(10, len(smaller_airports))
             if sample_size > 0:
-                sampled_airports = random.sample(smaller_airports, sample_size)  # nosec B311
+                sampled_airports = random.sample(
+                    smaller_airports, sample_size
+                )  # nosec B311
                 for spoke in sampled_airports:
                     hub_to_spoke_pairs.append(
                         {
