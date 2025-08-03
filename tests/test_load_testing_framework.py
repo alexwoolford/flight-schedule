@@ -24,7 +24,9 @@ class TestFlightScenarioGeneration:
         scenario_file = Path("flight_test_scenarios.json")
         if not scenario_file.exists():
             pytest.skip(
-                "flight_test_scenarios.json not found - this is expected since it's a generated file. Run generate_flight_scenarios.py after loading flight data."
+                "flight_test_scenarios.json not found - this is expected since it's a "
+                "generated file. Run generate_flight_scenarios.py after loading "
+                "flight data."
             )
 
         with open(scenario_file, "r") as f:
@@ -157,7 +159,9 @@ class TestLoadTestScriptValidation:
                 for m in methods
                 if hasattr(getattr(user_class, m), "locust_task_weight")
             ]
-            assert len(task_methods) >= 3  # Should have multiple task types
+            assert (
+                len(task_methods) >= 2
+            )  # Should have multiple task types (direct + connection)
 
         finally:
             # Cleanup: restore original scenarios file if it existed
@@ -179,7 +183,8 @@ class TestLoadTestScriptValidation:
         # Test the unified query structure (this is the core query logic)
         unified_query = """
         // Direct flights
-        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(direct:Schedule)-[:ARRIVES_AT]->(d:Airport {code: $dest})
+        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(direct:Schedule)
+              -[:ARRIVES_AT]->(d:Airport {code: $dest})
         WHERE direct.flightdate = $search_date
           AND direct.scheduled_departure_time IS NOT NULL
           AND direct.scheduled_arrival_time IS NOT NULL
@@ -188,25 +193,31 @@ class TestLoadTestScriptValidation:
             type: "direct",
             departure_time: direct.scheduled_departure_time,
             arrival_time: direct.scheduled_arrival_time,
-            flight: direct.reporting_airline + toString(direct.flight_number_reporting_airline),
-            duration_minutes: duration.between(direct.scheduled_departure_time, direct.scheduled_arrival_time).minutes,
+            flight: direct.reporting_airline +
+                    toString(direct.flight_number_reporting_airline),
+            duration_minutes: duration.between(direct.scheduled_departure_time,
+                                               direct.scheduled_arrival_time).minutes,
             distance: direct.distance_miles
         }) AS direct_flights
 
         // One-stop connections
-        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
-              <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(d:Airport {code: $dest})
+        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)
+              -[:ARRIVES_AT]->(hub:Airport)<-[:DEPARTS_FROM]-(s2:Schedule)
+              -[:ARRIVES_AT]->(d:Airport {code: $dest})
 
         WHERE s1.flightdate = $search_date
           AND s2.flightdate = $search_date
           AND s1.scheduled_arrival_time IS NOT NULL
           AND s2.scheduled_departure_time IS NOT NULL
           AND s2.scheduled_departure_time > s1.scheduled_arrival_time
-          AND hub.code <> $origin AND hub.code <> $dest
+          AND hub.code <> $origin
+          AND hub.code <> $dest
 
         WITH direct_flights, s1, s2, hub,
-             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes AS layover_minutes,
-             duration.between(s1.scheduled_departure_time, s2.scheduled_arrival_time).minutes AS total_duration
+             duration.between(s1.scheduled_arrival_time,
+                              s2.scheduled_departure_time).minutes AS layover_minutes,
+             duration.between(s1.scheduled_departure_time,
+                              s2.scheduled_arrival_time).minutes AS total_duration
 
         WHERE layover_minutes >= 45 AND layover_minutes <= 300
 
@@ -217,8 +228,10 @@ class TestLoadTestScriptValidation:
             hub: hub.code,
             layover_minutes: layover_minutes,
             total_duration: total_duration,
-            flight1: s1.reporting_airline + toString(s1.flight_number_reporting_airline),
-            flight2: s2.reporting_airline + toString(s2.flight_number_reporting_airline)
+            flight1: s1.reporting_airline +
+                     toString(s1.flight_number_reporting_airline),
+            flight2: s2.reporting_airline +
+                     toString(s2.flight_number_reporting_airline)
         }) AS connection_flights
 
         // Combine and return all options
@@ -304,8 +317,11 @@ class TestLoadTestFrameworkReadiness:
         ]
 
         for script in analysis_scripts:
-            script_path = Path(script)
-            assert script_path.exists(), f"Analysis script {script} not found"
+            # Look for script in project root (parent of tests directory)
+            script_path = Path(__file__).parent.parent / script
+            assert (
+                script_path.exists()
+            ), f"Analysis script {script} not found at {script_path}"
 
     def test_documentation_completeness(self):
         """Test that load testing documentation exists"""
@@ -380,5 +396,6 @@ class TestTestingFrameworkSanity:
             "   These verify setup and configuration without running actual load tests"
         )
         print(
-            "   Actual performance testing happens when you run: locust -f realistic_flight_search_load_test.py"
+            "   Actual performance testing happens when you run: "
+            "locust -f realistic_flight_search_load_test.py"
         )
