@@ -444,7 +444,7 @@ print('✅ Load test framework imports successfully')
 # Quick validation - test Neo4j connection without creating User instance
 load_dotenv()
 neo4j_uri = os.getenv('NEO4J_URI')
-neo4j_user = os.getenv('NEO4J_USER')
+neo4j_user = os.getenv('NEO4J_USERNAME')
 neo4j_password = os.getenv('NEO4J_PASSWORD')
 neo4j_database = os.getenv('NEO4J_DATABASE', 'neo4j')
 
