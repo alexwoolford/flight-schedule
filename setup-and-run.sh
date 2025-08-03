@@ -435,13 +435,25 @@ log_success "Flight scenarios generated"
 log "Testing load testing framework..."
 python -c "
 import neo4j_flight_load_test
+import os
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+
 print('✅ Load test framework imports successfully')
 
-# Quick validation
-user = neo4j_flight_load_test.Neo4jUser()
-user.on_start()
-print(f'✅ Connected to Neo4j with {len(user.airports)} airports loaded')
-user.on_stop()
+# Quick validation - test Neo4j connection without creating User instance
+load_dotenv()
+neo4j_uri = os.getenv('NEO4J_URI')
+neo4j_user = os.getenv('NEO4J_USER')
+neo4j_password = os.getenv('NEO4J_PASSWORD')
+neo4j_database = os.getenv('NEO4J_DATABASE', 'neo4j')
+
+driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+with driver.session(database=neo4j_database) as session:
+    result = session.run('MATCH (a:Airport) RETURN count(a) as airport_count')
+    airport_count = result.single()['airport_count']
+    print(f'✅ Connected to Neo4j with {airport_count} airports loaded')
+driver.close()
 print('✅ Load test framework ready')
 " >> "$LOG_FILE" 2>&1
 
