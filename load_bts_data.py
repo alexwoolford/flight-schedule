@@ -808,8 +808,8 @@ def load_bts_data(
                                     f"   ❌ Failed to load: {pfile.name} - Data type mismatch (likely schema change)"
                                 )
                                 print(
-                                    f"      Suggestion: This file may have incompatible data types. "
-                                    f"Consider re-downloading or excluding this file."
+                                    "      Suggestion: This file may have incompatible data types. "
+                                    "Consider re-downloading or excluding this file."
                                 )
                             else:
                                 print(
