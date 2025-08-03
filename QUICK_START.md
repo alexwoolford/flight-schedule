@@ -17,9 +17,9 @@ git clone https://github.com/alexwoolford/flight-schedule.git && cd flight-sched
 ## What This Does (Fully Automated)
 
 1. **✅ Environment Setup**: Creates conda environment with all dependencies
-2. **📥 Data Download**: Downloads real BTS flight data (586K+ records, ~2GB)
+2. **📥 Data Download**: Downloads real BTS flight data (7-8M+ records, all 12 months of 2024)
 3. **🔗 Neo4j Integration**: Connects to your Neo4j instance (Aura, self-hosted, etc.)
-4. **⚡ Data Loading**: Loads flight data using optimized Spark pipeline (~5 minutes)
+4. **⚡ Data Loading**: Loads ALL flight data using optimized Spark pipeline (~15-30 minutes)
 5. **🧪 Testing**: Validates system with comprehensive test suite
 6. **🚀 Load Testing**: Sets up production-ready Locust framework
 
@@ -66,16 +66,16 @@ LIMIT 5
 |-------|------|-------|
 | Environment Setup | 2-3 min | Conda environment creation |
 | Data Download | 10-15 min | Real BTS data (government servers) |
-| Data Loading | 5-10 min | Spark → Neo4j (~4K records/sec) |
+| Data Loading | 15-30 min | Spark → Neo4j (~4K records/sec, 7-8M records) |
 | Validation | 1-2 min | Test suite execution |
-| **Total** | **~20 minutes** | **Fully hands-off after credential input** |
+| **Total** | **~35-50 minutes** | **Fully hands-off after credential input** |
 
 ## What You Get
 
-- **586K+ Flight Schedules** (March 2024 real data)
+- **7-8M+ Flight Schedules** (All 12 months of 2024 real data)
 - **331 US Airports** with actual codes
 - **15 Airlines** with real flight numbers
-- **1.76M Relationships** (optimized graph structure)
+- **21M+ Relationships** (optimized graph structure)
 - **Production Load Testing** (331 airports = 109K+ route combinations)
 - **Sub-second Queries** with proper indexing
 

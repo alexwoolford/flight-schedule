@@ -12,7 +12,7 @@
 
 A production-ready Neo4j graph database system that processes real Bureau of Transportation Statistics (BTS) flight data using Apache Spark. Designed for flight schedule analysis and graph-based queries.
 
-> *Load 586K+ real government flight records in ~2 minutes and query them with sub-second response times.*
+> *Load 7-8M+ real government flight records and query them with sub-second response times.*
 
 The system provides a complete pipeline from BTS data download to Neo4j graph creation with comprehensive testing and monitoring.
 
@@ -21,10 +21,10 @@ The system provides a complete pipeline from BTS data download to Neo4j graph cr
 - **Real Flight Search**: Origin → destination with departure time preferences
 - **Connection Logic**: Multi-hop routes with connection timing (45-300 minutes)
 
-- **Graph Performance**: Sub-second queries on 586K+ real BTS flight records
+- **Graph Performance**: Sub-second queries on 7-8M+ real BTS flight records
 - **Business Logic**: Realistic connection rules and timing validation
 
-## 🚀 One-Liner Setup (Zero to Production in ~20 minutes)
+## 🚀 One-Liner Setup (Zero to Production in ~35-50 minutes)
 
 **Get everything running with a single command:**
 
@@ -34,7 +34,7 @@ git clone https://github.com/alexwoolford/flight-schedule.git && cd flight-sched
 
 ✅ **What this does automatically:**
 - Creates conda environment with all dependencies
-- Downloads real BTS flight data (586K+ records)
+- Downloads real BTS flight data (7-8M+ records, all 12 months)
 - Loads data into your Neo4j instance (Aura, self-hosted, etc.)
 - Sets up production-ready load testing framework
 - Runs comprehensive validation tests
@@ -123,14 +123,14 @@ ls data/bts_flight_data/
 ### 4. Load Data into Graph
 
 ```bash
-# Load BTS data (586K+ records for March 2024) using Spark
-python load_bts_data.py --single-file bts_flights_2024_03.parquet --data-path data/bts_flight_data
+# Load ALL BTS data (7-8M+ records for all 12 months of 2024) using Spark
+python load_bts_data.py --load-all-files --data-path data/bts_flight_data
 
 # This creates:
-# - 586K+ Schedule nodes
+# - 7-8M+ Schedule nodes
 # - 331 Airport nodes
 # - 15 Carrier nodes
-# - 1.76M relationships (3x Schedule nodes for DEPARTS_FROM, ARRIVES_AT, OPERATED_BY)
+# - 21M+ relationships (3x Schedule nodes for DEPARTS_FROM, ARRIVES_AT, OPERATED_BY)
 ```
 
 ### 5. Verify Installation
