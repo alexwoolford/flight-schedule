@@ -30,6 +30,285 @@ except ImportError:
     HAS_TQDM = False
 
 
+# ============================================================================
+# BTS DATA SCHEMA ENFORCEMENT
+# ============================================================================
+# Comprehensive schema definition to ensure consistent data types across
+# all months, preventing ClassCastException and timestamp compatibility issues
+
+BTS_COLUMN_TYPES = {
+    # ==== CORE IDENTIFIERS (always integers) ====
+    "year": "int32",
+    "quarter": "int32",
+    "month": "int32",
+    "dayofmonth": "int32",
+    "dayofweek": "int32",
+    "flight_number_reporting_airline": "int64",  # Non-nullable integer (filter NULLs)
+    "dot_id_reporting_airline": "int64",
+    # ==== AIRLINE IDENTIFIERS (strings) ====
+    "reporting_airline": "string",
+    "iata_code_reporting_airline": "string",
+    "tail_number": "string",
+    # ==== AIRPORT IDENTIFIERS ====
+    "origin": "string",  # Airport codes (LGA, JFK, etc.)
+    "dest": "string",
+    "originairportid": "Int64",
+    "originairportseqid": "Int64",
+    "destairportid": "Int64",
+    "destairportseqid": "Int64",
+    # ==== GEOGRAPHIC DATA ====
+    "origincitymarketid": "Int64",
+    "destcitymarketid": "Int64",
+    "origincityname": "string",
+    "destcityname": "string",
+    "originstate": "string",
+    "deststate": "string",
+    "originstatename": "string",
+    "deststatename": "string",
+    "originstatefips": "Int64",
+    "deststatefips": "Int64",
+    "originwac": "Int64",
+    "destwac": "Int64",
+    # ==== TIME/DATE COLUMNS (datetime with microsecond precision) ====
+    "flightdate": "datetime64[us]",
+    "crsdeptime": "datetime64[us]",
+    "deptime": "datetime64[us]",
+    "crsarrtime": "datetime64[us]",
+    "arrtime": "datetime64[us]",
+    "wheelsoff": "datetime64[us]",
+    "wheelson": "datetime64[us]",
+    "firstdeptime": "datetime64[us]",
+    # ==== TIME BLOCKS (strings) ====
+    "deptimeblk": "string",
+    "arrtimeblk": "string",
+    # ==== DELAY AND PERFORMANCE (nullable floats) ====
+    "crselapsedtime": "Float64",
+    "actualelapsedtime": "Float64",
+    "airtime": "Float64",
+    "flights": "Float64",
+    "distance": "Float64",
+    "distancegroup": "Int64",
+    "depdelay": "Float64",
+    "depdelayminutes": "Float64",
+    "depdel15": "Float64",
+    "departuredelaygroups": "Float64",
+    "arrdelay": "Float64",
+    "arrdelayminutes": "Float64",
+    "arrdel15": "Float64",
+    "arrivaldelaygroups": "Float64",
+    "carrierdelay": "Float64",
+    "weatherdelay": "Float64",
+    "nasdelay": "Float64",
+    "securitydelay": "Float64",
+    "lateaircraftdelay": "Float64",
+    "taxiout": "Float64",
+    "taxiin": "Float64",
+    # ==== CANCELLATION/DIVERSION ====
+    "cancelled": "Float64",  # 0.0/1.0 indicator
+    "cancellationcode": "string",
+    "diverted": "Float64",  # 0.0/1.0 indicator
+    "divreacheddest": "Float64",
+    "divactualelapsedtime": "Float64",
+    "divarrdelay": "Float64",
+    "divdistance": "Float64",
+    "divairportlandings": "Int64",
+    # ==== DIVERSION DETAILS (all nullable) ====
+    "div1airport": "string",
+    "div1airportid": "Float64",
+    "div1airportseqid": "Float64",
+    "div1wheelson": "Float64",
+    "div1wheelsoff": "Float64",
+    "div1totalgtime": "Float64",
+    "div1longestgtime": "Float64",
+    "div1tailnum": "string",
+    "div2airport": "string",
+    "div2airportid": "Float64",
+    "div2airportseqid": "Float64",
+    "div2wheelson": "Float64",
+    "div2wheelsoff": "Float64",
+    "div2totalgtime": "Float64",
+    "div2longestgtime": "Float64",
+    "div2tailnum": "string",
+    "div3airport": "string",
+    "div3airportid": "Float64",
+    "div3airportseqid": "Float64",
+    "div3wheelson": "Float64",
+    "div3wheelsoff": "Float64",
+    "div3totalgtime": "Float64",
+    "div3longestgtime": "Float64",
+    "div3tailnum": "string",
+    "div4airport": "string",
+    "div4airportid": "Float64",
+    "div4airportseqid": "Float64",
+    "div4wheelson": "Float64",
+    "div4wheelsoff": "Float64",
+    "div4totalgtime": "Float64",
+    "div4longestgtime": "Float64",
+    "div4tailnum": "string",
+    "div5airport": "string",
+    "div5airportid": "Float64",
+    "div5airportseqid": "Float64",
+    "div5wheelson": "Float64",
+    "div5wheelsoff": "Float64",
+    "div5totalgtime": "Float64",
+    "div5longestgtime": "Float64",
+    "div5tailnum": "string",
+    "totaladdgtime": "Float64",
+    "longestaddgtime": "Float64",
+    "unnamed:_109": "Float64",  # Often empty column
+}
+
+
+def enforce_bts_schema(csv_path: str) -> pd.DataFrame:
+    """Read CSV with enforced BTS schema for consistency across all months."""
+    print("   📋 Reading CSV with enforced schema...")
+
+    # Read CSV with object dtype first to avoid inference issues
+    df = pd.read_csv(csv_path, dtype="object", low_memory=False)
+
+    # Clean column names
+    df.columns = df.columns.str.lower().str.replace(" ", "_")
+
+    print(f"   🔧 Enforcing data types for {len(df.columns)} columns...")
+
+    # Apply schema enforcement
+    for col in df.columns:
+        if col in BTS_COLUMN_TYPES:
+            target_type = BTS_COLUMN_TYPES[col]
+            try:
+                df[col] = _convert_column_type(df[col], target_type, col)
+            except Exception as e:
+                print(
+                    f"      ⚠️  Warning: Failed to convert {col} to {target_type}: {e}"
+                )
+
+    # Handle NULL values in critical non-nullable columns
+    critical_cols = ["flight_number_reporting_airline", "dot_id_reporting_airline"]
+    for col in critical_cols:
+        if col in df.columns:
+            null_count = df[col].isnull().sum()
+            if null_count > 0:
+                print(f"   🧹 Dropping {null_count} rows with NULL {col}")
+                df = df.dropna(subset=[col])
+                # Re-convert to int64 after dropping NULLs
+                df[col] = df[col].astype("int64")
+
+    print(f"   ✅ Schema enforcement complete - final shape: {df.shape}")
+    return df
+
+
+def _convert_column_type(
+    series: pd.Series, target_type: str, col_name: str
+) -> pd.Series:
+    """Convert a pandas Series to the target data type with proper null handling"""
+
+    if target_type.startswith("datetime64"):
+        if "time" in col_name and col_name != "flightdate":
+            # Handle HHMM time format
+            return pd.to_datetime(series, format="%H%M", errors="coerce").dt.floor("us")
+        else:
+            # Handle date columns
+            return pd.to_datetime(series, errors="coerce").dt.floor("us")
+    elif target_type == "string":
+        return series.astype("string")
+    elif target_type == "int64":
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        return numeric_series.astype("int64")
+    elif target_type == "Float64":
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    elif target_type == "Int64":
+        return pd.to_numeric(series, errors="coerce").astype("Int64")
+    elif target_type == "int32":
+        return pd.to_numeric(series, errors="coerce").astype("int32")
+    else:
+        return series.astype(target_type)
+
+
+def get_bts_pyarrow_schema() -> pa.Schema:
+    """Generate PyArrow schema for consistent Parquet writing"""
+    fields = []
+    for col_name, dtype in BTS_COLUMN_TYPES.items():
+        if dtype.startswith("datetime64"):
+            fields.append(pa.field(col_name, pa.timestamp("us")))
+        elif dtype == "string":
+            fields.append(pa.field(col_name, pa.string()))
+        elif dtype in ["int32"]:
+            fields.append(pa.field(col_name, pa.int32()))
+        elif dtype in ["int64", "Int64"]:
+            fields.append(pa.field(col_name, pa.int64()))
+        elif dtype == "Float64":
+            fields.append(pa.field(col_name, pa.float64()))
+        else:
+            fields.append(pa.field(col_name, pa.string()))
+    return pa.schema(fields)
+
+
+def validate_schema_consistency(data_dir: Path) -> dict:
+    """
+    Built-in schema validation to test consistency across all months.
+    Returns validation results for critical columns.
+    """
+    parquet_files = list(data_dir.glob("*.parquet"))
+    if not parquet_files:
+        return {"error": "No parquet files found"}
+
+    print(f"\n🔍 SCHEMA VALIDATION: Testing {len(parquet_files)} files")
+    print("=" * 60)
+
+    results = {
+        "files_tested": len(parquet_files),
+        "consistent_schemas": True,
+        "critical_columns": {},
+        "issues": [],
+    }
+
+    # Test critical columns that caused the original ClassCastException
+    critical_columns = ["flight_number_reporting_airline", "div2tailnum"]
+
+    reference_types = {}
+    for file_path in sorted(parquet_files):
+        print(f"📁 {file_path.name}")
+        try:
+            df = pd.read_parquet(file_path)
+
+            for col in critical_columns:
+                if col in df.columns:
+                    dtype = str(df[col].dtype)
+                    null_count = df[col].isnull().sum()
+
+                    if col not in reference_types:
+                        reference_types[col] = dtype
+                        results["critical_columns"][col] = {
+                            "reference_type": dtype,
+                            "consistent": True,
+                            "files": {},
+                        }
+
+                    results["critical_columns"][col]["files"][file_path.name] = {
+                        "dtype": dtype,
+                        "null_count": null_count,
+                    }
+
+                    if dtype != reference_types[col]:
+                        results["consistent_schemas"] = False
+                        results["critical_columns"][col]["consistent"] = False
+                        issue = f"{col}: {file_path.name} has {dtype}, expected {reference_types[col]}"
+                        results["issues"].append(issue)
+                        print(f"   ❌ {issue}")
+                    else:
+                        print(f"   ✅ {col}: {dtype} (NULLs: {null_count})")
+
+        except Exception as e:
+            issue = f"Failed to read {file_path.name}: {e}"
+            results["issues"].append(issue)
+            print(f"   ❌ {issue}")
+
+    status = "✅ PASS" if results["consistent_schemas"] else "❌ FAIL"
+    print(f"\n{status}: Schema consistency validation")
+
+    return results
+
+
 class BTSFlightDataDownloader:
     """Download real flight data from Bureau of Transportation Statistics."""
 
@@ -166,37 +445,14 @@ class BTSFlightDataDownloader:
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(self.data_dir)
 
-            # Convert CSV to Parquet for better performance
-            print("   🔄 Converting to Parquet...")
-            df = pd.read_csv(csv_path)
+            # Convert CSV to Parquet with ENFORCED SCHEMA for consistency
+            print("   🔄 Converting to Parquet with enforced schema...")
 
-            # Clean up column names
-            df.columns = df.columns.str.lower().str.replace(" ", "_")
+            # Use schema enforcer to ensure consistent data types across all months
+            df = enforce_bts_schema(csv_path)
 
-            # Convert to datetime types where appropriate with MICROSECOND precision
-            # (Spark compatible)
-            datetime_cols = [
-                "flightdate",
-                "crsdeptime",
-                "deptime",
-                "crsarrtime",
-                "arrtime",
-            ]
-            for col in datetime_cols:
-                if col in df.columns:
-                    # Handle time columns (HHMM format)
-                    if "time" in col and col != "flightdate":
-                        # Convert HHMM to proper time
-                        df[col] = pd.to_datetime(
-                            df[col], format="%H%M", errors="coerce"
-                        ).dt.floor("us")
-                    elif col == "flightdate":
-                        df[col] = pd.to_datetime(df[col], errors="coerce").dt.floor(
-                            "us"
-                        )
-
-            # Save as Spark-compatible Parquet with microsecond precision
-            self.save_spark_compatible_parquet(df, parquet_path)
+            # Save as Spark-compatible Parquet with enforced schema
+            self.save_spark_compatible_parquet_with_schema(df, parquet_path)
 
             print(f"   ✅ Saved {len(df):,} flight records to {parquet_path.name}")
 
@@ -213,9 +469,59 @@ class BTSFlightDataDownloader:
             print(f"   ❌ Error processing {year}-{month}: {e}")
             return None
 
-    def save_spark_compatible_parquet(self, df: pd.DataFrame, output_file: Path):
-        """Save DataFrame to Parquet with microsecond precision for Spark
-        compatibility."""
+    def save_spark_compatible_parquet_with_schema(
+        self, df: pd.DataFrame, output_file: Path
+    ):
+        """Save DataFrame to Parquet with enforced BTS schema for perfect consistency."""
+
+        print("   💾 Saving with enforced schema...")
+
+        # Get the predefined PyArrow schema
+        schema = get_bts_pyarrow_schema()
+
+        # Only include columns that exist in both the dataframe and our schema
+        available_columns = []
+        for field in schema:
+            if field.name in df.columns:
+                available_columns.append(field.name)
+            else:
+                print(f"      ⚠️  Column {field.name} not found in data")
+
+        # Create subset schema for available columns only
+        available_fields = [
+            field for field in schema if field.name in available_columns
+        ]
+        subset_schema = pa.schema(available_fields)
+
+        # Select only the columns we have schema definitions for
+        df_subset = df[available_columns]
+
+        print(
+            f"   📊 Using {len(available_columns)}/{len(BTS_COLUMN_TYPES)} defined columns"
+        )
+
+        try:
+            # Convert DataFrame to PyArrow table with explicit enforced schema
+            table = pa.Table.from_pandas(
+                df_subset, schema=subset_schema, preserve_index=False
+            )
+
+            # Save as Parquet with enforced schema
+            pq.write_table(table, output_file, compression="snappy")
+
+            print("   ✅ Schema-enforced Parquet saved successfully")
+
+        except Exception as e:
+            print(f"   ❌ Schema enforcement failed: {e}")
+            print("   🔄 Falling back to dynamic schema...")
+
+            # Fallback to old method if schema enforcement fails
+            self.save_spark_compatible_parquet_fallback(df, output_file)
+
+    def save_spark_compatible_parquet_fallback(
+        self, df: pd.DataFrame, output_file: Path
+    ):
+        """Fallback method using dynamic schema (original implementation)"""
         # Ensure datetime columns are properly typed with microsecond precision
         datetime_columns = [
             "flightdate",
@@ -330,6 +636,11 @@ def main():
     parser.add_argument(
         "--summary", action="store_true", help="Show dataset summary statistics"
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate schema consistency across all files",
+    )
 
     args = parser.parse_args()
 
@@ -363,6 +674,32 @@ def main():
         print("\n📆 Monthly breakdown:")
         for month, count in summary["monthly_breakdown"]:
             print(f"   {month}: {count:,} flights")
+        return
+
+    # Schema validation
+    if args.validate:
+        print(f"🔍 Schema Validation for {args.year}")
+        print("=" * 50)
+        downloader = BTSFlightDataDownloader()
+        results = validate_schema_consistency(downloader.data_dir)
+
+        if "error" in results:
+            print(f"❌ {results['error']}")
+            return
+
+        print("\n📊 Validation Summary:")
+        print(f"   Files tested: {results['files_tested']}")
+        print(
+            f"   Schema consistent: {'✅ YES' if results['consistent_schemas'] else '❌ NO'}"
+        )
+
+        if results["issues"]:
+            print("\n⚠️  Issues found:")
+            for issue in results["issues"]:
+                print(f"   - {issue}")
+        else:
+            print("\n🎉 All schemas are perfectly consistent!")
+
         return
 
     if args.month:
