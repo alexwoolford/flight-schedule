@@ -24,13 +24,30 @@ The system provides a complete pipeline from BTS data download to Neo4j graph cr
 - **Graph Performance**: Sub-second queries on 586K+ real BTS flight records
 - **Business Logic**: Realistic connection rules and timing validation
 
-## 🚀 Quick Start (100% Reproducible)
+## 🚀 One-Liner Setup (Zero to Production in ~20 minutes)
 
-### Prerequisites
-- **Conda** (recommended) or **Python 3.12.8** + **Java 11+** manually
-- **16GB+ RAM** (recommended for processing 586K+ records)
+**Get everything running with a single command:**
 
-### Option 1: Conda Setup (Recommended - Complete Environment)
+```bash
+git clone https://github.com/alexwoolford/flight-schedule.git && cd flight-schedule && ./setup-and-run.sh
+```
+
+✅ **What this does automatically:**
+- Creates conda environment with all dependencies
+- Downloads real BTS flight data (586K+ records)
+- Loads data into your Neo4j instance (Aura, self-hosted, etc.)
+- Sets up production-ready load testing framework
+- Runs comprehensive validation tests
+
+**Prerequisites:** [Conda](https://docs.conda.io/en/latest/miniconda.html) + Neo4j instance + 16GB RAM + 10GB disk
+
+👉 **See [QUICK_START.md](QUICK_START.md) for detailed one-liner guide**
+
+---
+
+## 🔧 Manual Setup (If You Prefer Step-by-Step)
+
+### Option 1: Conda Setup (Recommended)
 
 ```bash
 # Clone and setup
