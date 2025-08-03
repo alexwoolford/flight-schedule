@@ -95,7 +95,31 @@ class Neo4jUser(User):
         sample_airports = ", ".join(self.airports[:10])
         print(f"📋 Sample airports: {sample_airports}...")
 
-        self.dates = ["2024-03-01", "2024-03-02", "2024-03-03"]
+        # Get actual date range from the database
+        print("📅 Loading available flight dates from database...")
+        with self.driver.session(database=self.neo4j_database) as session:
+            result = session.run(
+                """
+                MATCH (s:Schedule)
+                RETURN DISTINCT s.flightdate
+                ORDER BY s.flightdate
+            """
+            )
+            db_dates = [str(record["s.flightdate"]) for record in result]
+
+        if db_dates:
+            self.dates = db_dates
+            print(f"✅ Loaded {len(self.dates)} actual flight dates from database")
+            print(f"📆 Date range: {self.dates[0]} to {self.dates[-1]}")
+        else:
+            # If no dates found, this indicates a serious data problem
+            raise Exception(
+                "❌ No flight dates found in database! "
+                "This suggests the database is empty or flight data wasn't loaded "
+                "properly. Please check your Neo4j database contains Schedule "
+                "nodes with flightdate properties."
+            )
+
         print("✅ Neo4j user connected")
 
     def neo4j_request(self, name, query, params):
@@ -137,7 +161,21 @@ class Neo4jUser(User):
             raise e
 
     def generate_random_route(self):
-        """Generate a random origin-destination pair from actual airports"""
+        """Generate a random origin-destination pair using realistic routes"""
+        # Try to use generated airport pairs first (more realistic)
+        try:
+            import json
+
+            with open("flight_test_scenarios.json", "r") as f:
+                scenarios = json.load(f)
+            airport_pairs = scenarios.get("airport_pairs", [])
+            if airport_pairs:
+                pair = random.choice(airport_pairs)  # nosec B311
+                return pair["origin"], pair["dest"]
+        except Exception:  # nosec B110
+            pass
+
+        # Fallback to random selection from actual airports
         origin = random.choice(self.airports)  # nosec B311
         dest = random.choice(self.airports)  # nosec B311
         # Ensure origin != destination
@@ -145,9 +183,9 @@ class Neo4jUser(User):
             dest = random.choice(self.airports)  # nosec B311
         return origin, dest
 
-    @task(60)  # 60% direct flights
+    @task(70)  # 70% direct flights (most common search)
     def direct_flight_search(self):
-        """Direct flight search using README patterns"""
+        """Direct flight search - most realistic user behavior"""
         origin, dest = self.generate_random_route()
         search_date = random.choice(self.dates)  # nosec B311
 
@@ -165,17 +203,20 @@ class Neo4jUser(User):
             {"origin": origin, "dest": dest, "search_date": search_date},
         )
 
-        # Optional: print for debugging
+        # More realistic output
         count = result[0]["flight_count"] if result else 0
-        print(f"Direct {origin}→{dest}: {count} flights")
+        if count > 0:
+            print(f"✈️  Direct {origin}→{dest}: {count} flights available")
+        else:
+            print(f"❌ Direct {origin}→{dest}: No direct flights")
 
-    @task(35)  # 35% connection search using README pattern
+    @task(30)  # 30% connection search - when direct flights aren't available
     def connection_search(self):
-        """Connection search using EXACT README pattern"""
+        """Multi-hop connection search using README pattern"""
         origin, dest = self.generate_random_route()
         search_date = random.choice(self.dates)  # nosec B311
 
-        # EXACT README query pattern (matches README exactly!)
+        # EXACT README query pattern for realistic connections
         query = """
             MATCH (dep:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)
                   -[:ARRIVES_AT]->(hub:Airport)<-[:DEPARTS_FROM]-(s2:Schedule)
@@ -204,7 +245,7 @@ class Neo4jUser(User):
                    toString(s1.flight_number_reporting_airline) AS inbound_flight,
                    s2.reporting_airline +
                    toString(s2.flight_number_reporting_airline) AS outbound_flight
-            ORDER BY s1.scheduled_departure_time
+            ORDER BY connection_minutes
             LIMIT 8
         """
 
@@ -214,36 +255,18 @@ class Neo4jUser(User):
             {"origin": origin, "dest": dest, "search_date": search_date},
         )
 
-        # Optional: print for debugging
-        # (now shows actual connection details like README)
+        # Show realistic connection results like a travel website
         if result:
-            print(f"Connect {origin}→{dest}: {len(result)} connections found")
-            for i, conn in enumerate(result[:2], 1):  # Show first 2 connections
+            print(f"🔗 Connect {origin}→{dest}: {len(result)} routes found")
+            for i, conn in enumerate(result[:2], 1):  # Show best 2 options
                 hub_code = conn.get("hub.code", "Unknown")
                 print(
                     f"  {i}. {conn['inbound_flight']} → "
                     f"{conn['outbound_flight']} via {hub_code} "
-                    f"({conn['connection_minutes']}min)"
+                    f"({conn['connection_minutes']}min layover)"
                 )
         else:
-            print(f"Connect {origin}→{dest}: 0 connections")
-
-    @task(5)  # 5% hub analysis
-    def hub_analysis(self):
-        """Simple hub analysis"""
-        search_date = random.choice(self.dates)  # nosec B311
-
-        query = """
-            MATCH (hub:Airport)<-[:DEPARTS_FROM]-(s:Schedule)
-            WHERE s.flightdate = date($search_date)
-            RETURN count(s) as total_departures
-        """
-
-        result = self.neo4j_request("Hub Analysis", query, {"search_date": search_date})
-
-        # Optional: print for debugging
-        count = result[0]["total_departures"] if result else 0
-        print(f"Hub analysis: {count} total departures")
+            print(f"❌ Connect {origin}→{dest}: No connections found")
 
     def on_stop(self):
         """Clean up connection"""
@@ -254,12 +277,12 @@ class Neo4jUser(User):
 if __name__ == "__main__":
     print("🚀 NEO4J FLIGHT LOAD TEST")
     print("=========================")
-    print("📊 Realistic load testing with dynamic airport selection:")
-    print("   • 60% Direct flights (random airport pairs)")
-    print("   • 35% Connections (README pattern, random pairs)")
-    print("   • 5% Hub analysis")
+    print("📊 Realistic flight search load testing:")
+    print("   • 70% Direct flights (most common user behavior)")
+    print("   • 30% Multi-hop connections (README pattern)")
+    print("   • Dynamic date range from actual database data")
     print("")
-    print("🎯 Uses all 331 airports from database (109,230 route combinations)")
+    print("🎯 Dynamic airport + date selection from actual database")
     print("✅ Proper Locust integration for accurate RPS and response times")
     print("")
     print("▶️  Start: locust -f neo4j_flight_load_test.py")
