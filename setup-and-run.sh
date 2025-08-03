@@ -81,8 +81,8 @@ echo -e "${GREEN}===============================================${NC}"
 echo ""
 echo "This script will set up everything you need:"
 echo "  • Conda environment with all dependencies"
-echo "  • Download real BTS flight data (586K+ records)"
-echo "  • Load data into your Neo4j instance"
+echo "  • Download real BTS flight data (7-8M+ records, all 12 months)"
+echo "  • Load ALL data into your Neo4j instance"
 echo "  • Production-ready load testing framework"
 echo ""
 echo -e "${YELLOW}Prerequisites:${NC}"
@@ -362,15 +362,17 @@ else
 fi
 
 if [ "$LOAD_DATA" = true ]; then
-    log "Loading flight data into Neo4j (this may take 5-10 minutes)..."
+    log "Loading ALL flight data into Neo4j (this may take 15-30 minutes)..."
+    log "Processing all 12 months of 2024 data (~7-8 million flight records)..."
 
-    # Use March 2024 data (586K+ records) for optimal performance
-    MARCH_FILE="$DATA_DIR/bts_flights_2024_03.parquet"
-    if [ -f "$MARCH_FILE" ]; then
-        python load_bts_data.py --single-file bts_flights_2024_03.parquet --data-path data/bts_flight_data >> "$LOG_FILE" 2>&1
-        log_success "Flight data loaded successfully"
+    # Load all 12 months of 2024 data using the --load-all-files option
+    FILE_COUNT=$(ls -1 "$DATA_DIR"/*.parquet 2>/dev/null | wc -l)
+    if [ "$FILE_COUNT" -gt 0 ]; then
+        log "Found $FILE_COUNT parquet files to load..."
+        python load_bts_data.py --load-all-files --data-path data/bts_flight_data >> "$LOG_FILE" 2>&1
+        log_success "ALL flight data loaded successfully"
     else
-        log_error "March 2024 data file not found. Please check the download step."
+        log_error "No parquet files found in $DATA_DIR. Please check the download step."
         exit 1
     fi
 
@@ -385,8 +387,8 @@ if [ "$LOAD_DATA" = true ]; then
     echo "  • Airports: $FINAL_AIRPORT_COUNT"
     echo ""
 
-    if [ "$FINAL_SCHEDULE_COUNT" -lt 100000 ]; then
-        log_error "Data loading appears incomplete. Check logs for errors."
+    if [ "$FINAL_SCHEDULE_COUNT" -lt 1000000 ]; then
+        log_error "Data loading appears incomplete. Expected 7-8M+ records, got $FINAL_SCHEDULE_COUNT. Check logs for errors."
         exit 1
     fi
 fi
@@ -434,7 +436,7 @@ echo ""
 echo -e "${BLUE}📊 System Summary:${NC}"
 echo "  • Environment: conda env '$CONDA_ENV_NAME' activated"
 echo "  • Database: $FINAL_SCHEDULE_COUNT flight schedules, $FINAL_AIRPORT_COUNT airports"
-echo "  • Data source: Real BTS government flight data (March 2024)"
+echo "  • Data source: Real BTS government flight data (All 12 months of 2024)"
 echo "  • Load testing: Production-ready Locust framework"
 echo ""
 echo -e "${BLUE}🚀 Next Steps:${NC}"
