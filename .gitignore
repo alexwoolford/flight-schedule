@@ -78,4 +78,6 @@ safety-report.json
 *.tmp
 *.temp
 quick_*.py
+test_connection.py
+check_data.py
 # Note: test files in tests/ directory are included (not ignored)
