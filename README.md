@@ -56,7 +56,7 @@ cd flight-schedule
 
 # Create complete environment (Python + Java + all dependencies)
 conda env create -f environment.yml
-conda activate neo4j
+conda activate flight-schedule
 
 # Configure Neo4j connection
 cp .env.example .env

@@ -184,7 +184,7 @@ fi
 # Setup Conda Environment
 log_section "Setting Up Conda Environment"
 
-CONDA_ENV_NAME="neo4j"
+CONDA_ENV_NAME="flight-schedule"
 
 # Check if environment exists
 if conda env list | grep -q "^$CONDA_ENV_NAME "; then

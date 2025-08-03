@@ -39,11 +39,11 @@ def check_prerequisites():
 
     # Check if we're in the right conda environment
     conda_env = os.getenv("CONDA_DEFAULT_ENV")
-    if conda_env != "neo4j-flight-schedule":
+    if conda_env != "flight-schedule":
         print("⚠️  Warning: Not in recommended conda environment")
         print(f"   Current environment: {conda_env or 'base'}")
         print("   Recommended setup:")
-        print("     conda activate neo4j-flight-schedule")
+        print("     conda activate flight-schedule")
         print("   Or create it: ./setup_environment.sh")
         print()
 
@@ -306,9 +306,9 @@ def load_full_dataset(batch_size: int = 10000):
 
     # Check Java version and warn if not optimal
     try:
-        import subprocess
+        import subprocess  # nosec B404
 
-        java_version = subprocess.check_output(
+        java_version = subprocess.check_output(  # nosec B603 B607
             ["java", "-version"], stderr=subprocess.STDOUT, text=True
         )
         if "21." in java_version and "11." not in java_version:
@@ -328,7 +328,7 @@ def load_full_dataset(batch_size: int = 10000):
         print(
             "\n🚀 Using Neo4j Parallel Spark Loader (deadlock-free, production-ready)..."
         )
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603
             [sys.executable, "load_with_parallel_spark.py"], capture_output=False
         )
 
@@ -358,7 +358,8 @@ def load_full_dataset(batch_size: int = 10000):
                     rel_count = rel_result.single()["count"]
 
                     print(
-                        f"📊 Verification: {node_count:,} nodes, {rel_count:,} relationships"
+                        f"📊 Verification: {node_count:,} nodes, "
+                        f"{rel_count:,} relationships"
                     )
 
                     if node_count > 0 and rel_count > 0:
