@@ -739,17 +739,25 @@ def load_bts_data(
                 df = parquet_reader.parquet(str(data_dir / "*.parquet"))
                 print(f"   📁 Loaded: {len(parquet_files)} files")
         except Exception as e:
-            if "TIMESTAMP(NANOS" in str(e) or "Illegal Parquet type" in str(e):
+            if (
+                "TIMESTAMP(NANOS" in str(e)
+                or "Illegal Parquet type" in str(e)
+                or "ClassCastException" in str(e)
+                or "MutableLong cannot be cast" in str(e)
+                or "MutableDouble" in str(e)
+            ):
                 print(
-                    "   ⚠️  Detected parquet timestamp issues - using aggressive compatibility mode..."
+                    "   ⚠️  Detected parquet compatibility issues - using aggressive compatibility mode..."
                 )
                 logger.warning(
-                    "Parquet timestamp compatibility issues detected, using aggressive fallback"
+                    f"Parquet compatibility issues detected: {str(e)[:200]}... using aggressive fallback"
                 )
 
                 # Enhanced Fallback: Use aggressive compatibility settings for schema inference problems
                 parquet_reader_fallback = (
-                    spark.read.option("mergeSchema", "false")
+                    spark.read.option(
+                        "mergeSchema", "true"
+                    )  # Enable for data type differences
                     .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
                     .option("inferTimestamp", "false")
                     .option("timestampNTZFormat", "yyyy-MM-dd HH:mm:ss")
@@ -793,9 +801,20 @@ def load_bts_data(
                             dfs.append(single_df)
                             print(f"   ✅ Successfully loaded: {pfile.name}")
                         except Exception as e3:
-                            print(
-                                f"   ❌ Failed to load: {pfile.name} - {str(e3)[:100]}..."
-                            )
+                            if "ClassCastException" in str(
+                                e3
+                            ) or "MutableLong cannot be cast" in str(e3):
+                                print(
+                                    f"   ❌ Failed to load: {pfile.name} - Data type mismatch (likely schema change)"
+                                )
+                                print(
+                                    f"      Suggestion: This file may have incompatible data types. "
+                                    f"Consider re-downloading or excluding this file."
+                                )
+                            else:
+                                print(
+                                    f"   ❌ Failed to load: {pfile.name} - {str(e3)[:100]}..."
+                                )
                             logger.error(f"Failed to load {pfile.name}: {e3}")
                             # Continue with other files instead of failing completely
 
