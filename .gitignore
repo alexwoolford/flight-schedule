@@ -77,7 +77,8 @@ safety-report.json
 # Temporary files
 *.tmp
 *.temp
-quick_*.py
+quick_test*.py
+quick_debug*.py
 test_connection.py
 check_data.py
 # Note: test files in tests/ directory are included (not ignored)
