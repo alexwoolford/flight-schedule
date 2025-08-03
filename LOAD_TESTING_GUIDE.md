@@ -8,7 +8,7 @@
 conda env update -f environment.yml
 
 # Or if you need to install them individually:
-# conda activate neo4j
+# conda activate flight-schedule
 # conda install -c conda-forge locust faker psutil
 ```
 

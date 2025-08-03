@@ -35,8 +35,8 @@ RUN mkdir -p data/bts_flight_data logs
 EXPOSE 8000
 
 # Default command - run tests to verify setup
-CMD ["/bin/bash", "-c", "source activate neo4j && python -m pytest tests/test_ci_unit.py -v"]
+CMD ["/bin/bash", "-c", "source activate flight-schedule && python -m pytest tests/test_ci_unit.py -v"]
 
 # Health check - verify core dependencies
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /bin/bash -c "source activate neo4j && python -c 'import neo4j, pyspark, pandas, pyarrow; print(\"Health check passed\")'" || exit 1
+    CMD /bin/bash -c "source activate flight-schedule && python -c 'import neo4j, pyspark, pandas, pyarrow; print(\"Health check passed\")'" || exit 1

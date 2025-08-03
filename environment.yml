@@ -1,4 +1,4 @@
-name: neo4j
+name: flight-schedule
 channels:
   - conda-forge
   - defaults
