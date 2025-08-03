@@ -178,11 +178,44 @@ EOF
     log_success "Created .env file with Neo4j credentials"
 fi
 
-# Test Neo4j connection
-log_section "Testing Neo4j Connection"
+# Note: Neo4j connection test happens AFTER conda environment setup
+# to ensure all required packages (neo4j, python-dotenv) are available
 
-# Load environment variables
-source "$ENV_FILE"
+# Setup Conda Environment
+log_section "Setting Up Conda Environment"
+
+CONDA_ENV_NAME="neo4j"
+
+# Check if environment exists
+if conda env list | grep -q "^$CONDA_ENV_NAME "; then
+    log_success "Conda environment '$CONDA_ENV_NAME' already exists"
+    echo "Recreate environment? (y/N)"
+    read -r recreate
+    if [[ "$recreate" =~ ^[Yy]$ ]]; then
+        log "Removing existing environment..."
+        conda env remove -n "$CONDA_ENV_NAME" -y >> "$LOG_FILE" 2>&1
+        CREATE_ENV=true
+    else
+        CREATE_ENV=false
+    fi
+else
+    CREATE_ENV=true
+fi
+
+if [ "$CREATE_ENV" = true ]; then
+    log "Creating conda environment from environment.yml..."
+    conda env create -f environment.yml >> "$LOG_FILE" 2>&1
+    log_success "Conda environment created"
+fi
+
+# Activate environment for rest of script
+log "Activating conda environment..."
+eval "$(conda shell.bash hook)"
+conda activate "$CONDA_ENV_NAME" >> "$LOG_FILE" 2>&1
+log_success "Environment activated: $(conda env list | grep '*' | awk '{print $1}')"
+
+# Test Neo4j connection (now that we have the required packages)
+log_section "Testing Neo4j Connection"
 
 # Simple connection test using Python
 cat > test_connection.py << 'EOF'
@@ -217,7 +250,7 @@ except Exception as e:
     sys.exit(1)
 EOF
 
-# Try connection test (will install basic deps if needed)
+# Test connection (now we have all required packages from conda environment)
 if python test_connection.py 2>> "$LOG_FILE"; then
     log_success "Neo4j connection successful"
 else
@@ -227,39 +260,6 @@ else
 fi
 
 rm -f test_connection.py
-
-# Setup Conda Environment
-log_section "Setting Up Conda Environment"
-
-CONDA_ENV_NAME="neo4j"
-
-# Check if environment exists
-if conda env list | grep -q "^$CONDA_ENV_NAME "; then
-    log_success "Conda environment '$CONDA_ENV_NAME' already exists"
-    echo "Recreate environment? (y/N)"
-    read -r recreate
-    if [[ "$recreate" =~ ^[Yy]$ ]]; then
-        log "Removing existing environment..."
-        conda env remove -n "$CONDA_ENV_NAME" -y >> "$LOG_FILE" 2>&1
-        CREATE_ENV=true
-    else
-        CREATE_ENV=false
-    fi
-else
-    CREATE_ENV=true
-fi
-
-if [ "$CREATE_ENV" = true ]; then
-    log "Creating conda environment from environment.yml..."
-    conda env create -f environment.yml >> "$LOG_FILE" 2>&1
-    log_success "Conda environment created"
-fi
-
-# Activate environment for rest of script
-log "Activating conda environment..."
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV_NAME" >> "$LOG_FILE" 2>&1
-log_success "Environment activated: $(conda env list | grep '*' | awk '{print $1}')"
 
 # Download Flight Data
 log_section "Downloading BTS Flight Data"
