@@ -237,10 +237,27 @@ try:
         record = result.single()
         print(f"✅ {record['message']}")
 
-        # Get database info
-        result = session.run("CALL db.info()")
-        info = result.single()
-        print(f"✅ Connected to: {info['name']} (Neo4j {info['version']})")
+        # Try to get version info (gracefully handle different Neo4j versions)
+        try:
+            # Try modern version info first
+            result = session.run("CALL dbms.components() YIELD name, versions RETURN name, versions[0] as version")
+            component = result.single()
+            if component:
+                print(f"✅ Connected to: {component['name']} {component['version']}")
+            else:
+                raise Exception("No component info")
+        except:
+            try:
+                # Fallback: try db.info()
+                result = session.run("CALL db.info()")
+                info = result.single()
+                db_name = info.get('name', 'Neo4j')
+                db_version = info.get('version', 'unknown')
+                print(f"✅ Connected to: {db_name} (Neo4j {db_version})")
+            except:
+                # Final fallback: just confirm database name
+                db_name = os.getenv("NEO4J_DATABASE", "neo4j")
+                print(f"✅ Connected to database: {db_name}")
 
     driver.close()
     sys.exit(0)
