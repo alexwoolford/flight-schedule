@@ -51,7 +51,8 @@ class Neo4jUser(User):
         if not all([self.neo4j_uri, self.neo4j_user, self.neo4j_password]):
             raise ValueError(
                 "Missing required Neo4j environment variables. "
-                "Please check your .env file contains: NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD"
+                "Please check your .env file contains: "
+                "NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD"
             )
 
         print(
@@ -71,9 +72,8 @@ class Neo4jUser(User):
                 )
                 self.airports = [record["code"] for record in result if record["code"]]
             print(f"✅ Loaded {len(self.airports)} airports from database")
-            print(
-                f"📊 Possible route combinations: {len(self.airports) * (len(self.airports)-1):,}"
-            )
+            combinations = len(self.airports) * (len(self.airports) - 1)
+            print(f"📊 Possible route combinations: {combinations:,}")
         except Exception as e:
             print(f"❌ Failed to load airports: {e}")
             # Fallback to major airports if database query fails
@@ -138,18 +138,18 @@ class Neo4jUser(User):
 
     def generate_random_route(self):
         """Generate a random origin-destination pair from actual airports"""
-        origin = random.choice(self.airports)
-        dest = random.choice(self.airports)
+        origin = random.choice(self.airports)  # nosec B311
+        dest = random.choice(self.airports)  # nosec B311
         # Ensure origin != destination
         while dest == origin:
-            dest = random.choice(self.airports)
+            dest = random.choice(self.airports)  # nosec B311
         return origin, dest
 
     @task(60)  # 60% direct flights
     def direct_flight_search(self):
         """Direct flight search using README patterns"""
         origin, dest = self.generate_random_route()
-        search_date = random.choice(self.dates)
+        search_date = random.choice(self.dates)  # nosec B311
 
         query = """
             MATCH (dep:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)
@@ -173,7 +173,7 @@ class Neo4jUser(User):
     def connection_search(self):
         """Connection search using EXACT README pattern"""
         origin, dest = self.generate_random_route()
-        search_date = random.choice(self.dates)
+        search_date = random.choice(self.dates)  # nosec B311
 
         # EXACT README query pattern (matches README exactly!)
         query = """
@@ -191,14 +191,19 @@ class Neo4jUser(User):
             WITH s1, s2, hub,
                  s1.scheduled_arrival_time AS hub_arrival,
                  s2.scheduled_departure_time AS hub_departure,
-                 duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes AS connection_minutes
+                 duration.between(
+                     s1.scheduled_arrival_time,
+                     s2.scheduled_departure_time
+                 ).minutes AS connection_minutes
 
             WHERE connection_minutes >= 45 AND connection_minutes <= 300
 
             RETURN hub.code, connection_minutes,
                    hub_arrival, hub_departure,
-                   s1.reporting_airline + toString(s1.flight_number_reporting_airline) AS inbound_flight,
-                   s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS outbound_flight
+                   s1.reporting_airline +
+                   toString(s1.flight_number_reporting_airline) AS inbound_flight,
+                   s2.reporting_airline +
+                   toString(s2.flight_number_reporting_airline) AS outbound_flight
             ORDER BY s1.scheduled_departure_time
             LIMIT 8
         """
@@ -209,13 +214,16 @@ class Neo4jUser(User):
             {"origin": origin, "dest": dest, "search_date": search_date},
         )
 
-        # Optional: print for debugging (now shows actual connection details like README)
+        # Optional: print for debugging
+        # (now shows actual connection details like README)
         if result:
             print(f"Connect {origin}→{dest}: {len(result)} connections found")
             for i, conn in enumerate(result[:2], 1):  # Show first 2 connections
                 hub_code = conn.get("hub.code", "Unknown")
                 print(
-                    f"  {i}. {conn['inbound_flight']} → {conn['outbound_flight']} via {hub_code} ({conn['connection_minutes']}min)"
+                    f"  {i}. {conn['inbound_flight']} → "
+                    f"{conn['outbound_flight']} via {hub_code} "
+                    f"({conn['connection_minutes']}min)"
                 )
         else:
             print(f"Connect {origin}→{dest}: 0 connections")
@@ -223,7 +231,7 @@ class Neo4jUser(User):
     @task(5)  # 5% hub analysis
     def hub_analysis(self):
         """Simple hub analysis"""
-        search_date = random.choice(self.dates)
+        search_date = random.choice(self.dates)  # nosec B311
 
         query = """
             MATCH (hub:Airport)<-[:DEPARTS_FROM]-(s:Schedule)
