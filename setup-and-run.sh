@@ -428,7 +428,7 @@ fi
 log_section "Setting Up Load Testing Framework"
 
 log "Generating flight scenarios from actual data..."
-python generate_flight_scenarios.py >> "$LOG_FILE" 2>&1
+python generate_flight_scenarios_fast.py >> "$LOG_FILE" 2>&1
 log_success "Flight scenarios generated"
 
 # Test the load testing framework
