@@ -156,36 +156,65 @@ pytest tests/test_flight_search_unit.py -v
 
 ## 🔍 Query Performance & Business Logic
 
-### Example: LGA → DFW Connection Search
+### Example: Advanced Multi-Hop Flight Routing
 
-**Query**: Find connection flights with timing validation (optimized)
+**Query**: Comprehensive routing with cross-day flight handling (production-ready)
 ```cypher
-// Single path pattern with early filtering for optimal performance
-MATCH (dep:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
-      <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(arr:Airport {code: 'DFW'})
+// Advanced routing: finds direct flights + 1-stop connections with cross-day handling
+// Part 1: Direct flights
+MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(direct:Schedule)
+      -[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
+WHERE direct.flightdate = date('2024-03-01')
+  AND direct.scheduled_departure_time IS NOT NULL
+  AND direct.scheduled_arrival_time IS NOT NULL
 
-// Early filtering on most selective properties first
+WITH direct, origin, dest,
+     CASE
+         WHEN direct.scheduled_departure_time <= direct.scheduled_arrival_time THEN
+             duration.between(direct.scheduled_departure_time, direct.scheduled_arrival_time).minutes
+         ELSE
+             // Cross-day flight (red-eye): departure > arrival means arrival next day
+             duration.between(direct.scheduled_departure_time, time('23:59')).minutes + 1 +
+             duration.between(time('00:00'), direct.scheduled_arrival_time).minutes
+     END AS flight_duration_minutes
+
+WHERE flight_duration_minutes > 0 AND flight_duration_minutes < 1440
+
+RETURN 'direct' AS route_type, direct.reporting_airline + toString(direct.flight_number_reporting_airline) AS flight,
+       direct.scheduled_departure_time AS departure, direct.scheduled_arrival_time AS arrival,
+       flight_duration_minutes AS duration_min
+
+UNION ALL
+
+// Part 2: 1-stop connections with proper cross-day timing
+MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
+      <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
 WHERE s1.flightdate = date('2024-03-01')
-  AND s2.flightdate = date('2024-03-01')
+  AND s2.flightdate IN [date('2024-03-01'), date('2024-03-01') + duration('P1D')]
   AND s1.scheduled_arrival_time IS NOT NULL
   AND s2.scheduled_departure_time IS NOT NULL
-  AND s2.scheduled_departure_time > s1.scheduled_arrival_time  // Ensure connection is possible
   AND hub.code <> 'LGA' AND hub.code <> 'DFW'
 
-// Combined WITH clause for efficiency
-WITH s1, s2, hub,
-     s1.scheduled_arrival_time AS hub_arrival,
-     s2.scheduled_departure_time AS hub_departure,
-     duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes AS connection_minutes
+WITH s1, s2, hub, origin, dest,
+     CASE
+         WHEN s1.flightdate = s2.flightdate THEN
+             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes
+         ELSE
+             // Overnight connection
+             duration.between(s1.scheduled_arrival_time, time('23:59')).minutes + 1 +
+             duration.between(time('00:00'), s2.scheduled_departure_time).minutes
+     END AS connection_minutes
 
-WHERE connection_minutes >= 45 AND connection_minutes <= 300
+WHERE connection_minutes >= 45 AND connection_minutes <= 1200
 
-RETURN hub.code, connection_minutes,
-       hub_arrival, hub_departure,
-       s1.reporting_airline + toString(s1.flight_number_reporting_airline) AS inbound_flight,
-       s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS outbound_flight
-ORDER BY s1.scheduled_departure_time
-LIMIT 8
+RETURN '1_stop' AS route_type, hub.code AS via_hub,
+       s1.reporting_airline + toString(s1.flight_number_reporting_airline) + ' → ' +
+       s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS flights,
+       s1.scheduled_departure_time AS departure, s2.scheduled_arrival_time AS arrival,
+       connection_minutes AS layover_min
+
+ORDER BY route_type, departure
+LIMIT 10
 ```
 
 **Performance**: ~140ms on 586K+ BTS records (March 2024 data) - **41% faster than original**
@@ -251,7 +280,7 @@ The system includes production-grade load testing using **Locust** to measure da
 python generate_flight_scenarios.py
 
 # 2. Start the load test
-locust -f realistic_flight_search_load_test.py --host=bolt://localhost:7687
+locust -f neo4j_flight_load_test.py
 
 # 3. Open web UI and configure test
 # http://localhost:8089
@@ -282,7 +311,7 @@ locust -f realistic_flight_search_load_test.py --host=bolt://localhost:7687
 
 ```bash
 # Headless mode with specific parameters
-locust -f realistic_flight_search_load_test.py \
+locust -f neo4j_flight_load_test.py \
        --host=bolt://localhost:7687 \
        --users 50 \
        --spawn-rate 5 \
@@ -353,7 +382,7 @@ Hooks run automatically on `git commit` and prevent commits with quality issues.
 | Script | Purpose |
 |--------|---------|
 | `generate_flight_scenarios.py` | ✅ Generate realistic test scenarios from actual flight data |
-| `realistic_flight_search_load_test.py` | ✅ Locust load test simulating real user flight searches |
+| `neo4j_flight_load_test.py` | ✅ Locust load test with advanced routing and cross-day flight handling |
 | `quick_load_test_analysis.py` | ✅ Quick CLI analysis of load test results |
 
 **📊 Primary Analysis**: Use Locust's **interactive web interface** at `http://localhost:8089` for real-time charts, metrics, and professional visualizations.

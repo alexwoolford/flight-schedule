@@ -48,15 +48,28 @@ locust -f neo4j_flight_load_test.py
 
 **📊 Query Your Data:**
 ```cypher
-// Find connections LGA → DFW
-MATCH (dep:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s1:Schedule)
-      -[:ARRIVES_AT]->(hub:Airport)<-[:DEPARTS_FROM]-(s2:Schedule)
-      -[:ARRIVES_AT]->(arr:Airport {code: 'DFW'})
-WHERE s1.flightdate = date('2024-03-01')
-  AND s2.flightdate = date('2024-03-01')
-  AND s2.scheduled_departure_time > s1.scheduled_arrival_time
-RETURN hub.code, s1.reporting_airline + toString(s1.flight_number_reporting_airline) as flight1,
-       s2.reporting_airline + toString(s2.flight_number_reporting_airline) as flight2
+// Advanced routing with cross-day flight handling
+MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(direct:Schedule)
+      -[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
+WHERE direct.flightdate = date('2024-03-01')
+  AND direct.scheduled_departure_time IS NOT NULL
+
+WITH direct,
+     CASE
+         WHEN direct.scheduled_departure_time <= direct.scheduled_arrival_time THEN
+             duration.between(direct.scheduled_departure_time, direct.scheduled_arrival_time).minutes
+         ELSE
+             // Cross-day flight handling (red-eye flights)
+             duration.between(direct.scheduled_departure_time, time('23:59')).minutes + 1 +
+             duration.between(time('00:00'), direct.scheduled_arrival_time).minutes
+     END AS flight_duration
+
+WHERE flight_duration > 0 AND flight_duration < 1440
+RETURN direct.reporting_airline + toString(direct.flight_number_reporting_airline) AS flight,
+       direct.scheduled_departure_time AS departure,
+       direct.scheduled_arrival_time AS arrival,
+       flight_duration AS duration_minutes,
+       direct.scheduled_departure_time > direct.scheduled_arrival_time AS is_red_eye
 LIMIT 5
 ```
 

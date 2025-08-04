@@ -39,7 +39,7 @@ NEO4J_DATABASE=neo4j
 
 ### 3. Start Load Test
 ```bash
-locust -f realistic_flight_search_load_test.py --host=bolt://localhost:7687
+locust -f neo4j_flight_load_test.py
 ```
 
 ### 4. Open Web UI
@@ -111,13 +111,13 @@ export NEO4J_PASSWORD="password"
 export NEO4J_DATABASE="neo4j"
 
 # Run with environment variables
-locust -f realistic_flight_search_load_test.py
+locust -f neo4j_flight_load_test.py
 ```
 
 ### Headless Mode (CI/CD)
 ```bash
 # Run without web UI for automated testing
-locust -f realistic_flight_search_load_test.py \
+locust -f neo4j_flight_load_test.py \
   --headless \
   --users 50 \
   --spawn-rate 5 \
@@ -128,10 +128,10 @@ locust -f realistic_flight_search_load_test.py \
 ### Distributed Load Testing
 ```bash
 # Master node
-locust -f realistic_flight_search_load_test.py --master
+locust -f neo4j_flight_load_test.py --master
 
 # Worker nodes (run on different machines)
-locust -f realistic_flight_search_load_test.py --worker --master-host=<master-ip>
+locust -f neo4j_flight_load_test.py --worker --master-host=<master-ip>
 ```
 
 ## 🔍 Performance Expectations by Query Type
