@@ -103,9 +103,7 @@ class TestLoadTestScriptValidation:
             if "flight_test_scenarios.json" in str(e):
                 pytest.skip("Scenarios file missing - this is an import structure test")
             else:
-                pytest.fail(
-                    f"Unexpected error importing realistic_flight_search_load_test: {e}"
-                )
+                pytest.fail(f"Unexpected error importing neo4j_flight_load_test: {e}")
 
     def test_locust_user_class_structure(self):
         """Test that the load test defines proper Locust user class"""
@@ -175,8 +173,8 @@ class TestLoadTestScriptValidation:
                     backup_file.rename("flight_test_scenarios.json")
 
             # Clear import cache
-            if "realistic_flight_search_load_test" in sys.modules:
-                del sys.modules["realistic_flight_search_load_test"]
+            if "neo4j_flight_load_test" in sys.modules:
+                del sys.modules["neo4j_flight_load_test"]
 
     def test_query_construction_logic(self):
         """Test that queries can be constructed without syntax errors"""
@@ -397,5 +395,5 @@ class TestTestingFrameworkSanity:
         )
         print(
             "   Actual performance testing happens when you run: "
-            "locust -f realistic_flight_search_load_test.py"
+            "locust -f neo4j_flight_load_test.py"
         )
