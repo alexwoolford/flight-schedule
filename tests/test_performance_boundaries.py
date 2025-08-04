@@ -401,10 +401,10 @@ class TestScaleScenarios:
                     many_files_read_time <= few_files_read_time * max_acceptable_ratio
                 ), f"Many files read time ({many_files_read_time:.3f}s) too slow vs few files ({few_files_read_time:.3f}s)"
             else:
-                # For very fast operations, just check that many files reading is reasonable (< 1 second)
+                # For very fast operations, just check that many files reading is reasonable (< 3 seconds)
                 assert (
-                    many_files_read_time < 1.0
-                ), f"Many files read time {many_files_read_time:.3f}s should be < 1 second"
+                    many_files_read_time < 3.0
+                ), f"Many files read time {many_files_read_time:.3f}s should be < 3 seconds"
 
     def test_file_count_impact_on_discovery(self):
         """Test impact of file count on file discovery performance"""

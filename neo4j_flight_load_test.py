@@ -14,9 +14,8 @@ Uses dynamic airport selection and README query patterns.
     locust -f neo4j_flight_load_test.py
 
 **Test Distribution:**
-- 60% Direct flight searches (random airport pairs)
-- 35% Connection searches (README pattern)
-- 5% Hub analysis
+- 70% Direct flight searches (simple count queries)
+- 30% Comprehensive routing (direct + 1-stop with cross-day handling)
 """
 
 import os
@@ -210,63 +209,169 @@ class Neo4jUser(User):
         else:
             print(f"❌ Direct {origin}→{dest}: No direct flights")
 
-    @task(30)  # 30% connection search - when direct flights aren't available
-    def connection_search(self):
-        """Multi-hop connection search using README pattern"""
+    @task(30)  # 30% comprehensive routing search - direct + connections
+    def comprehensive_routing_search(self):
+        """
+        Advanced routing search with cross-day flight handling.
+        Finds direct flights + 1-stop connections in a single query.
+        Handles overnight flights properly (e.g., LAX-JFK red-eye).
+        """
         origin, dest = self.generate_random_route()
         search_date = random.choice(self.dates)  # nosec B311
 
-        # EXACT README query pattern for realistic connections
+        # Advanced routing query with proper cross-day flight handling
         query = """
-            MATCH (dep:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)
-                  -[:ARRIVES_AT]->(hub:Airport)<-[:DEPARTS_FROM]-(s2:Schedule)
-                  -[:ARRIVES_AT]->(arr:Airport {code: $dest})
+        // Find direct flights with cross-day handling
+        MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(direct:Schedule)
+              -[:ARRIVES_AT]->(dest:Airport {code: $dest})
+        WHERE direct.flightdate = date($search_date)
+          AND direct.scheduled_departure_time IS NOT NULL
+          AND direct.scheduled_arrival_time IS NOT NULL
 
-            WHERE s1.flightdate = date($search_date)
-              AND s2.flightdate = date($search_date)
-              AND s1.scheduled_arrival_time IS NOT NULL
-              AND s2.scheduled_departure_time IS NOT NULL
-              AND s2.scheduled_departure_time > s1.scheduled_arrival_time
-              AND hub.code <> $origin AND hub.code <> $dest
+        // Calculate proper flight duration handling cross-day flights
+        WITH direct, origin, dest,
+             CASE
+                 WHEN direct.scheduled_departure_time <= direct.scheduled_arrival_time THEN
+                     // Same day flight
+                     duration.between(direct.scheduled_departure_time, direct.scheduled_arrival_time).minutes
+                 ELSE
+                     // Cross-day flight (departure > arrival means arrival is next day)
+                     duration.between(direct.scheduled_departure_time, time('23:59')).minutes + 1 +
+                     duration.between(time('00:00'), direct.scheduled_arrival_time).minutes
+             END AS flight_duration_minutes
 
-            WITH s1, s2, hub,
-                 s1.scheduled_arrival_time AS hub_arrival,
-                 s2.scheduled_departure_time AS hub_departure,
-                 duration.between(
-                     s1.scheduled_arrival_time,
-                     s2.scheduled_departure_time
-                 ).minutes AS connection_minutes
+        WHERE flight_duration_minutes > 0 AND flight_duration_minutes < 1440  // Reasonable flight time
 
-            WHERE connection_minutes >= 45 AND connection_minutes <= 300
+        RETURN 'direct' AS route_type,
+               [origin.code, dest.code] AS route_airports,
+               [{
+                   flight: direct.reporting_airline + toString(direct.flight_number_reporting_airline),
+                   departure: direct.scheduled_departure_time,
+                   arrival: direct.scheduled_arrival_time,
+                   cross_day: direct.scheduled_departure_time > direct.scheduled_arrival_time
+               }] AS flights,
+               0 AS connections,
+               flight_duration_minutes AS total_time_minutes
 
-            RETURN hub.code, connection_minutes,
-                   hub_arrival, hub_departure,
-                   s1.reporting_airline +
-                   toString(s1.flight_number_reporting_airline) AS inbound_flight,
-                   s2.reporting_airline +
-                   toString(s2.flight_number_reporting_airline) AS outbound_flight
-            ORDER BY connection_minutes
-            LIMIT 8
+        UNION ALL
+
+        // Find 1-stop connections with cross-day handling
+        MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
+              <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
+        WHERE s1.flightdate = date($search_date)
+          AND s2.flightdate IN [date($search_date), date($search_date) + duration('P1D')]
+          AND s1.scheduled_arrival_time IS NOT NULL
+          AND s2.scheduled_departure_time IS NOT NULL
+          AND hub.code <> $origin AND hub.code <> $dest
+
+        // Calculate proper flight durations and connection times
+        WITH s1, s2, hub, origin, dest,
+             // First flight duration
+             CASE
+                 WHEN s1.scheduled_departure_time <= s1.scheduled_arrival_time THEN
+                     duration.between(s1.scheduled_departure_time, s1.scheduled_arrival_time).minutes
+                 ELSE
+                     duration.between(s1.scheduled_departure_time, time('23:59')).minutes + 1 +
+                     duration.between(time('00:00'), s1.scheduled_arrival_time).minutes
+             END AS s1_duration,
+             // Second flight duration
+             CASE
+                 WHEN s2.scheduled_departure_time <= s2.scheduled_arrival_time THEN
+                     duration.between(s2.scheduled_departure_time, s2.scheduled_arrival_time).minutes
+                 ELSE
+                     duration.between(s2.scheduled_departure_time, time('23:59')).minutes + 1 +
+                     duration.between(time('00:00'), s2.scheduled_arrival_time).minutes
+             END AS s2_duration,
+             // Connection time calculation (handling cross-day scenarios)
+             CASE
+                 WHEN s1.flightdate = s2.flightdate THEN
+                     // Same day connection
+                     CASE
+                         WHEN s1.scheduled_departure_time <= s1.scheduled_arrival_time THEN
+                             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes
+                         ELSE
+                             // S1 crosses to next day, s2 departure is after s1 arrival (next day)
+                             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes + 1440
+                     END
+                 ELSE
+                     // Different day connection (s2 is next day)
+                     CASE
+                         WHEN s1.scheduled_departure_time <= s1.scheduled_arrival_time THEN
+                             // S1 same day, S2 next day
+                             duration.between(s1.scheduled_arrival_time, time('23:59')).minutes + 1 +
+                             duration.between(time('00:00'), s2.scheduled_departure_time).minutes
+                         ELSE
+                             // S1 crosses day, S2 is next day
+                             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes
+                     END
+             END AS connection_minutes
+
+        WHERE connection_minutes >= 45 AND connection_minutes <= 1200  // 45 min to 20 hours
+          AND s1_duration > 0 AND s1_duration < 1440
+          AND s2_duration > 0 AND s2_duration < 1440
+
+        RETURN '1_stop' AS route_type,
+               [origin.code, hub.code, dest.code] AS route_airports,
+               [
+                   {
+                       flight: s1.reporting_airline + toString(s1.flight_number_reporting_airline),
+                       departure: s1.scheduled_departure_time,
+                       arrival: s1.scheduled_arrival_time,
+                       cross_day: s1.scheduled_departure_time > s1.scheduled_arrival_time
+                   },
+                   {
+                       flight: s2.reporting_airline + toString(s2.flight_number_reporting_airline),
+                       departure: s2.scheduled_departure_time,
+                       arrival: s2.scheduled_arrival_time,
+                       cross_day: s2.scheduled_departure_time > s2.scheduled_arrival_time
+                   }
+               ] AS flights,
+               1 AS connections,
+               s1_duration + connection_minutes + s2_duration AS total_time_minutes
+
+        ORDER BY connections, total_time_minutes
+        LIMIT 10
         """
 
         result = self.neo4j_request(
-            f"Connection Search ({origin}→{dest})",
+            f"Comprehensive Routing ({origin}→{dest})",
             query,
             {"origin": origin, "dest": dest, "search_date": search_date},
         )
 
-        # Show realistic connection results like a travel website
+        # Show realistic airline-style results
         if result:
-            print(f"🔗 Connect {origin}→{dest}: {len(result)} routes found")
-            for i, conn in enumerate(result[:2], 1):  # Show best 2 options
-                hub_code = conn.get("hub.code", "Unknown")
+            direct_count = sum(1 for r in result if r["route_type"] == "direct")
+            connection_count = sum(1 for r in result if r["route_type"] == "1_stop")
+
+            route_display = " → ".join(result[0]["route_airports"])
+            print(
+                f"🛫 {route_display}: {len(result)} routes "
+                f"({direct_count} direct, {connection_count} connections)"
+            )
+
+            # Show best option details
+            best = result[0]
+            total_hours = best["total_time_minutes"] / 60
+            overnight_indicator = ""
+            if any(f.get("cross_day", False) for f in best["flights"]):
+                overnight_indicator = " 🌙"
+
+            if best["route_type"] == "direct":
+                flight = best["flights"][0]
                 print(
-                    f"  {i}. {conn['inbound_flight']} → "
-                    f"{conn['outbound_flight']} via {hub_code} "
-                    f"({conn['connection_minutes']}min layover)"
+                    f"  ✈️  Best: {flight['flight']} "
+                    f"({total_hours:.1f}h){overnight_indicator}"
+                )
+            else:
+                f1, f2 = best["flights"]
+                hub = best["route_airports"][1]
+                print(
+                    f"  🔗 Best: {f1['flight']} → {f2['flight']} "
+                    f"via {hub} ({total_hours:.1f}h){overnight_indicator}"
                 )
         else:
-            print(f"❌ Connect {origin}→{dest}: No connections found")
+            print(f"❌ Route {origin}→{dest}: No flights found")
 
     def on_stop(self):
         """Clean up connection"""
@@ -277,9 +382,9 @@ class Neo4jUser(User):
 if __name__ == "__main__":
     print("🚀 NEO4J FLIGHT LOAD TEST")
     print("=========================")
-    print("📊 Realistic flight search load testing:")
-    print("   • 70% Direct flights (most common user behavior)")
-    print("   • 30% Multi-hop connections (README pattern)")
+    print("📊 Advanced flight search load testing:")
+    print("   • 70% Direct flights (simple count queries)")
+    print("   • 30% Comprehensive routing (direct + 1-stop with cross-day handling)")
     print("   • Dynamic date range from actual database data")
     print("")
     print("🎯 Dynamic airport + date selection from actual database")
