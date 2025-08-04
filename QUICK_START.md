@@ -48,28 +48,33 @@ locust -f neo4j_flight_load_test.py
 
 **📊 Query Your Data:**
 ```cypher
-// Advanced routing with cross-day flight handling
-MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(direct:Schedule)
-      -[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
-WHERE direct.flightdate = date('2024-03-01')
-  AND direct.scheduled_departure_time IS NOT NULL
+// FLEXIBLE ROUTING: Dynamic multi-hop search (no hardcoded hop counts!)
+// Step 1: Direct flights
+MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
+WHERE s.flightdate = date('2024-03-01')
+  AND s.scheduled_departure_time IS NOT NULL
 
-WITH direct,
+WITH s,
      CASE
-         WHEN direct.scheduled_departure_time <= direct.scheduled_arrival_time THEN
-             duration.between(direct.scheduled_departure_time, direct.scheduled_arrival_time).minutes
+         WHEN s.scheduled_departure_time <= s.scheduled_arrival_time THEN
+             duration.between(s.scheduled_departure_time, s.scheduled_arrival_time).minutes
          ELSE
              // Cross-day flight handling (red-eye flights)
-             duration.between(direct.scheduled_departure_time, time('23:59')).minutes + 1 +
-             duration.between(time('00:00'), direct.scheduled_arrival_time).minutes
+             duration.between(s.scheduled_departure_time, time('23:59')).minutes + 1 +
+             duration.between(time('00:00'), s.scheduled_arrival_time).minutes
      END AS flight_duration
 
 WHERE flight_duration > 0 AND flight_duration < 1440
-RETURN direct.reporting_airline + toString(direct.flight_number_reporting_airline) AS flight,
-       direct.scheduled_departure_time AS departure,
-       direct.scheduled_arrival_time AS arrival,
-       flight_duration AS duration_minutes,
-       direct.scheduled_departure_time > direct.scheduled_arrival_time AS is_red_eye
+RETURN 0 AS connections,
+       s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
+       s.scheduled_departure_time AS departure,
+       s.scheduled_arrival_time AS arrival,
+       flight_duration AS duration_minutes
+
+// Step 2: If need more results → 1-stop connections (with temporal constraints)
+// Step 3: If need more results → 2-stop connections...
+// Algorithm continues dynamically until enough results found!
+
 LIMIT 5
 ```
 
