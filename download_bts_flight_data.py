@@ -16,6 +16,7 @@ import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict
 
 import pandas as pd
 import pyarrow as pa
@@ -243,7 +244,7 @@ def get_bts_pyarrow_schema() -> pa.Schema:
     return pa.schema(fields)
 
 
-def validate_schema_consistency(data_dir: Path) -> dict:
+def validate_schema_consistency(data_dir: Path) -> Dict[str, Any]:
     """
     Built-in schema validation to test consistency across all months.
     Returns validation results for critical columns.
@@ -255,7 +256,7 @@ def validate_schema_consistency(data_dir: Path) -> dict:
     print(f"\n🔍 SCHEMA VALIDATION: Testing {len(parquet_files)} files")
     print("=" * 60)
 
-    results = {
+    results: Dict[str, Any] = {
         "files_tested": len(parquet_files),
         "consistent_schemas": True,
         "critical_columns": {},
