@@ -342,9 +342,10 @@ Hooks run automatically on `git commit` and prevent commits with quality issues.
 
 | Script | Purpose |
 |--------|---------|
+| `setup-and-run.sh` | ✅ Complete end-to-end setup script for everything |
 | `download_bts_flight_data.py` | ✅ Downloads real BTS flight data (Bureau of Transportation Statistics) |
 | `load_bts_data.py` | ✅ Load BTS data using Spark with Neo4j connector |
-| `setup.py` | Complete setup script for database, indexes, and demos |
+| `neo4j_flight_load_test.py` | ✅ Production-ready Locust load testing framework |
 | `tests/` | Comprehensive test suite with unit, integration, and performance tests |
 
 ### Load Testing Tools
