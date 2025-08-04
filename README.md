@@ -158,7 +158,7 @@ pytest tests/test_flight_search_unit.py -v
 
 ### Example: Advanced Multi-Hop Flight Routing
 
-**Query**: Comprehensive routing with cross-day flight handling (production-ready)
+**Query**: Comprehensive routing with cross-day flight handling (production-ready, tested)
 ```cypher
 // Advanced routing: finds direct flights + 1-stop connections with cross-day handling
 // Part 1: Direct flights
@@ -180,9 +180,12 @@ WITH direct, origin, dest,
 
 WHERE flight_duration_minutes > 0 AND flight_duration_minutes < 1440
 
-RETURN 'direct' AS route_type, direct.reporting_airline + toString(direct.flight_number_reporting_airline) AS flight,
-       direct.scheduled_departure_time AS departure, direct.scheduled_arrival_time AS arrival,
-       flight_duration_minutes AS duration_min
+RETURN 'direct' AS route_type,
+       direct.reporting_airline + toString(direct.flight_number_reporting_airline) AS flight_info,
+       direct.scheduled_departure_time AS departure,
+       direct.scheduled_arrival_time AS arrival,
+       flight_duration_minutes AS duration_minutes,
+       '' AS via_airport
 
 UNION ALL
 
@@ -207,11 +210,13 @@ WITH s1, s2, hub, origin, dest,
 
 WHERE connection_minutes >= 45 AND connection_minutes <= 1200
 
-RETURN '1_stop' AS route_type, hub.code AS via_hub,
+RETURN '1_stop' AS route_type,
        s1.reporting_airline + toString(s1.flight_number_reporting_airline) + ' → ' +
-       s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS flights,
-       s1.scheduled_departure_time AS departure, s2.scheduled_arrival_time AS arrival,
-       connection_minutes AS layover_min
+       s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS flight_info,
+       s1.scheduled_departure_time AS departure,
+       s2.scheduled_arrival_time AS arrival,
+       connection_minutes AS duration_minutes,
+       hub.code AS via_airport
 
 ORDER BY route_type, departure
 LIMIT 10
@@ -223,10 +228,15 @@ LIMIT 10
 
 ### Results
 ```
-Found 8 LGA → DFW connections on March 1, 2024:
-1. AA1536 LGA→ORD (14:40) | AA481 ORD→DFW (17:39) | Layover: 179min
-2. AA1536 LGA→ORD (14:40) | AA1109 ORD→DFW (18:43) | Layover: 243min
-3. AA1536 LGA→ORD (14:40) | UA1071 ORD→DFW (16:30) | Layover: 110min
+Found 27 LGA → DFW routes on March 1, 2024:
+Direct flights:
+1. DL308 (201min) - 13:00 → 16:21
+2. AA1597 (211min) - 13:00 → 16:31
+3. AA1490 (206min) - 14:30 → 17:56
+
+1-stop connections:
+4. AA1536 → AA481 via ORD (179min layover)
+5. DL308 → UA1071 via ATL (156min layover)
 ```
 
 ## 🏗️ Architecture
