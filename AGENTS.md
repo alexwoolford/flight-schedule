@@ -78,8 +78,7 @@ flight-schedule-system/
 ├── data/                   # Large data files (gitignored)
 │   ├── .gitkeep           # Preserves folder structure
 │   └── *.parquet          # Flight schedule data
-├── src/                    # Source code (commits)
-├── setup.py               # Main setup script (commits)
+├── setup-and-run.sh       # Main setup script (commits)
 ├── README.md               # Main documentation (commits)
 └── .env                    # Credentials (gitignored, in root)
 ```
@@ -180,21 +179,14 @@ python download_bts_flight_data.py --year 2024 --month 3
 - **Schedule Properties**: Contains temporal data (`first_seen_time`, `last_seen_time`, `date_of_operation`)
 
 #### 🚀 Spark Loading Best Practice:
-**CRITICAL**: Always create constraints and indexes BEFORE Spark data loading:
+**CRITICAL**: Schema (constraints and indexes) are automatically managed by the Python loading scripts:
 
-1. **Constraints** (for node merging without duplicates):
-   ```bash
-   # Use the dedicated constraint script
-   cat src/queries/create_constraints.cypher | cypher-shell
-   ```
+1. **Automatic Schema Management**:
+   - `load_bts_data.py` creates all necessary constraints and indexes
+   - Schema is defined in Python code for consistency
+   - No need for separate .cypher files or manual schema creation
 
-2. **Indexes** (for query performance):
-   ```bash
-   # Use the dedicated index script
-   cat src/queries/create_indexes.cypher | cypher-shell
-   ```
-
-3. **Use Neo4j Parallel Spark Loader** (prevents deadlocks):
+2. **Use Neo4j Parallel Spark Loader** (prevents deadlocks):
    ```python
    # REQUIRED for bulk loading - install first:
    pip install neo4j-parallel-spark-loader
