@@ -15,7 +15,15 @@ flight_test_scenarios.json
 
 
 # Environment & Credentials
+# Ignore every .env variant (.env.backup, .env.local, .env.bak, .envrc, ...).
+# A bare ".env" line matches only that exact name, which is how .env.backup
+# was committed with a real password in 81edc69.
 .env
+.env.*
+.envrc
+*.env
+# Re-allow the committed placeholder template (must contain no real secrets)
+!.env.example
 *.log
 
 # Logs Directory

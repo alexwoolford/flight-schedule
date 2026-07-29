@@ -443,10 +443,10 @@ if not all([uri, username, password]):
 ### ❌ NEVER DO - ALL OF THESE ARE SECURITY VIOLATIONS
 ```python
 # WRONG: Hard-coded credentials - MAJOR security risk!
-uri = "bolt://192.0.2.10:7687"           # ❌ Hard-coded IP + port
+uri = "bolt://192.0.2.10:7687"          # ❌ Hard-coded IP + port
 username = "neo4j"                      # ❌ Hard-coded username
 password = "secretpassword"             # ❌ Hard-coded password
-password = "REDACTED"                   # ❌ ANY hard-coded password
+password = "hunter2"                    # ❌ ANY hard-coded password
 database = "flights"                    # ❌ Hard-coded database name
 
 # ALSO WRONG: Connection strings with embedded credentials
