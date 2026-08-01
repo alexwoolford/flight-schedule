@@ -10,7 +10,14 @@ The `neo4j_driver`, `neo4j_database` and `search_date` fixtures come from
 against any loaded year rather than a hard-coded one.
 """
 
+import os
+import sys
+
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from load_bts_data import CARRIER_FAMILY  # noqa: E402
 
 
 class TestBasicConnectivity:
@@ -86,21 +93,173 @@ class TestBasicConnectivity:
             # The whole value of this edge is that the connection rules are
             # already applied, so a query over it cannot produce an unsellable
             # itinerary. Assert the invariants rather than trusting the builder.
+            # Carrier equality is asserted separately (regional affiliates are
+            # legitimately allowed to differ), so it is not checked here.
             invalid = session.run(
                 """
                 MATCH (s1:Schedule)-[r:CONNECTS_TO]->(s2:Schedule)
                 WHERE s1.dest <> s2.origin
-                   OR s1.reporting_airline <> s2.reporting_airline
                    OR s2.dest = s1.origin
                    OR r.layover_minutes IS NULL
-                   OR r.layover_minutes <= 0
+                   OR r.layover_minutes < 45
+                   OR r.layover_minutes > 300
                 RETURN count(r) AS count
                 """
             ).single()["count"]
 
         assert invalid == 0, (
             f"{invalid:,} of {total:,} CONNECTS_TO edges violate the connection "
-            "rules (hub mismatch, carrier change, backtrack, or bad layover)"
+            "rules (hub mismatch, backtrack, or layover outside 45-300 min)"
+        )
+
+    def test_connects_to_has_no_overnight_inbound_legs(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """No connection depends on an inbound leg that lands the next day"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            # s1's stored arrival is local at the hub with no timezone, so its
+            # DATE is unreliable. scheduled_duration_minutes (BTS
+            # CRSElapsedTime) is timezone-independent: a negative apparent
+            # duration that reconciles with the block time once a day is added
+            # means s1 really lands the NEXT morning, so a same-day connection
+            # off it is not bookable. This caught 17,502 false edges (3.29%).
+            false_edges = session.run(
+                """
+                MATCH (s1:Schedule)-[r:CONNECTS_TO]->()
+                WITH r, duration.inSeconds(s1.scheduled_departure_time,
+                                           s1.scheduled_arrival_time
+                                           ).seconds / 60 AS apparent,
+                     s1.scheduled_duration_minutes AS block
+                WHERE apparent < 0 AND abs(apparent + 1440 - block) <= 180
+                RETURN count(r) AS count
+                """
+            ).single()["count"]
+
+        assert false_edges == 0, (
+            f"{false_edges:,} of {total:,} CONNECTS_TO edges connect off an "
+            "inbound leg that actually arrives the next calendar day"
+        )
+
+    def test_connects_to_carrier_is_sellable(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """Both legs are sold by the same airline, allowing regional affiliates"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            # BTS reports the OPERATING carrier, so an American Eagle feeder
+            # shows up as MQ/OH even though the ticket says AA. Splicing two
+            # *unrelated* carriers is still unsellable (Southwest interlines
+            # with nobody), so map through CARRIER_FAMILY and then require
+            # equality. Imported from the loader so there is one definition.
+            mismatched = session.run(
+                """
+                MATCH (s1:Schedule)-[r:CONNECTS_TO]->(s2:Schedule)
+                WITH coalesce($family[s1.reporting_airline],
+                              s1.reporting_airline) AS m1,
+                     coalesce($family[s2.reporting_airline],
+                              s2.reporting_airline) AS m2, r
+                WHERE m1 <> m2
+                RETURN count(r) AS count
+                """,
+                family=CARRIER_FAMILY,
+            ).single()["count"]
+
+        assert mismatched == 0, (
+            f"{mismatched:,} of {total:,} CONNECTS_TO edges splice two "
+            "unrelated carriers into an unsellable itinerary"
+        )
+
+    def test_connects_to_hubs_are_real(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """Connections concentrate at real US hubs, not arbitrary airports"""
+        # Externally validated against published route data: the busiest
+        # connecting airports in the graph reproduce the real US hub set, and
+        # the top 10 carry 71.6% of all connections (measured 2025-07-18). A
+        # collapse here means the connection rules have degenerated even if
+        # every individual edge still passes its invariants.
+        real_hubs = {
+            "ATL",
+            "DFW",
+            "DEN",
+            "ORD",
+            "CLT",
+            "SEA",
+            "LAS",
+            "PHX",
+            "MSP",
+            "MDW",
+            "BWI",
+            "IAH",
+            "EWR",
+            "LAX",
+            "SFO",
+            "DTW",
+            "SLC",
+            "MIA",
+            "JFK",
+            "BOS",
+            "MCO",
+            "PHL",
+            "FLL",
+            "HNL",
+            "DCA",
+            "SAN",
+            "TPA",
+            "BNA",
+            "AUS",
+            "STL",
+            "PDX",
+            "ANC",
+            "RDU",
+            "HOU",
+            "DAL",
+            "SFB",
+            "PIE",
+            "OAK",
+            "SJC",
+            "MSY",
+            "CLE",
+            "PIT",
+            "IND",
+            "CVG",
+            "SMF",
+        }
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            top = list(
+                session.run(
+                    """
+                    MATCH (s1:Schedule)-[r:CONNECTS_TO]->()
+                    RETURN s1.dest AS hub, count(r) AS conns
+                    ORDER BY conns DESC LIMIT 10
+                    """
+                )
+            )
+
+        hubs = [r["hub"] for r in top]
+        unexpected = set(hubs) - real_hubs
+        assert not unexpected, (
+            f"Top connecting airports include implausible hubs: {unexpected}. "
+            f"Top 10 were {hubs}"
+        )
+        share = sum(r["conns"] for r in top) / total
+        assert share > 0.60, (
+            f"Top 10 hubs carry only {share:.1%} of connections (expected "
+            ">60%, measured 71.6%) — hub structure has degenerated"
         )
 
     def test_connects_to_supports_multi_hop_qpp(

@@ -36,6 +36,32 @@ try:
 except ImportError:
     NEO4J_DRIVER_AVAILABLE = False
 
+# BTS On-Time Performance reports only the OPERATING carrier
+# (reporting_airline); there is no marketing-carrier column in the feed. These
+# regionals are wholly-owned subsidiaries whose flights are scheduled, marketed
+# and sold exclusively under the parent's code, so a parent<->child connection
+# is a single-ticket itinerary in the real world. Comparing raw operating codes
+# instead drops ~112,501 sellable connections per day (measured 2025-07-18),
+# because e.g. an AA flight never connects to its own American Eagle feeder.
+#
+# Only carriers that fly for exactly ONE mainline belong here. Deliberately
+# ABSENT: SkyWest (OO) and Republic (YX), which each fly for several mainlines
+# (OO for DL/UA/AA/AS, YX for AA/DL/UA) and are independently owned, so BTS
+# carries nothing to say which one a given flight was sold under; and Mesa (YV),
+# which left American in April 2023, now flies for United, and is owned by
+# Republic rather than a mainline. Inferring any of these would be fabricating
+# data — see rule 1 in CLAUDE.md.
+#
+# Of the entries below only MQ and OH appear in the loaded 2025 US-domestic
+# data; the rest are correct mappings kept for other periods and are inert here.
+CARRIER_FAMILY = {
+    "MQ": "AA",  # Envoy Air -> American Eagle
+    "OH": "AA",  # PSA Airlines -> American Eagle
+    "PT": "AA",  # Piedmont Airlines -> American Eagle
+    "9E": "DL",  # Endeavor Air -> Delta Connection
+    "QX": "AS",  # Horizon Air -> Alaska
+}
+
 
 def setup_logging(verbose_cli=True):
     """Setup logging to file with proper formatting (required by AGENTS.md)"""
@@ -489,6 +515,8 @@ def create_connects_to(
     dates,
     min_layover=45,
     max_layover=300,
+    strict_carrier=False,
+    rebuild=False,
 ):
     """
     Build (:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule) for `dates`.
@@ -501,49 +529,100 @@ def create_connects_to(
     Materialising the connection as a single edge removes the juncture, so each
     repetition is one relationship hop with small out-degree.
 
-    Only valid connections get an edge: same carrier (no interline splicing),
-    layover within [min_layover, max_layover], and no immediate backtrack to the
-    first leg's origin. Encoding the policy in the edge is the tradeoff — change
-    the layover window and this must be rebuilt.
+    Only valid connections get an edge:
 
-    Scoped to specific dates on purpose. One day of 2025 is ~532K edges; a full
-    year would be ~194M, which is ~9x the rest of the graph and not what a demo
-    or a same-day search needs. Same-day connections only, so this does not
-    depend on the timezone-affected cross-midnight arithmetic documented in
-    CLAUDE.md.
+    - same marketing carrier — CARRIER_FAMILY maps wholly-owned regionals onto
+      their mainline parent, so AA->MQ (American Eagle) connects but unrelated
+      carriers never splice. `strict_carrier=True` compares raw operating codes
+      instead, which drops ~112K sellable connections per day.
+    - layover within [min_layover, max_layover]
+    - no immediate backtrack to the first leg's origin
+    - the inbound leg does not land the next calendar day (see below)
+
+    Encoding the policy in the edge is the tradeoff — change the layover window
+    or the carrier rule and this must be rebuilt. `MERGE` will not remove edges
+    that a previous, looser build already wrote, so pass `rebuild=True` to clear
+    each date first.
+
+    Scoped to specific dates on purpose. One day of 2025 is ~625K edges; a full
+    year would be ~228M, which is ~11x the rest of the graph and not what a demo
+    or a same-day search needs.
     """
     print("   🔀 Creating CONNECTS_TO relationships (bookable connections)...")
     start_time = time.time()
+
+    # s1's stored arrival is local at the hub and carries no timezone, so its
+    # DATE cannot be trusted (see the timezone defect in CLAUDE.md). BTS
+    # scheduled_duration_minutes (CRSElapsedTime) is timezone-independent
+    # ground truth: when arrival-minus-departure is negative AND adding a day
+    # reconciles it with the block time, s1 really lands the NEXT morning and
+    # this same-day connection cannot be made. Measured on 2025-07-18: 17,502
+    # of 532,080 edges (3.29%) were false this way, e.g. AA1009 LAX-ORD
+    # dep 22:59 arr 05:18 spliced to a 06:55 ORD departure.
+    #
+    # The 180-minute tolerance covers the observed timezone-offset histogram
+    # (+/-60, +/-120, +/-180) without matching genuine same-day legs.
+    overnight_inbound = """
+                      duration.inSeconds(s1.scheduled_departure_time,
+                                         s1.scheduled_arrival_time
+                                         ).seconds / 60 < 0
+                  AND abs(duration.inSeconds(s1.scheduled_departure_time,
+                                             s1.scheduled_arrival_time
+                                             ).seconds / 60
+                          + 1440 - s1.scheduled_duration_minutes) <= 180
+    """
+
+    if strict_carrier:
+        carrier_match = "s2.reporting_airline = s1.reporting_airline"
+    else:
+        carrier_match = (
+            "coalesce($family[s2.reporting_airline], s2.reporting_airline) = "
+            "coalesce($family[s1.reporting_airline], s1.reporting_airline)"
+        )
 
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     total = 0
     try:
         with driver.session(database=neo4j_database) as session:
             for search_date in dates:
+                if rebuild:
+                    session.run(
+                        """
+                        MATCH (s1:Schedule)-[r:CONNECTS_TO]->()
+                        WHERE s1.flightdate = date($date)
+                        CALL (r) {
+                            DELETE r
+                        } IN TRANSACTIONS OF 25000 ROWS
+                        """,
+                        date=search_date,
+                    ).consume()
+
                 # Driven from Schedule.flightdate (indexed) rather than through
                 # the Airport supernode: seeks the day's flights, then joins on
                 # dest = origin. Batched so one day does not build a single
                 # oversized transaction.
                 session.run(
-                    """
+                    f"""
                     MATCH (s1:Schedule) WHERE s1.flightdate = date($date)
+                      AND NOT ({overnight_inbound})
                     MATCH (s2:Schedule) WHERE s2.flightdate = date($date)
                       AND s2.origin = s1.dest
-                      AND s2.reporting_airline = s1.reporting_airline
+                      AND {carrier_match}
                       AND s2.dest <> s1.origin
                     WITH s1, s2,
                          duration.inSeconds(s1.scheduled_arrival_time,
                                             s2.scheduled_departure_time
                                             ).seconds / 60 AS lay
                     WHERE lay >= $min_layover AND lay <= $max_layover
-                    CALL (s1, s2, lay) {
+                    CALL (s1, s2, lay) {{
                         MERGE (s1)-[r:CONNECTS_TO]->(s2)
                         SET r.layover_minutes = lay
-                    } IN TRANSACTIONS OF 25000 ROWS
+                    }} IN TRANSACTIONS OF 25000 ROWS
                     """,
                     date=search_date,
                     min_layover=min_layover,
                     max_layover=max_layover,
+                    family=CARRIER_FAMILY,
                 ).consume()
 
                 count = session.run(
@@ -1239,7 +1318,25 @@ def main():
         nargs="+",
         help=(
             "Build CONNECTS_TO edges for the given date(s) and exit. Requires an "
-            "already-loaded graph; does not start Spark. ~532K edges per day."
+            "already-loaded graph; does not start Spark. ~625K edges per day."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-connections",
+        action="store_true",
+        help=(
+            "Delete existing CONNECTS_TO edges for each date before building. "
+            "MERGE cannot remove edges written by an earlier, looser rule, so "
+            "use this after changing the layover window or carrier matching."
+        ),
+    )
+    parser.add_argument(
+        "--strict-carrier",
+        action="store_true",
+        help=(
+            "Require an identical operating carrier code instead of treating "
+            "wholly-owned regionals as their mainline parent. Drops ~112K "
+            "sellable connections per day; see CARRIER_FAMILY."
         ),
     )
     parser.add_argument(
@@ -1285,6 +1382,8 @@ def main():
                 args.build_connections,
                 min_layover=args.min_layover,
                 max_layover=args.max_layover,
+                strict_carrier=args.strict_carrier,
+                rebuild=args.rebuild_connections,
             )
         except Exception as e:
             error_msg = f"CONNECTS_TO build failed: {str(e)}"

@@ -89,12 +89,15 @@ python load_bts_data.py --build-connections 2025-07-18
 ```
 
 That writes `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for every
-**bookable** connection on those dates — same carrier, layover within
-45–300 minutes, no immediate backtrack. About **532,000 edges per day**, built in
-**~7 seconds**. It is idempotent (`MERGE`), so re-running is safe.
+**bookable** connection on those dates — same marketing carrier, layover within
+45–300 minutes, no immediate backtrack, and no inbound leg that actually lands the
+next day. About **625,000 edges per day**, built in **~12 seconds**. It is
+idempotent (`MERGE`), so re-running is safe.
 
-The layover window is baked into the edges. Change `--min-layover`/`--max-layover`
-and rebuild.
+The connection policy is baked into the edges. After changing
+`--min-layover`/`--max-layover` or `--strict-carrier`, rebuild with
+`--rebuild-connections` — `MERGE` alone cannot remove edges a looser rule already
+wrote.
 
 ### The query
 
@@ -123,30 +126,84 @@ unsellable itinerary.
 
 ### Measured
 
-LGA→DFW, 2025-07-18, best-first, `LIMIT 5`:
+LGA→DFW, 2025-07-18, best-first, `LIMIT 5`, warm page cache:
 
 | query | wall clock | itineraries |
 |---|---|---|
-| QPP `{1,1}` (1-stop) | **185 ms** | 135 |
-| explicit 1-stop join | **182 ms** | 135 |
-| QPP `{0,1}` | **66 ms** | 157 |
-| QPP `{0,2}` | **102 ms** | 1,736 |
-| QPP `{0,3}` | **492 ms** | 13,625 |
+| QPP `{1,1}` (1-stop) | **146 ms** | 138 |
+| QPP `{0,1}` | **56 ms** | 160 |
+| QPP `{0,2}` | **105 ms** | 2,122 |
+| QPP `{0,3}` | **478 ms** | 11,488 |
 
-At 1-stop it is **at parity** with the hand-written join and returns an identical
-135 itineraries. Beyond 1-stop the join has no equivalent — you would hand-write
-another `MATCH` block per hop count, which is what the iterative-deepening client
-loop in `neo4j_flight_load_test.py` exists to do.
+At 1-stop this is at parity with the hand-written explicit join. Beyond 1-stop the
+join has no equivalent — you would hand-write another `MATCH` block per hop count,
+which is what the iterative-deepening client loop in
+`neo4j_flight_load_test.py` exists to do.
 
-Across 12 routes at `{0,2}`: **min 71 ms, median 113 ms, max 186 ms**.
+Across 12 routes at `{0,2}`: **min 88 ms, median 131 ms, max 261 ms**. Time these
+warm; a cold page cache roughly triples the first hit on each route.
 
 Routes with no nonstop, where multi-hop is the *only* answer:
 
 | route | wall clock | best itinerary |
 |---|---|---|
-| GUM→BOS | **1.2 ms** | GUM-HNL, HNL-DEN, DEN-BOS |
-| FCA→SAV | **7.6 ms** | FCA-DEN, DEN-SAV |
-| BOI→ALB | **28.5 ms** | BOI-MDW, MDW-ALB |
+| GUM→BOS | **4.7 ms** | GUM-HNL, HNL-DEN, DEN-BOS |
+| FCA→SAV | **26.4 ms** | FCA-DEN, DEN-SAV |
+| BOI→ALB | **154.5 ms** | BOI-MDW, MDW-ALB |
+
+### Validated against real routings
+
+The edges were checked against published airline route data (Wikipedia airport and
+airline articles, which carry per-carrier nonstop destination tables with seasonal
+annotations). Every leg in the sampled itineraries corresponds to real scheduled
+service, and every route the query *works around* genuinely has no nonstop:
+
+| itinerary leg | external check |
+|---|---|
+| `FCA-DEN` (UA2446) | UA / United Express serve DEN from FCA year-round |
+| `FCA-DFW` (AA2939) | AA serves DFW from FCA **seasonally** — July is in season |
+| `FCA-MSP` (DL1578) | DL serves MSP from FCA year-round |
+| FCA→SAV via ATL ranks 3rd | FCA has **no** ATL service; ATL only ever appears as a 2nd hop |
+| `BOI-MDW` (WN1382) | WN serves MDW from BOI seasonally — July in season |
+| `BOI-ORD` (UA573) | United Express serves ORD from BOI year-round |
+| BOI→ALB needs a stop | no BOI→ALB nonstop exists |
+| `GUM-HNL` (UA200) | UA is the **only** GUM–HNL carrier; GUM is a UA hub |
+| GUM→BOS needs 3 legs | GUM has **no** mainland-US nonstop at all |
+
+Structurally, connections concentrate exactly where real US hubs are — ATL, DFW,
+DEN, ORD, CLT lead, and the top 10 airports carry **71.6%** of all connections.
+Per-carrier hub sets derived from the graph match the real networks with no
+exceptions (DL at ATL/MSP/DTW/SLC, WN at DEN/LAS/MDW/BWI, HA at HNL/OGG/LIH/KOA,
+G4 at PIE/SFB). `tests/test_graph_validation.py` asserts this.
+
+Two defects that validation found, both now fixed in the builder:
+
+**Inbound legs that land the next day.** 17,502 edges (3.29%) connected off a leg
+whose stored arrival was same-day but which really arrives the following morning —
+`AA1009 LAX-ORD dep 22:59 arr 05:18` spliced to a 06:55 ORD departure. This is the
+timezone defect at the top of this document leaking into connection *dates*. The
+detector needs no timezone table: if apparent duration is negative **and** adding
+1440 minutes reconciles it with `scheduled_duration_minutes`, the leg is an
+overnight. Those legs are now excluded.
+
+**Regional affiliates are not interline.** BTS reports the *operating* carrier and
+the feed has **no marketing-carrier column**, so Envoy (`MQ`) and PSA (`OH`) —
+both wholly-owned American subsidiaries selling under AA flight numbers — never
+connected to AA. A strict code comparison drops **112,501 sellable connections per
+day**. `CARRIER_FAMILY` in `load_bts_data.py` maps wholly-owned regionals to their
+parent before comparing; `--strict-carrier` restores the old behaviour.
+
+SkyWest (`OO`, 2,533 flights/day) and Republic (`YX`, 1,030) are **deliberately
+excluded** from that map: each flies for several mainlines and BTS carries nothing
+to say which one a given flight was sold under. They stay strict rather than
+guessed. True interline between unrelated carriers (AA↔AS) is also not derivable
+here — and matters, since allowing arbitrary cross-carrier connections would add
+1.1M pairs a day, most unsellable.
+
+**Known and accepted:** 142 airports act as a connecting point for fewer than 100
+connections each (TTN, WYS, MGW…), which no airline would sell. That is **0.49%**
+of edges — too small to affect a ranked result, so it is measured rather than
+filtered.
 
 ### Why the edge is necessary: don't traverse through `Airport`
 
@@ -189,10 +246,10 @@ The cost is the juncture, not the quantifier.
 
 | scope | edges |
 |---|---|
-| 1 day | ~532,000 |
-| full year (extrapolated) | ~194,000,000 |
+| 1 day | ~625,000 |
+| full year (extrapolated) | ~228,000,000 |
 
-A full year is ~9x the rest of the graph, and a date-specific search never needs
+A full year is ~11x the rest of the graph, and a date-specific search never needs
 it. Build the dates you intend to query. Same-day connections only, so this also
 sidesteps the cross-midnight timezone problem described above.
 
@@ -317,8 +374,12 @@ of the trap described at the top of this document.
   `CASE` duration idiom and no carrier predicate. Migrating it is an open task.
 - **Layover bounds are inconsistent across this repo** (300, 720, and 1200
   minutes appear in different files). Pick a value deliberately.
-- **Without the carrier predicate, most returned itineraries are unsellable.**
-  A 1-stop query with no `s1.reporting_airline = s2.reporting_airline` condition
-  freely splices any airline to any other — including carriers that interline
-  with nobody.
+- **Without a carrier predicate, most returned itineraries are unsellable.**
+  A 1-stop query with no carrier condition freely splices any airline to any
+  other — including carriers that interline with nobody. But note the predicate
+  cuts both ways: a *strict* `s1.reporting_airline = s2.reporting_airline` is too
+  tight, because BTS reports operating carriers and so separates mainlines from
+  their own wholly-owned regional feeders. `CONNECTS_TO` compares marketing
+  carriers via `CARRIER_FAMILY` instead; the explicit join above still uses the
+  strict form and will miss American Eagle connections.
 - **No APOC.** Everything here is plain Cypher, for Aura compatibility.

@@ -258,8 +258,9 @@ python load_bts_data.py --build-connections 2025-07-18
 ```
 
 That materialises `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for
-every bookable connection — same carrier, 45-300 minute layover, no backtracking.
-~532K edges per day, built in ~7 seconds, idempotent.
+every bookable connection — same carrier or its wholly-owned regional affiliate,
+45-300 minute layover, no backtracking, no overnight inbound leg. ~625K edges per
+day, built in ~12 seconds, idempotent.
 
 ```cypher
 MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
@@ -305,12 +306,12 @@ Where it earns its keep — routes with no nonstop at all:
 supernode with no date property: reaching a hub forces the next hop to bind
 3,783,541 candidate flights to keep 11,695. Materialising the connection removes
 that juncture and puts the connection rules in the edge, so no query can
-accidentally splice two carriers into an unsellable itinerary.
+accidentally splice two unrelated carriers into an unsellable itinerary.
 
 > 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the full
-> measurements, the cost/scope tradeoff (a full year would be ~194M edges), and
-> why moving predicates inside the quantifier does *not* fix the supernode
-> problem.
+> measurements, the cost/scope tradeoff (a full year would be ~228M edges), how
+> the edges were validated against published airline route data, and why moving
+> predicates inside the quantifier does *not* fix the supernode problem.
 >
 > The shipped load test (`neo4j_flight_load_test.py`) still uses an older
 > formulation with the flawed duration idiom and no carrier predicate; migrating
@@ -336,11 +337,17 @@ Derived projections:
 `Airport` and `Carrier` carry only a `code`. `Schedule` holds everything else.
 
 **`CONNECTS_TO`** is what makes variable-depth routing fast — one edge per
-*bookable* connection (same carrier, 45–300 min layover, no backtrack), so a
-quantified path pattern walks flight-to-flight instead of crossing the `Airport`
-supernode. Date-scoped and built on demand:
-`python load_bts_data.py --build-connections 2025-07-18` (~532K edges/day, ~7s).
-The layover policy lives in the edge, so changing it means rebuilding.
+*bookable* connection, so a quantified path pattern walks flight-to-flight instead
+of crossing the `Airport` supernode. Date-scoped and built on demand:
+`python load_bts_data.py --build-connections 2025-07-18` (~625K edges/day, ~12s).
+
+"Bookable" is enforced in the edge and externally validated against published
+route data: 45–300 minute layover, no backtrack, no inbound leg that really lands
+the next day, and same *marketing* carrier. That last point is subtle — BTS reports
+only the operating carrier, so treating `MQ`/`OH` (wholly-owned American Eagle
+subsidiaries) as distinct from `AA` drops 112,501 sellable connections a day. See
+`CARRIER_FAMILY` in `load_bts_data.py`. Because the policy lives in the edge,
+changing it means rebuilding with `--rebuild-connections`.
 
 **`ROUTE`** is an aggregated topology projection — one edge per distinct
 `(origin, dest)` pair with service counts and date span, rebuilt from the graph at
