@@ -70,6 +70,75 @@ class TestBasicConnectivity:
             f"got {route_edges:,}"
         )
 
+    def test_connects_to_edges_are_valid(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """Every CONNECTS_TO edge is a genuinely bookable connection"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip(
+                    "No CONNECTS_TO edges — build them with "
+                    "`python load_bts_data.py --build-connections YYYY-MM-DD`"
+                )
+            # The whole value of this edge is that the connection rules are
+            # already applied, so a query over it cannot produce an unsellable
+            # itinerary. Assert the invariants rather than trusting the builder.
+            invalid = session.run(
+                """
+                MATCH (s1:Schedule)-[r:CONNECTS_TO]->(s2:Schedule)
+                WHERE s1.dest <> s2.origin
+                   OR s1.reporting_airline <> s2.reporting_airline
+                   OR s2.dest = s1.origin
+                   OR r.layover_minutes IS NULL
+                   OR r.layover_minutes <= 0
+                RETURN count(r) AS count
+                """
+            ).single()["count"]
+
+        assert invalid == 0, (
+            f"{invalid:,} of {total:,} CONNECTS_TO edges violate the connection "
+            "rules (hub mismatch, carrier change, backtrack, or bad layover)"
+        )
+
+    def test_connects_to_supports_multi_hop_qpp(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """A variable-depth QPP over CONNECTS_TO returns coherent itineraries"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            if (
+                session.run(
+                    "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+                ).single()["count"]
+                == 0
+            ):
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            # Pick a date that actually has connections rather than assuming one.
+            date = session.run(
+                """
+                MATCH (s1:Schedule)-[:CONNECTS_TO]->()
+                RETURN toString(s1.flightdate) AS d, count(*) AS c
+                ORDER BY c DESC LIMIT 1
+                """
+            ).single()["d"]
+            # Legs must chain end-to-end across the whole path: leg N's
+            # destination is leg N+1's origin, at every depth the QPP returns.
+            broken = session.run(
+                """
+                MATCH p = (first:Schedule)-[:CONNECTS_TO]->{1,3}(last:Schedule)
+                WHERE first.flightdate = date($date)
+                WITH nodes(p) AS legs LIMIT 2000
+                WHERE any(i IN range(0, size(legs) - 2)
+                          WHERE legs[i].dest <> legs[i + 1].origin)
+                RETURN count(*) AS count
+                """,
+                date=date,
+            ).single()["count"]
+
+        assert broken == 0, f"{broken} QPP paths have non-contiguous legs"
+
     def test_sample_schedule_properties(
         self, neo4j_driver, neo4j_database, loaded_graph
     ):

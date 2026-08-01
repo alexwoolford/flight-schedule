@@ -248,68 +248,69 @@ Note `duration.inSeconds(...)`, **not** `duration.between(...).minutes` — the
 `.minutes` accessor covers only the seconds component group and **excludes whole
 days**, so a 25½-hour span reports as 90 minutes.
 
-### On quantified path patterns
+### Variable-depth routing with quantified path patterns
 
-Neo4j 5.9+ supports quantified path patterns, which can express "1 to N legs" in
-one pattern instead of a `UNION` per hop count:
+Direct, 1-stop, or 2-stop itineraries from **one query with one number to change**.
+First build the connection edges for the date(s) you want to search:
 
-```cypher
-MATCH (origin:Airport {code: $origin})
-      ((a:Airport)<-[:DEPARTS_FROM]-(leg:Schedule)-[:ARRIVES_AT]->(b:Airport)
-        WHERE leg.flightdate IN [date($date), date($date) + duration('P1D')]
-      ){1,2}
-      (dest:Airport {code: $dest})
-WHERE leg[0].flightdate = date($date)
-  AND all(i IN range(0, size(leg) - 2) WHERE
-        leg[i].reporting_airline = leg[i + 1].reporting_airline
-    AND duration.inSeconds(leg[i].scheduled_arrival_time,
-                           leg[i + 1].scheduled_departure_time).seconds / 60 >= $min_layover
-    AND duration.inSeconds(leg[i].scheduled_arrival_time,
-                           leg[i + 1].scheduled_departure_time).seconds / 60 <= $max_layover)
-RETURN size(leg) - 1 AS stops,
-       [f IN leg | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
-       leg[0].scheduled_departure_time AS departs,
-       leg[-1].scheduled_arrival_time AS arrives,
-       reduce(t = 0, f IN leg | t + f.scheduled_duration_minutes) AS air_minutes
-ORDER BY stops, departs
-LIMIT $limit
+```bash
+python load_bts_data.py --build-connections 2025-07-18
 ```
 
-It is more elegant, and `leg` being a *group variable* (a list of the matched
-`Schedule` nodes) is what makes `leg[0]`, `leg[-1]`, and the `reduce()` work.
+That materialises `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for
+every bookable connection — same carrier, 45-300 minute layover, no backtracking.
+~532K edges per day, built in ~7 seconds, idempotent.
 
-**But on this graph it is dramatically slower**, and the reason is the data model,
-not the query. Measured on LGA→DFW for one date:
+```cypher
+MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
+WHERE first.flightdate = date($date)
+MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
+MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WITH p, nodes(p) AS legs, relationships(p) AS conns
+RETURN size(legs) - 1 AS stops,
+       [f IN legs | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
+       [f IN legs | f.origin + '-' + f.dest] AS route,
+       reduce(t = 0, f IN legs | t + f.scheduled_duration_minutes) AS air_minutes,
+       reduce(t = 0, c IN conns | t + c.layover_minutes) AS layover_minutes
+ORDER BY stops, air_minutes + layover_minutes
+LIMIT 5
+```
 
-| | wall clock | dbHits |
+`{0,2}` is direct + 1-stop + 2-stop. `{0,3}` adds another leg. Nothing else
+changes.
+
+Measured, LGA→DFW on 2025-07-18:
+
+| query | wall clock | itineraries |
 |---|---|---|
-| explicit 1-stop join | **658 ms** | 1,364,930 |
-| QPP `{1,2}` | **44,566 ms** | 255,800,105 |
+| QPP `{1,1}` (1-stop) | **185 ms** | 135 |
+| explicit 1-stop join | **182 ms** | 135 |
+| QPP `{0,2}` | **102 ms** | 1,736 |
+| QPP `{0,3}` | **492 ms** | 13,625 |
 
-There is no `Schedule`→`Schedule` relationship, so each repetition has to hop
-`Schedule → Airport → Schedule`, passing **through an `Airport` supernode**.
-`Airport` holds only `code` — it has no date — so the second hop fans out to a
-whole year of departures before any date filter can apply. From the hubs LGA
-reaches on one date, that is **51,943,377** `DEPARTS_FROM` edges walked, of which
-**161,054** are on the search date: **99.69% wasted traversal**.
+At 1-stop it matches the hand-written join exactly — same 135 itineraries, same
+latency. Beyond 1-stop there is no join to compare against without hand-writing a
+new `MATCH` block per hop count. Across 12 routes at `{0,2}`: median **113 ms**.
 
-This is not a matter of where the predicates sit. A `{1,2}` pattern with *no*
-inter-repetition predicates at all still takes **20,800 ms**, while `{1,1}` —
-which never crosses a hub — takes **304 ms**. The supernode juncture is the cost,
-so no rewrite of the QPP avoids it.
+Where it earns its keep — routes with no nonstop at all:
 
-Use the explicit join for itinerary search. **QPPs are the right tool on the
-`ROUTE` projection instead** — 352 airports, ~6,900 edges, out-degree ~20 and no
-supernodes — for reachability and hop-count questions:
+| route | wall clock | best itinerary |
+|---|---|---|
+| GUM→BOS | **1.2 ms** | GUM-HNL, HNL-DEN, DEN-BOS |
+| FCA→SAV | **7.6 ms** | FCA-DEN, DEN-SAV |
+| BOI→ALB | **28.5 ms** | BOI-MDW, MDW-ALB |
 
-```cypher
-// Airports reachable from LGA in at most 3 legs
-MATCH (:Airport {code: 'LGA'})-[:ROUTE]->{1,3}(reachable:Airport)
-RETURN count(DISTINCT reachable) AS airports;
-```
+**The `CONNECTS_TO` edge is what makes this work.** Writing the same QPP over
+`Schedule → Airport → Schedule` is 200-400x slower, because `Airport` is a
+supernode with no date property: reaching a hub forces the next hop to bind
+3,783,541 candidate flights to keep 11,695. Materialising the connection removes
+that juncture and puts the connection rules in the edge, so no query can
+accidentally splice two carriers into an unsellable itinerary.
 
-> 📖 See [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) for the `ROUTE`
-> QPP examples, parameters, and further caveats.
+> 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the full
+> measurements, the cost/scope tradeoff (a full year would be ~194M edges), and
+> why moving predicates inside the quantifier does *not* fix the supernode
+> problem.
 >
 > The shipped load test (`neo4j_flight_load_test.py`) still uses an older
 > formulation with the flawed duration idiom and no carrier predicate; migrating
@@ -318,27 +319,34 @@ RETURN count(DISTINCT reachable) AS airports;
 ## 🏗️ Architecture
 
 ### Data Model
+
+Loaded for every flight:
 ```
 (Schedule)-[:DEPARTS_FROM]->(Airport)
 (Schedule)-[:ARRIVES_AT]->(Airport)
 (Schedule)-[:OPERATED_BY]->(Carrier)
+```
 
+Derived projections:
+```
 (Airport)-[:ROUTE {flights, carriers, first_date, last_date}]->(Airport)
+(Schedule)-[:CONNECTS_TO {layover_minutes}]->(Schedule)
 ```
 
 `Airport` and `Carrier` carry only a `code`. `Schedule` holds everything else.
 
-`ROUTE` is an **aggregated projection**, not per-flight data: one edge per
-distinct `(origin, dest)` pair, carrying how many flights and how many distinct
-carriers served it and over what date span. It is derived from the `Schedule`
-nodes already in the graph at the end of each load, so it always describes
-everything loaded — not just the file that happened to run.
+**`CONNECTS_TO`** is what makes variable-depth routing fast — one edge per
+*bookable* connection (same carrier, 45–300 min layover, no backtrack), so a
+quantified path pattern walks flight-to-flight instead of crossing the `Airport`
+supernode. Date-scoped and built on demand:
+`python load_bts_data.py --build-connections 2025-07-18` (~532K edges/day, ~7s).
+The layover policy lives in the edge, so changing it means rebuilding.
 
-It exists because `Airport` is a supernode with no date property, which makes
-multi-hop traversal over `Schedule` expensive; `ROUTE` has out-degree ~20 instead
-of ~19,600, so reachability and hop-count questions over it are millisecond-scale.
-It answers *which routes exist*, not *which connections are bookable* — for that,
-join back to `Schedule`. See
+**`ROUTE`** is an aggregated topology projection — one edge per distinct
+`(origin, dest)` pair with service counts and date span, rebuilt from the graph at
+the end of every load. Useful as a cheap hub pre-filter, but it has no time
+dimension, so it overstates what is actually bookable (66 claimed hubs for
+LGA→DFW versus 26 real ones). Not an itinerary search. See
 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md).
 
 `Schedule` has **no surrogate ID** — its identity is the 5-part composite key

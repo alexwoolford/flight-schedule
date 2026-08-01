@@ -38,7 +38,12 @@ minutes, one timezone westbound). The `CASE` idiom returns **1439 minutes**, and
 at the hub are local to the same airport, so connection windows computed by
 subtraction are correct.
 
-## Recommended query: explicit 1-stop join
+## Explicit 1-stop join
+
+Use this when you want exactly one stop and don't want to build any extra edges.
+For variable-depth search (direct *or* 1-stop *or* 2-stop in one query), use the
+quantified path pattern in the next section instead — it's at parity on 1-stop and
+the only practical option beyond it.
 
 ```cypher
 MATCH (:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
@@ -70,94 +75,149 @@ LIMIT $limit
 **`duration.inSeconds(...)`, not `.minutes`** — `duration.between(...).minutes` is
 a component accessor that **excludes whole days**, so a 25½-hour span reports as
 90 minutes. `inSeconds()` gives the true total.
+## Quantified path patterns: variable-depth search in one query
 
-## Quantified path patterns: elegant, but slower here
+QPPs (Neo4j 5.9+) express "direct, or 1 stop, or 2 stops…" as **one pattern with
+one number to change** — no `UNION ALL` per hop count and no iterative deepening
+in the client. On this graph they need one thing first: a direct
+`Schedule`→`Schedule` edge.
 
-Neo4j 5.9+ supports quantified path patterns (QPPs), which express "1 to N legs"
-in one pattern — no `UNION ALL` per hop count and no iterative deepening in the
-client:
+### Build the connection edges
+
+```bash
+python load_bts_data.py --build-connections 2025-07-18
+```
+
+That writes `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for every
+**bookable** connection on those dates — same carrier, layover within
+45–300 minutes, no immediate backtrack. About **532,000 edges per day**, built in
+**~7 seconds**. It is idempotent (`MERGE`), so re-running is safe.
+
+The layover window is baked into the edges. Change `--min-layover`/`--max-layover`
+and rebuild.
+
+### The query
 
 ```cypher
-MATCH (origin:Airport {code: $origin})
-      ((a:Airport)<-[:DEPARTS_FROM]-(leg:Schedule)-[:ARRIVES_AT]->(b:Airport)
-        WHERE leg.flightdate IN [date($date), date($date) + duration('P1D')]
-      ){1,2}
-      (dest:Airport {code: $dest})
-WHERE leg[0].flightdate = date($date)
-  AND all(i IN range(0, size(leg) - 2) WHERE
-        leg[i].reporting_airline = leg[i + 1].reporting_airline
-    AND duration.inSeconds(leg[i].scheduled_arrival_time,
-                           leg[i + 1].scheduled_departure_time).seconds / 60
-          >= $min_layover
-    AND duration.inSeconds(leg[i].scheduled_arrival_time,
-                           leg[i + 1].scheduled_departure_time).seconds / 60
-          <= $max_layover)
-RETURN size(leg) - 1 AS stops,
-       [f IN leg | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
-       [f IN leg | f.origin + '-' + f.dest] AS route,
-       leg[0].scheduled_departure_time AS departs,
-       leg[-1].scheduled_arrival_time AS arrives,
-       reduce(t = 0, f IN leg | t + f.scheduled_duration_minutes) AS air_minutes
-ORDER BY stops, departs
+MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
+WHERE first.flightdate = date($date)
+MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
+MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WITH p, nodes(p) AS legs, relationships(p) AS conns
+RETURN size(legs) - 1 AS stops,
+       [f IN legs | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
+       [f IN legs | f.origin + '-' + f.dest] AS route,
+       // Sum of real block times. Do NOT compute arrives - departs.
+       reduce(t = 0, f IN legs | t + f.scheduled_duration_minutes) AS air_minutes,
+       reduce(t = 0, c IN conns | t + c.layover_minutes) AS layover_minutes
+ORDER BY stops, air_minutes + layover_minutes
 LIMIT $limit
 ```
 
-Worth understanding:
+`{0,2}` means **direct, 1-stop, or 2-stop in a single query**. `{0,3}` adds
+3-stop. Nothing else changes — that is the whole point.
 
-- **`{1,2}`** covers direct flights *and* 1-stop in one pattern.
-- **`leg`** is a *group variable* — outside the quantifier it is an ordered list of
-  the matched `Schedule` nodes. That's what makes `leg[0]`, `leg[-1]`, and the
-  `reduce()` over block times work.
-- **A predicate inside the quantifier** (`leg.flightdate IN [...]`) applies per
-  repetition, so it prunes during expansion.
-- **`leg[0].flightdate = date($date)`** anchors the *first* leg to the search date
-  while letting later legs spill into the next day.
+Because the connection rules live in the edge, there are no inter-repetition
+predicates left to write, and no way to accidentally splice two carriers into an
+unsellable itinerary.
 
-### Why it is slow: the supernode juncture
+### Measured
 
-`PROFILE`d on the full 2025 graph (6,898,743 flights), LGA→DFW on one date:
+LGA→DFW, 2025-07-18, best-first, `LIMIT 5`:
 
-| query | wall clock | dbHits | rows expanded |
-|---|---|---|---|
-| explicit 1-stop join (above) | **658 ms** | 1,364,930 | — |
-| QPP `{1,2}` | **44,566 ms** | 255,800,105 | 84,254,361 → 493,785 |
-| QPP `{1,1}` (never crosses a hub) | **304 ms** | — | — |
-| QPP `{1,2}`, *no* inter-repetition predicates | **20,800 ms** | — | — |
+| query | wall clock | itineraries |
+|---|---|---|
+| QPP `{1,1}` (1-stop) | **185 ms** | 135 |
+| explicit 1-stop join | **182 ms** | 135 |
+| QPP `{0,1}` | **66 ms** | 157 |
+| QPP `{0,2}` | **102 ms** | 1,736 |
+| QPP `{0,3}` | **492 ms** | 13,625 |
 
-The cause is the **data model**, not the phrasing. There is no
-`Schedule`→`Schedule` relationship, so each repetition must hop
-`Schedule → Airport → Schedule` — through an `Airport` node. `Airport` carries
-only `code`; it has **no date dimension**. So the moment expansion arrives at a
-hub, the next hop fans out to that hub's departures for *the entire loaded
-period* before any date predicate can apply. Measured directly: from the hubs LGA
-reaches on one date, the second hop walks **51,943,377** `DEPARTS_FROM` edges, of
-which **161,054** are on the search date — **99.69% wasted traversal**.
+At 1-stop it is **at parity** with the hand-written join and returns an identical
+135 itineraries. Beyond 1-stop the join has no equivalent — you would hand-write
+another `MATCH` block per hop count, which is what the iterative-deepening client
+loop in `neo4j_flight_load_test.py` exists to do.
 
-`Airport` out-degree over a year is avg **19,599**, median 2,733, max **321,372**
-(ORD). For a single day it is avg 62.7, max 1,035 — but QPP cannot exploit that,
-because the date lives on `Schedule`, one hop away.
+Across 12 routes at `{0,2}`: **min 71 ms, median 113 ms, max 186 ms**.
 
-The last two rows are the control that rules out predicate placement as the
-explanation. Removing *every* inter-repetition predicate — QPP's best possible
-case — still costs 20.8 s, while `{1,1}`, which never crosses a hub, costs 304 ms.
-No rewrite of the QPP avoids the juncture.
+Routes with no nonstop, where multi-hop is the *only* answer:
 
-**So itinerary search stays on the explicit join.** That is a deliberate choice
-about where QPP fits this model, not an artifact of the repo predating QPP.
+| route | wall clock | best itinerary |
+|---|---|---|
+| GUM→BOS | **1.2 ms** | GUM-HNL, HNL-DEN, DEN-BOS |
+| FCA→SAV | **7.6 ms** | FCA-DEN, DEN-SAV |
+| BOI→ALB | **28.5 ms** | BOI-MDW, MDW-ALB |
 
-## Quantified path patterns over `ROUTE`: where they do win
+### Why the edge is necessary: don't traverse through `Airport`
 
-The loader also writes an aggregated route network, which is the projection QPP is
-actually suited to:
+Writing the same QPP *without* `CONNECTS_TO` — hopping
+`Schedule → Airport → Schedule` — is **200-400x slower** and, in the naive form,
+also wrong. `PROFILE`d on the same route and date:
+
+| formulation | wall clock | result |
+|---|---|---|
+| QPP over `CONNECTS_TO` `{1,1}` | **185 ms** | 135 ✅ |
+| QPP via `Airport`, predicates inside the quantifier | 69,322 ms | 135 ✅ |
+| QPP via `Airport`, `all(i IN range(...))` post-filter | 41,878 ms | 157 ❌ |
+
+`Airport` carries only `code` — it has **no date**. So when expansion reaches a
+hub, the next hop must bind that hub's departures for the *entire loaded period*
+before any date predicate can apply: **3,783,541** candidate `Schedule` nodes
+bound to keep **11,695**, or **99.69% discarded**.
+
+Moving the predicates inside the quantifier does not fix this, and that is the
+non-obvious part: a predicate like
+`s1.reporting_airline = s2.reporting_airline` needs `s2`'s properties, so `s2`
+must be *materialised* before it can be tested. **Per-repetition predicates prune
+after the supernode crossing, not during it** — and unlike a `MATCH`, a predicate
+inside a quantifier cannot be served by an index. That is why the stateful
+formulation is *slower* than the post-filter one: same traversal, plus 3.8M
+predicate evaluations.
+
+The explicit join avoids it because `s2.flightdate = date($date)` lets the planner
+seek the ~11,695 relevant nodes via `schedule_date_departure` and *then* check the
+hub — it never walks the 3.8M. `CONNECTS_TO` avoids it by removing the juncture
+entirely.
+
+The `{1,1}` row above is also the control that rules out "QPP is just slow":
+restricted to one leg, so never crossing a hub, the `Airport` form runs in 304 ms.
+The cost is the juncture, not the quantifier.
+
+### Cost and scope
+
+`CONNECTS_TO` is date-scoped on purpose:
+
+| scope | edges |
+|---|---|
+| 1 day | ~532,000 |
+| full year (extrapolated) | ~194,000,000 |
+
+A full year is ~9x the rest of the graph, and a date-specific search never needs
+it. Build the dates you intend to query. Same-day connections only, so this also
+sidesteps the cross-midnight timezone problem described above.
+
+## The `ROUTE` projection: topology, not itineraries
+
+The loader also writes an aggregated route network:
 
 ```
 (:Airport)-[:ROUTE {flights, carriers, first_date, last_date}]->(:Airport)
 ```
 
-One edge per distinct directed route rather than one per flight. It has no
-supernodes — 352 airports, ~6,900 edges, out-degree avg ~20 / max 186, versus
-19,599 for `DEPARTS_FROM` — so bounded expansion stays cheap, and none of these
-questions need per-flight temporal data.
+One edge per distinct directed route rather than one per flight — 352 airports,
+~6,900 edges, out-degree avg ~20 / max 186 versus 19,599 for `DEPARTS_FROM`.
+
+**Calibrate your expectations before using this.** It is a 352-node graph, so
+everything here is fast for uninteresting reasons, and the answers tend toward the
+degenerate: ATL reaches 347 of 352 airports within 2 legs and all 352 within 3;
+the average across all origins is 228 within 2 legs. "What can I reach in N legs"
+mostly answers "almost everything."
+
+It also **overstates what is bookable**, because it has no time dimension:
+`ROUTE` claims 66 connecting hubs for LGA→DFW where only **26** have an actual
+same-day, same-carrier, 45–300-minute connection — a **2.5x** overstatement. Use
+it as a cheap hub pre-filter or for topology questions, then verify against
+`Schedule` or `CONNECTS_TO`. It is not an itinerary search.
 
 **Bounded reachability** — how much of the network is within N legs of LGA:
 

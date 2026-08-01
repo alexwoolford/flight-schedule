@@ -481,6 +481,89 @@ def create_route_projection(neo4j_uri, neo4j_user, neo4j_password, neo4j_databas
     return route_count
 
 
+def create_connects_to(
+    neo4j_uri,
+    neo4j_user,
+    neo4j_password,
+    neo4j_database,
+    dates,
+    min_layover=45,
+    max_layover=300,
+):
+    """
+    Build (:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule) for `dates`.
+
+    This is the edge that makes quantified path patterns work for itinerary
+    search. A QPP over Schedule->Airport->Schedule has to cross the Airport
+    supernode at every repetition, and because the date lives on Schedule rather
+    than Airport, 99.69% of the Schedule nodes it binds are discarded. Measured
+    LGA->DFW for one date: 3,783,541 candidates bound, 11,695 relevant.
+    Materialising the connection as a single edge removes the juncture, so each
+    repetition is one relationship hop with small out-degree.
+
+    Only valid connections get an edge: same carrier (no interline splicing),
+    layover within [min_layover, max_layover], and no immediate backtrack to the
+    first leg's origin. Encoding the policy in the edge is the tradeoff — change
+    the layover window and this must be rebuilt.
+
+    Scoped to specific dates on purpose. One day of 2025 is ~532K edges; a full
+    year would be ~194M, which is ~9x the rest of the graph and not what a demo
+    or a same-day search needs. Same-day connections only, so this does not
+    depend on the timezone-affected cross-midnight arithmetic documented in
+    CLAUDE.md.
+    """
+    print("   🔀 Creating CONNECTS_TO relationships (bookable connections)...")
+    start_time = time.time()
+
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    total = 0
+    try:
+        with driver.session(database=neo4j_database) as session:
+            for search_date in dates:
+                # Driven from Schedule.flightdate (indexed) rather than through
+                # the Airport supernode: seeks the day's flights, then joins on
+                # dest = origin. Batched so one day does not build a single
+                # oversized transaction.
+                session.run(
+                    """
+                    MATCH (s1:Schedule) WHERE s1.flightdate = date($date)
+                    MATCH (s2:Schedule) WHERE s2.flightdate = date($date)
+                      AND s2.origin = s1.dest
+                      AND s2.reporting_airline = s1.reporting_airline
+                      AND s2.dest <> s1.origin
+                    WITH s1, s2,
+                         duration.inSeconds(s1.scheduled_arrival_time,
+                                            s2.scheduled_departure_time
+                                            ).seconds / 60 AS lay
+                    WHERE lay >= $min_layover AND lay <= $max_layover
+                    CALL (s1, s2, lay) {
+                        MERGE (s1)-[r:CONNECTS_TO]->(s2)
+                        SET r.layover_minutes = lay
+                    } IN TRANSACTIONS OF 25000 ROWS
+                    """,
+                    date=search_date,
+                    min_layover=min_layover,
+                    max_layover=max_layover,
+                ).consume()
+
+                count = session.run(
+                    """
+                    MATCH (s1:Schedule)-[r:CONNECTS_TO]->()
+                    WHERE s1.flightdate = date($date)
+                    RETURN count(r) AS count
+                    """,
+                    date=search_date,
+                ).single()["count"]
+                total += count
+                print(f"     • {search_date}: {count:,} connections")
+    finally:
+        driver.close()
+
+    elapsed = time.time() - start_time
+    print(f"     ✅ CONNECTS_TO completed in {elapsed:.1f}s ({total:,} edges)")
+    return total
+
+
 def create_relationships_fast(
     spark,
     schedule_df,
@@ -1150,6 +1233,27 @@ def main():
     parser.add_argument(
         "--quiet", action="store_true", help="Suppress CLI output (logs only)"
     )
+    parser.add_argument(
+        "--build-connections",
+        metavar="YYYY-MM-DD",
+        nargs="+",
+        help=(
+            "Build CONNECTS_TO edges for the given date(s) and exit. Requires an "
+            "already-loaded graph; does not start Spark. ~532K edges per day."
+        ),
+    )
+    parser.add_argument(
+        "--min-layover",
+        type=int,
+        default=45,
+        help="Minimum connection minutes for --build-connections (default 45)",
+    )
+    parser.add_argument(
+        "--max-layover",
+        type=int,
+        default=300,
+        help="Maximum connection minutes for --build-connections (default 300)",
+    )
 
     args = parser.parse_args()
 
@@ -1158,6 +1262,36 @@ def main():
 
     # Setup logging - disable console output if in CLI mode (to avoid duplication)
     logger = setup_logging(verbose_cli=cli_mode)
+
+    # CONNECTS_TO works purely over the loaded graph, so it runs standalone
+    # rather than as a step in the Spark pipeline.
+    if args.build_connections:
+        load_dotenv()
+        neo4j_uri = os.getenv("NEO4J_URI")
+        neo4j_user = os.getenv("NEO4J_USERNAME")
+        neo4j_password = os.getenv("NEO4J_PASSWORD")
+        neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
+        if not all([neo4j_uri, neo4j_user, neo4j_password]):
+            msg = "Missing Neo4j credentials — copy .env.example to .env"
+            logger.error(msg)
+            print(f"❌ {msg}")
+            raise SystemExit(1)
+        try:
+            create_connects_to(
+                neo4j_uri,
+                neo4j_user,
+                neo4j_password,
+                neo4j_database,
+                args.build_connections,
+                min_layover=args.min_layover,
+                max_layover=args.max_layover,
+            )
+        except Exception as e:
+            error_msg = f"CONNECTS_TO build failed: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            print(f"❌ {error_msg}")
+            raise
+        return
 
     logger.info(
         f"Starting BTS data load - single_file: {args.single_file}, data_path: {args.data_path}"
