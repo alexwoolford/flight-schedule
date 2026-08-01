@@ -82,6 +82,11 @@ locust_failures*.csv
 bandit-report.json
 safety-report.json
 
+# Non-conda package managers. Dependencies belong in environment.yml
+# (see rule 4 in CLAUDE.md); a uv/pip lockfile here would be a second,
+# competing source of truth.
+uv.lock
+
 # Temporary files
 *.tmp
 *.temp

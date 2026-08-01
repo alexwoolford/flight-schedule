@@ -631,7 +631,7 @@ class BTSFlightDataDownloader:
 def main():
     parser = argparse.ArgumentParser(description="Download real BTS flight data")
     parser.add_argument(
-        "--year", type=int, default=2024, help="Year to download (default: 2024)"
+        "--year", type=int, default=2025, help="Year to download (default: 2025)"
     )
     parser.add_argument("--month", type=int, help="Specific month to download (1-12)")
     parser.add_argument(

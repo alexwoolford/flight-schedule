@@ -217,7 +217,11 @@ log_success "Environment activated: $(conda env list | grep '*' | awk '{print $1
 # Test Neo4j connection (now that we have the required packages)
 log_section "Testing Neo4j Connection"
 
-# Simple connection test using Python
+# Simple connection test using Python.
+# Creates the target database first if it doesn't exist: the default for
+# self-hosted is "flights", which won't be present on a fresh Neo4j install.
+# CREATE DATABASE requires Enterprise or Aura; on Community it fails and we
+# fall through to the connection test, which reports the real problem.
 cat > test_connection.py << 'EOF'
 import sys
 import os
@@ -225,6 +229,23 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
 load_dotenv()
+
+target_db = os.getenv("NEO4J_DATABASE", "neo4j")
+
+if target_db != "neo4j":
+    try:
+        driver = GraphDatabase.driver(
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD")),
+        )
+        with driver.session(database="system") as session:
+            session.run(f"CREATE DATABASE `{target_db}` IF NOT EXISTS").consume()
+        print(f"✅ Database '{target_db}' is present")
+        driver.close()
+    except Exception as e:
+        print(f"⚠️  Could not create database '{target_db}': {e}")
+        print("    If this is Neo4j Community Edition, set NEO4J_DATABASE=neo4j "
+              "in .env (Community supports only the default database).")
 
 try:
     driver = GraphDatabase.driver(
@@ -418,18 +439,16 @@ EOF
     echo "  • Airports: $FINAL_AIRPORT_COUNT"
     echo ""
 
+    # A full year loads ~6.9M Schedule nodes. Anything under 1M means the load
+    # aborted partway; check the log rather than proceeding.
     if [ "$FINAL_SCHEDULE_COUNT" -lt 1000000 ]; then
-        log_error "Data loading appears incomplete. Expected 7-8M+ records, got $FINAL_SCHEDULE_COUNT. Check logs for errors."
+        log_error "Data loading appears incomplete. Expected ~6.9M records for a full year, got $FINAL_SCHEDULE_COUNT. Check logs for errors."
         exit 1
     fi
 fi
 
-# Generate Flight Scenarios for Load Testing
+# Verify the load-test harness imports and can reach the database
 log_section "Setting Up Load Testing Framework"
-
-log "Generating flight scenarios from actual data..."
-python generate_flight_scenarios.py >> "$LOG_FILE" 2>&1
-log_success "Flight scenarios generated"
 
 # Test the load testing framework
 log "Testing load testing framework..."
@@ -479,8 +498,8 @@ echo ""
 echo -e "${BLUE}📊 System Summary:${NC}"
 echo "  • Environment: conda env '$CONDA_ENV_NAME' activated"
 echo "  • Database: $FINAL_SCHEDULE_COUNT flight schedules, $FINAL_AIRPORT_COUNT airports"
-echo "  • Data source: Real BTS government flight data (All 12 months of 2024)"
-echo "  • Load testing: Production-ready Locust framework"
+echo "  • Data source: Real BTS government flight data (all 12 months of 2025)"
+echo "  • Load testing: Locust framework (see README for known sampling caveats)"
 echo ""
 echo -e "${BLUE}🚀 Next Steps:${NC}"
 echo ""
