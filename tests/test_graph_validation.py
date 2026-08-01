@@ -540,6 +540,305 @@ class TestNetworkAnalysis:
             assert carriers >= 5, f"Should find >=5 major carriers, got {carriers}"
 
 
+class TestDeadlineFilters:
+    """
+    Guard the two silent traps in an "arrives before HH:MM" filter.
+
+    Both were found by writing the query the obvious way and getting a wrong
+    answer with no error: the first returns nothing, the second returns
+    itineraries that land the next day. See "Deadline filters" in
+    ROUTING_QUERY_REFERENCE.md.
+    """
+
+    def test_arrival_is_localdatetime_not_zoned(
+        self, neo4j_driver, neo4j_database, search_date
+    ):
+        """Comparing the stored arrival to datetime() yields NULL, not false"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            # The loader writes to_timestamp_ntz, so the stored value is a LOCAL
+            # DATETIME. Cypher does not error when it is compared against a
+            # ZONED DATETIME -- the predicate evaluates to NULL, so WHERE drops
+            # every row and a route with valid itineraries reports none. This
+            # test pins the type and both comparison behaviours so a loader
+            # change to zoned timestamps fails here loudly rather than silently
+            # flipping every deadline query's result set.
+            record = session.run(
+                """
+                MATCH (f:Schedule)
+                WHERE f.flightdate = date($search_date)
+                  AND f.scheduled_arrival_time IS NOT NULL
+                WITH f LIMIT 500
+                WITH f, localdatetime($search_date + 'T15:00:00') AS local_cut,
+                        datetime($search_date + 'T15:00:00') AS zoned_cut
+                RETURN valueType(f.scheduled_arrival_time) AS stored_type,
+                       count(*) AS total,
+                       sum(CASE WHEN (f.scheduled_arrival_time < zoned_cut)
+                                     IS NULL THEN 1 ELSE 0 END) AS zoned_nulls,
+                       sum(CASE WHEN (f.scheduled_arrival_time < local_cut)
+                                     IS NULL THEN 1 ELSE 0 END) AS local_nulls,
+                       sum(CASE WHEN f.scheduled_arrival_time < local_cut
+                                THEN 1 ELSE 0 END) AS local_matched
+                """,
+                search_date=search_date,
+            ).single()
+
+        assert record["stored_type"].startswith("LOCAL DATETIME"), (
+            f"scheduled_arrival_time is {record['stored_type']}, expected a "
+            "LOCAL DATETIME. Every deadline query in the docs compares it with "
+            "localdatetime(); if the loader now writes a zoned type those "
+            "comparisons are wrong and the docs need updating together."
+        )
+        assert record["zoned_nulls"] == record["total"], (
+            "Comparing a LOCAL DATETIME against datetime() no longer yields "
+            "NULL for every row. The documented trap may have changed "
+            "behaviour; re-check ROUTING_QUERY_REFERENCE.md."
+        )
+        assert record["local_nulls"] == 0, (
+            "Comparing against localdatetime() produced NULLs, so the "
+            "recommended form is not reliable either"
+        )
+        assert record["local_matched"] > 0, (
+            "No arrival on this date is before 15:00 local, so this test "
+            "cannot demonstrate that the localdatetime form matches rows"
+        )
+
+    def test_deadline_query_excludes_overnight_final_legs(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """A deadline filter must reject legs that land the following day"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            # CONNECTS_TO excludes overnight INBOUND legs, but the final leg of
+            # an itinerary is nobody's inbound, so it keeps the origin-derived
+            # date. A red-eye landing 00:01 the next morning is stored as 00:01
+            # on the departure date and passes "< 15:00". Measured on
+            # 2025-07-18: 862 of 16,212 terminal legs (5.32%).
+            record = session.run(
+                """
+                MATCH ()-[:CONNECTS_TO]->(f:Schedule)
+                WITH DISTINCT f
+                WITH f, duration.inSeconds(f.scheduled_departure_time,
+                                           f.scheduled_arrival_time
+                                           ).seconds / 60 AS apparent
+                WITH f, apparent,
+                     apparent < 0
+                     AND abs(apparent + 1440
+                             - f.scheduled_duration_minutes) <= 180 AS overnight
+                WITH f, overnight,
+                     f.scheduled_arrival_time
+                       < localdatetime(toString(f.flightdate) + 'T15:00:00')
+                     AS before_cutoff
+                RETURN count(*) AS terminal_legs,
+                       sum(CASE WHEN overnight THEN 1 ELSE 0 END) AS overnights,
+                       sum(CASE WHEN overnight AND before_cutoff
+                                THEN 1 ELSE 0 END) AS false_accepts
+                """
+            ).single()
+
+        # Anti-vacuity: without overnight terminal legs in the graph, a deadline
+        # query with no guard would pass this file and still be wrong in
+        # production. Assert the hazard is present before asserting it is handled.
+        assert record["overnights"] > 0, (
+            f"None of the {record['terminal_legs']:,} terminal legs is an "
+            "overnight, so this dataset cannot detect a deadline query that "
+            "forgets the overnight guard"
+        )
+        assert record["false_accepts"] > 0, (
+            "No overnight terminal leg falls before the 15:00 cutoff, so the "
+            "guard documented in ROUTING_QUERY_REFERENCE.md is untestable "
+            "against this dataset"
+        )
+
+    def test_documented_deadline_query_is_correct(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """The query shipped in ROUTING_QUERY_REFERENCE.md returns sound results
+
+        Mutation-tested: swapping localdatetime() for datetime(), deleting the
+        overnight guard, and computing the journey total by endpoint subtraction
+        each make this fail. Three further mutants survive because they cannot
+        change the result set -- {1,2}->{0,2} (the probe route has no nonstop),
+        the contiguity check, and a query-side layover window (both already
+        invariants of the edge).
+        """
+        with neo4j_driver.session(database=neo4j_database) as session:
+            total = session.run(
+                "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+            ).single()["count"]
+            if total == 0:
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            # Pick a real origin/dest/date triple out of the graph rather than
+            # hard-coding one: a pair that needs a connection, on a date whose
+            # edges are built. Hard-coded routes are what made
+            # test_performance_baseline.py rot.
+            #
+            # The nonstop pairs are collected ONCE for the chosen date and
+            # compared with IN. The natural phrasing -- a NOT EXISTS subquery on
+            # each edge -- re-runs that lookup per row and takes 406s against a
+            # 4M-edge graph, versus ~1.7s here.
+            #
+            # The route must also EXERCISE the hazards, not merely exist. An
+            # all-Florida pair like MCO->TPA has no timezone spread and no
+            # red-eye, so it passes even with the overnight guard deleted and
+            # the journey total computed by endpoint subtraction -- verified by
+            # mutation testing. Requiring >= 120 min of timezone skew and an
+            # overnight terminal leg that falls before the cutoff makes every
+            # assertion below load-bearing.
+            probe = session.run(
+                """
+                MATCH (s1:Schedule)-[:CONNECTS_TO]->()
+                WITH s1.flightdate AS d, count(*) AS n ORDER BY n DESC LIMIT 1
+                CALL (d) {
+                    MATCH (f:Schedule) WHERE f.flightdate = d
+                    RETURN collect(DISTINCT f.origin + '>' + f.dest) AS nonstop
+                }
+                MATCH (s1:Schedule)-[:CONNECTS_TO]->(s2:Schedule)
+                WHERE s1.flightdate = d
+                  AND NOT s1.origin + '>' + s2.dest IN nonstop
+                WITH d, s1, s2,
+                     duration.inSeconds(s1.scheduled_departure_time,
+                                        s2.scheduled_arrival_time
+                                        ).seconds / 60 AS apparent,
+                     s1.scheduled_duration_minutes
+                       + s2.scheduled_duration_minutes AS block,
+                     duration.inSeconds(s2.scheduled_departure_time,
+                                        s2.scheduled_arrival_time
+                                        ).seconds / 60 AS final_apparent
+                WITH d, s1, s2, apparent, block,
+                     final_apparent < 0
+                     AND abs(final_apparent + 1440
+                             - s2.scheduled_duration_minutes) <= 180 AS overnight
+                WITH d, s1.origin AS origin, s2.dest AS dest, count(*) AS options,
+                     max(abs(apparent - block)) AS tz_skew,
+                     sum(CASE WHEN overnight THEN 1 ELSE 0 END) AS overnights,
+                     min(CASE WHEN NOT overnight
+                              THEN s2.scheduled_arrival_time END) AS earliest_real
+                WHERE options >= 10 AND tz_skew >= 120 AND overnights > 0
+                  AND earliest_real IS NOT NULL
+                // A fixed 15:00 cutoff is not valid for every route: MCO->ANC
+                // crosses four timezones and has no arrival before 15:00 local
+                // at all, so the test would fail on a correct query. Derive the
+                // deadline instead -- two hours past the earliest genuinely
+                // achievable arrival, which admits real itineraries while the
+                // 00:0x overnight legs still fall below it.
+                RETURN origin, dest, toString(d) AS date,
+                       toString(earliest_real
+                                + duration({minutes: 120})) AS deadline
+                ORDER BY tz_skew DESC, options DESC LIMIT 1
+                """
+            ).single()
+            if probe is None:
+                pytest.skip("No connection-only city pair found in the graph")
+
+            rows = list(
+                session.run(
+                    """
+                    MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $o})
+                    WHERE first.flightdate = date($date)
+                    MATCH p = (first)-[:CONNECTS_TO]->{1,2}(last:Schedule)
+                    MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dst})
+                    WITH nodes(p) AS legs, relationships(p) AS conns, last AS f
+                    WHERE f.scheduled_arrival_time < localdatetime($deadline)
+                      AND NOT (
+                          duration.inSeconds(f.scheduled_departure_time,
+                                             f.scheduled_arrival_time
+                                             ).seconds / 60 < 0
+                      AND abs(duration.inSeconds(f.scheduled_departure_time,
+                                                 f.scheduled_arrival_time
+                                                 ).seconds / 60
+                              + 1440 - f.scheduled_duration_minutes) <= 180)
+                    RETURN size(legs) - 1 AS stops,
+                           [x IN legs | x.origin] AS origins,
+                           [x IN legs | x.dest] AS dests,
+                           toString(f.scheduled_arrival_time) AS arrival,
+                           // Raw ingredients so the assertions can recompute
+                           // every derived value instead of trusting the query.
+                           [x IN legs | x.scheduled_duration_minutes] AS blocks,
+                           [c IN conns | c.layover_minutes] AS layovers,
+                           duration.inSeconds(f.scheduled_departure_time,
+                                              f.scheduled_arrival_time
+                                              ).seconds / 60 AS final_apparent,
+                           f.scheduled_duration_minutes AS final_block,
+                           reduce(t = 0, x IN legs |
+                                  t + x.scheduled_duration_minutes) +
+                           reduce(t = 0, c IN conns |
+                                  t + c.layover_minutes) AS total_minutes
+                    // No LIMIT: the assertions below check EVERY row the
+                    // predicates admit. With `LIMIT 10` the sound itineraries
+                    // sort to the top and the ~60 defective ones hide beneath
+                    // it, so removing a guard still passed -- confirmed by
+                    // mutation testing. A few hundred rows is cheap.
+                    ORDER BY total_minutes
+                    """,
+                    o=probe["origin"],
+                    dst=probe["dest"],
+                    date=probe["date"],
+                    deadline=probe["deadline"],
+                )
+            )
+
+        where = (
+            f"{probe['origin']}->{probe['dest']} on {probe['date']} "
+            f"arriving before {probe['deadline']}"
+        )
+        cutoff = probe["deadline"]
+        assert rows, (
+            f"The documented deadline query returned nothing for {where}, "
+            "which has at least 10 connecting options. This is the exact "
+            "symptom of the localdatetime/datetime NULL trap."
+        )
+        for row in rows:
+            assert row["stops"] >= 1, f"{where}: {{1,2}} returned a nonstop"
+            assert row["origins"][0] == probe["origin"], f"{where}: wrong origin"
+            assert row["dests"][-1] == probe["dest"], f"{where}: wrong dest"
+            # Legs must actually chain: each hop departs where the last landed.
+            for i in range(len(row["dests"]) - 1):
+                assert row["dests"][i] == row["origins"][i + 1], (
+                    f"{where}: itinerary is not contiguous — leg {i} lands at "
+                    f"{row['dests'][i]} but leg {i + 1} departs "
+                    f"{row['origins'][i + 1]}"
+                )
+            assert row["arrival"] < cutoff, (
+                f"{where}: returned an itinerary arriving {row['arrival']}, "
+                f"past the deadline"
+            )
+            # Comparing the STORED arrival against the cutoff cannot detect an
+            # overnight: its date is a day early, so it looks earlier than the
+            # deadline, which is precisely the bug. Recompute the overnight test
+            # from block time -- the same evidence the builder uses -- so this
+            # assertion is independent of the query under test.
+            assert not (
+                row["final_apparent"] < 0
+                and abs(row["final_apparent"] + 1440 - row["final_block"]) <= 180
+            ), (
+                f"{where}: itinerary ending {row['dests'][-1]} arrives "
+                f"{row['arrival']}, but its final leg departs later than it "
+                "lands and the block time reconciles a day later — it really "
+                "arrives the NEXT day and misses the deadline. The overnight "
+                "guard is missing from the query."
+            )
+            # Recompute the journey from its parts. A range check alone is too
+            # weak: endpoint subtraction lands inside any plausible range on
+            # plenty of routes, so it would pass while being wrong. Exact
+            # equality against sum(blocks) + sum(layovers) does not.
+            expected = sum(row["blocks"]) + sum(row["layovers"])
+            assert row["total_minutes"] == expected, (
+                f"{where}: journey reported as {row['total_minutes']} min but "
+                f"its {len(row['blocks'])} block times and "
+                f"{len(row['layovers'])} layovers sum to {expected} min. "
+                "Subtracting the endpoint timestamps is wrong — they are in "
+                "different timezones."
+            )
+            assert all(45 <= lay <= 300 for lay in row["layovers"]), (
+                f"{where}: layovers {row['layovers']} fall outside the 45-300 "
+                "minute window the edges were built with"
+            )
+
+
 class TestBusinessLogic:
     """Test business logic patterns"""
 

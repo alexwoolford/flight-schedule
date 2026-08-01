@@ -22,6 +22,79 @@ Use **`scheduled_duration_minutes`** instead. It is BTS's reported scheduled
 block time (`CRSElapsedTime`), it is 100% populated, and it is both timezone- and
 DST-independent.
 
+### What that 49% does and does not mean
+
+It is a statement about **subtraction**, not about the stored timestamps. Read as
+"arrival times are 50% wrong" it is badly misleading, and the distinction decides
+whether an "arrives before 3pm" filter is usable.
+
+The stored **time-of-day is the correct destination-local wall clock**. Verified
+two ways on 2025-07-18:
+
+- `DL304 DTW→SNA` stores dep 08:45, arr 10:25, block 280 min. 08:45 Eastern is
+  05:45 Pacific; 05:45 + 280 min = **10:25 Pacific** — exactly what is stored.
+- Structurally: if the times are right and only the frames differ, then
+  `(arrival − departure − block) mod 1440` must be **constant for every directed
+  airport pair**, because it is that pair's UTC-offset delta. Measured over all
+  2,737 directed pairs with ≥3 flights that day: **2,737 (100.00%)** yield a
+  single value, and every value is a whole hour (0, ±60, ±120, ±180, ±240, ±300).
+  A pair whose stored times were arbitrarily wrong could not do this.
+
+So the defect is narrower than the 49% figure suggests. What is wrong is the
+**date**, not the time: both timestamps are composed onto the origin's
+`flightdate`, so a leg crossing local midnight is stamped a day early. On
+2025-07-18, **893 of 21,376 flights (4.18%)** are such overnights.
+
+Consequences, precisely:
+
+| you want | safe? |
+|---|---|
+| a leg or journey **duration** | ✗ subtraction is wrong — use `scheduled_duration_minutes` |
+| **layover** at a hub | ✓ both timestamps share the hub's timezone |
+| **"arrives before HH:MM local"** | ✓ time-of-day is right, **but** you must exclude overnight legs or they falsely pass — see below |
+| ordering arrivals **across different airports** | ✗ different frames; no timezone table is loaded |
+
+### Deadline filters: two traps, both silent
+
+**1. `datetime()` vs `localdatetime()` — this one returns no error at all.**
+`scheduled_arrival_time` is a `LOCAL DATETIME` (the loader writes
+`to_timestamp_ntz`). `datetime('2025-07-18T15:00:00')` is a `ZONED DATETIME`.
+Comparing the two is **not** an error and does **not** evaluate false — it
+evaluates **NULL**, so `WHERE` discards every row:
+
+```
+MATCH (f:Schedule) WHERE f.flightdate = date('2025-07-18') AND f.dest = 'CHS' ...
+
+  f.scheduled_arrival_time < datetime('...T15:00:00')       ->  0 of 82 matched, 82 NULL
+  f.scheduled_arrival_time < localdatetime('...T15:00:00')  -> 39 of 82 matched,  0 NULL
+```
+
+A BUF→CHS search with 40 valid itineraries returns **zero** and looks like "no
+route exists". Always use `localdatetime()` — or `datetime()` only after loading
+a real timezone for each airport, which this graph does not have.
+
+**2. Overnight legs pass a deadline they do not meet.** Because the arrival date
+is the origin's, a red-eye landing at 00:01 the *next* day is stored as 00:01 on
+the departure date and sails through `< 15:00`. Real examples on 2025-07-18:
+`AS636 SEA-LAS` and `DL2645 LAX-SEA`, both stored 00:01 on 07-18, both actually
+landing 07-19. Of the 16,212 legs that terminate a `CONNECTS_TO` itinerary,
+**862 (5.32%)** would be wrongly accepted.
+
+The same block-time test the builder uses excludes them:
+
+```cypher
+AND NOT (duration.inSeconds(f.scheduled_departure_time,
+                            f.scheduled_arrival_time).seconds / 60 < 0
+     AND abs(duration.inSeconds(f.scheduled_departure_time,
+                                f.scheduled_arrival_time).seconds / 60
+             + 1440 - f.scheduled_duration_minutes) <= 180)
+```
+
+`CONNECTS_TO` already applies this to every *inbound* leg, so intermediate hops
+are clean. The **final** leg is not covered — it is not the inbound side of any
+connection — so a deadline query has to add the guard itself. See
+"Arrive-before-a-deadline" below for the complete query.
+
 ### The `CASE`-based idiom is wrong — don't copy it
 
 Earlier versions of this document recommended a `CASE` expression that treated
@@ -91,8 +164,9 @@ python load_bts_data.py --build-connections 2025-07-18
 That writes `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for every
 **bookable** connection on those dates — same marketing carrier, layover within
 45–300 minutes, no immediate backtrack, and no inbound leg that actually lands the
-next day. About **625,000 edges per day**, built in **~12 seconds**. It is
-idempotent (`MERGE`), so re-running is safe.
+next day. **514,000-625,000 edges per day** (measured over 2025-07-14...20; mean 577,228,
+lowest on Saturday), built in **~7 seconds** per date. Idempotent (`MERGE`), so
+re-running is safe. Accepts several dates in one invocation.
 
 The connection policy is baked into the edges. After changing
 `--min-layover`/`--max-layover` or `--strict-carrier`, rebuild with
@@ -123,6 +197,65 @@ LIMIT $limit
 Because the connection rules live in the edge, there are no inter-repetition
 predicates left to write, and no way to accidentally splice two carriers into an
 unsellable itinerary.
+
+### Arrive-before-a-deadline
+
+"Find me a route from A to B that arrives before 3pm" — the query most real
+requests actually are. It is the base QPP plus the two guards from
+"Deadline filters" above. Both matter: without the first it returns nothing,
+without the second it returns itineraries that land the following day.
+
+```cypher
+MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
+WHERE first.flightdate = date($date)
+MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
+MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WITH nodes(p) AS legs, relationships(p) AS conns, last AS f
+// localdatetime, NOT datetime: scheduled_arrival_time is a LOCAL DATETIME, and
+// comparing it against a ZONED DATETIME yields NULL rather than false, which
+// silently discards every row. See "Deadline filters" above.
+WHERE f.scheduled_arrival_time < localdatetime($deadline)
+// The stored time-of-day is the correct destination-local wall clock, but the
+// DATE comes from the origin's flightdate, so a leg crossing local midnight is
+// stamped a day early and would falsely satisfy the deadline. CONNECTS_TO
+// already excludes overnight INBOUND legs; the final leg needs this guard.
+  AND NOT (duration.inSeconds(f.scheduled_departure_time,
+                              f.scheduled_arrival_time).seconds / 60 < 0
+       AND abs(duration.inSeconds(f.scheduled_departure_time,
+                                  f.scheduled_arrival_time).seconds / 60
+               + 1440 - f.scheduled_duration_minutes) <= 180)
+RETURN size(legs) - 1 AS stops,
+       [x IN legs | x.reporting_airline +
+                    toString(x.flight_number_reporting_airline)] AS flights,
+       [x IN legs | x.origin + '-' + x.dest] AS route,
+       f.scheduled_arrival_time AS arrives,
+       // Elapsed journey from real block times plus real layovers. Never
+       // subtract the endpoints: they are in different timezones.
+       reduce(t = 0, x IN legs | t + x.scheduled_duration_minutes) +
+       reduce(t = 0, c IN conns | t + c.layover_minutes) AS total_minutes
+ORDER BY total_minutes
+LIMIT $limit
+```
+
+`$deadline` is a local wall-clock string at the **destination**, e.g.
+`"2025-07-18T15:00:00"`. Use `{1,2}` instead of `{0,2}` to require a connection.
+
+Measured, `{1,2}`, `LIMIT 5`, warm — three routes with no nonstop:
+
+| route | wall clock | best itinerary arriving before 15:00 |
+|---|---|---|
+| BUF→CHS | **44 ms** | `AA1204+AA1531` via CLT, dep 06:28 → arr 10:27 (3h59) |
+| PVD→BOI | **37 ms** | `AA360+MQ3354` via ORD, dep 07:00 → arr 12:46 (7h46) |
+| ALB→SNA | **28 ms** | `DL1498+DL304` via DTW, dep 06:10 → arr 10:25 (7h15) |
+
+`AA360+MQ3354` is `CARRIER_FAMILY` doing its job: a real American Eagle
+connection that strict operating-carrier equality would have dropped.
+
+The remaining honest limitation is **cross-airport comparison**. Ranking by
+`total_minutes` is sound, and each itinerary's own deadline test is sound, but
+"which of these arrives earliest in absolute time" is not answerable for
+destinations in different timezones — nothing in the graph carries a UTC offset.
+Within a single `$dest`, as here, that does not arise.
 
 ### Measured
 
@@ -265,10 +398,10 @@ The cost is the juncture, not the quantifier.
 
 | scope | edges |
 |---|---|
-| 1 day | ~625,000 |
-| full year (extrapolated) | ~228,000,000 |
+| 1 day | 514,000-625,000 (mean 577,228) |
+| full year (365 dates, extrapolated) | ~211,000,000 |
 
-A full year is ~11x the rest of the graph, and a date-specific search never needs
+A full year is ~10x the rest of the graph (measured: 20,703,162 other relationships), and a date-specific search never needs
 it. Build the dates you intend to query. Same-day connections only, so this also
 sidesteps the cross-midnight timezone problem described above.
 

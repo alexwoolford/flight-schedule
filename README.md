@@ -251,16 +251,32 @@ days**, so a 25½-hour span reports as 90 minutes.
 ### Variable-depth routing with quantified path patterns
 
 Direct, 1-stop, or 2-stop itineraries from **one query with one number to change**.
-First build the connection edges for the date(s) you want to search:
+
+**Routing is scoped to dates you prepare.** `CONNECTS_TO` is built per date and is
+**not** created by the main load, so a freshly loaded graph answers no routing
+query until you build the edges. Pass every date you intend to search:
 
 ```bash
 python load_bts_data.py --build-connections 2025-07-18
+python load_bts_data.py --build-connections 2025-07-14 2025-07-15 2025-07-16   # several at once
 ```
 
 That materialises `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for
 every bookable connection — same carrier or its wholly-owned regional affiliate,
-45-300 minute layover, no backtracking, no overnight inbound leg. ~625K edges per
-day, built in ~12 seconds, idempotent.
+45-300 minute layover, no backtracking, no overnight inbound leg. Measured over
+2025-07-14…20: **514K-625K edges per day** (mean 577K; the spread is real weekday
+/ weekend schedule variation, lowest on Saturday the 19th), ~7s per date,
+idempotent.
+
+Scoping is deliberate. A full year would be ~211M edges — roughly 10x the rest of
+the graph — and a date-specific search never touches them. But it does mean the
+question "what routes exist on an arbitrary date" is answerable only for prepared
+dates, so build them up front rather than mid-demo. To check what is available:
+
+```cypher
+MATCH (s:Schedule)-[r:CONNECTS_TO]->()
+RETURN toString(s.flightdate) AS date, count(r) AS edges ORDER BY date;
+```
 
 ```cypher
 MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
@@ -339,7 +355,8 @@ Derived projections:
 **`CONNECTS_TO`** is what makes variable-depth routing fast — one edge per
 *bookable* connection, so a quantified path pattern walks flight-to-flight instead
 of crossing the `Airport` supernode. Date-scoped and built on demand:
-`python load_bts_data.py --build-connections 2025-07-18` (~625K edges/day, ~12s).
+`python load_bts_data.py --build-connections 2025-07-18` (514K-625K edges/day,
+~7s per date). Not built by the main load — see "Variable-depth routing" above.
 
 "Bookable" is enforced in the edge and externally validated against published
 route data: 45–300 minute layover, no backtrack, no inbound leg that really lands
