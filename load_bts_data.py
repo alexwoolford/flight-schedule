@@ -201,7 +201,11 @@ def create_spark_session(app_name: str = "BTSFlightLoader", custom_config: dict 
 
     spark = builder.config(
         "spark.jars.packages",
-        "org.neo4j:neo4j-connector-apache-spark_2.12:4.1.5_for_spark_3",
+        # 5.4.0+ is REQUIRED: it is the first version that maps Spark
+        # timestamp_ntz to a Neo4j LocalDateTime. Earlier versions (e.g. 4.1.5)
+        # silently write timestamp_ntz as a raw epoch INTEGER, which breaks every
+        # temporal query and duration.between() call.
+        "org.neo4j:neo4j-connector-apache-spark_2.12:5.5.0_for_spark_3",
     ).getOrCreate()
 
     return spark
@@ -309,12 +313,14 @@ def setup_database_schema(
 
         # Only create indexes that are actually used during loading
     # Based on readCount analysis - most indexes add write overhead without benefit
+    # NOTE: Do NOT add a plain index on (:Airport {code}) or (:Carrier {code}).
+    # The uniqueness constraints below create their own backing indexes, and Neo4j
+    # rejects a constraint with IndexAlreadyExists if a plain index on the identical
+    # label+property already exists (IF NOT EXISTS does not suppress that error).
+    # Airport/Carrier lookups are served by the constraints' backing indexes.
     schema_queries = [
         # ✅ PROVEN USEFUL: This index gets 3.5M+ reads during loading
         "CREATE INDEX schedule_route IF NOT EXISTS FOR (s:Schedule) ON (s.origin, s.dest)",
-        # ✅ ESSENTIAL: Airport/Carrier lookups for MATCH operations (1M+ reads)
-        "CREATE INDEX airport_code_lookup IF NOT EXISTS FOR (a:Airport) ON (a.code)",
-        "CREATE INDEX carrier_code_lookup IF NOT EXISTS FOR (c:Carrier) ON (c.code)",
         # ✅ NEW: Temporal indexes for optimized query performance
         "CREATE INDEX schedule_flightdate IF NOT EXISTS FOR (s:Schedule) ON (s.flightdate)",
         "CREATE INDEX schedule_departure_time IF NOT EXISTS FOR (s:Schedule) ON (s.scheduled_departure_time)",
@@ -354,33 +360,56 @@ def setup_database_schema(
                             log_and_print(msg, logger, cli_mode=cli_mode)
                         else:
                             print(msg)
-                except Exception:
-                    if "INDEX" in query:
-                        index_name = query.split("INDEX ")[1].split(" ")[0]
-                        msg = f"   ⚠️  Index already exists: {index_name}"
-                        if logger:
-                            log_and_print(
-                                msg, logger, level=logging.WARNING, cli_mode=cli_mode
-                            )
-                        else:
-                            print(msg)
+                except Exception as e:
+                    # Do NOT swallow these. A missing uniqueness constraint silently
+                    # turns a second load into duplicate dimension nodes, so a
+                    # failure here must abort the load rather than be logged away.
+                    kind = "Index" if "INDEX" in query else "Constraint"
+                    name = query.split(f"{kind.upper()} ")[1].split(" ")[0]
+                    msg = f"   ❌ {kind} failed: {name}: {e}"
+                    if logger:
+                        log_and_print(
+                            msg, logger, level=logging.ERROR, cli_mode=cli_mode
+                        )
                     else:
-                        constraint_name = query.split("CONSTRAINT ")[1].split(" ")[0]
-                        msg = f"   ⚠️  Constraint skipped: {constraint_name} (duplicates exist)"
-                        if logger:
-                            log_and_print(
-                                msg, logger, level=logging.WARNING, cli_mode=cli_mode
-                            )
-                        else:
-                            print(msg)
+                        print(msg)
+                    return False
+
+            # Verify the constraints actually exist. Creation returning without an
+            # exception is not proof: assert against SHOW CONSTRAINTS.
+            expected_constraints = {
+                "airport_code_unique",
+                "carrier_code_unique",
+                "schedule_composite_unique",
+            }
+            actual = {
+                record["name"]
+                for record in session.run("SHOW CONSTRAINTS YIELD name RETURN name")
+            }
+            missing = expected_constraints - actual
+            if missing:
+                msg = (
+                    f"   ❌ Schema verification failed: missing constraints "
+                    f"{sorted(missing)}. Loading would create duplicates."
+                )
+                if logger:
+                    log_and_print(msg, logger, level=logging.ERROR, cli_mode=cli_mode)
+                else:
+                    print(msg)
+                return False
 
             summary_msg = f"   📊 Schema setup: {indexes_created} indexes, {constraints_created} constraints"
+            verified_msg = (
+                f"   ✅ Verified {len(expected_constraints)} constraints exist"
+            )
             success_msg = "   🚀 Database ready for loading!"
             if logger:
                 log_and_print(summary_msg, logger, cli_mode=cli_mode)
+                log_and_print(verified_msg, logger, cli_mode=cli_mode)
                 log_and_print(success_msg, logger, cli_mode=cli_mode)
             else:
                 print(summary_msg)
+                print(verified_msg)
                 print(success_msg)
             return True
 
@@ -469,7 +498,9 @@ def create_relationships_fast(
     ).option(
         "relationship.target.node.keys", "origin:code"
     ).mode(
-        "Append"
+        # MERGE the relationship rather than CREATE, so a re-run does not
+        # duplicate edges. See the node writes for the full rationale.
+        "Overwrite"
     ).save()
 
     dep_time = time.time() - dep_start_time
@@ -522,7 +553,7 @@ def create_relationships_fast(
     ).option(
         "relationship.target.node.keys", "dest:code"
     ).mode(
-        "Append"
+        "Overwrite"  # MERGE, not CREATE — idempotent re-runs
     ).save()
 
     arr_time = time.time() - arr_start_time
@@ -575,7 +606,7 @@ def create_relationships_fast(
     ).option(
         "relationship.target.node.keys", "reporting_airline:code"
     ).mode(
-        "Append"
+        "Overwrite"  # MERGE, not CREATE — idempotent re-runs
     ).save()
 
     op_time = time.time() - op_start_time
@@ -858,31 +889,53 @@ def load_bts_data(
             col("flight_number_reporting_airline"),
             col("origin"),
             col("dest"),
-            # Temporal data with proper timestamp conversion
+            # Temporal data.
+            #
+            # These are LOCAL wall-clock times at their respective airports:
+            # BTS CRSDepTime is local at origin, CRSArrTime is local at dest.
+            # They are therefore written as TIMESTAMP_NTZ, which the Neo4j
+            # connector stores as LocalDateTime. Using plain `timestamp()` here
+            # would produce Spark TimestampType, which the connector writes as a
+            # UTC ZonedDateTime — silently baking in the *loader machine's*
+            # timezone and producing a different graph on a laptop than in a
+            # container.
+            #
+            # Do NOT subtract these two to get a flight duration: they are in
+            # different timezones, so the result is wrong for ~50% of flights.
+            # Use scheduled_duration_minutes (below) instead.
             when(
                 col("crsdeptime").isNotNull(),
                 expr(
-                    "timestamp(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(crsdeptime, 'HH:mm:ss')))"
+                    "to_timestamp_ntz(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(crsdeptime, 'HH:mm:ss')))"
                 ),
             ).alias("scheduled_departure_time"),
             when(
                 col("crsarrtime").isNotNull(),
                 expr(
-                    "timestamp(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(crsarrtime, 'HH:mm:ss')))"
+                    "to_timestamp_ntz(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(crsarrtime, 'HH:mm:ss')))"
                 ),
             ).alias("scheduled_arrival_time"),
             when(
                 col("deptime").isNotNull(),
                 expr(
-                    "timestamp(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(deptime, 'HH:mm:ss')))"
+                    "to_timestamp_ntz(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(deptime, 'HH:mm:ss')))"
                 ),
             ).alias("actual_departure_time"),
             when(
                 col("arrtime").isNotNull(),
                 expr(
-                    "timestamp(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(arrtime, 'HH:mm:ss')))"
+                    "to_timestamp_ntz(concat(date_format(flightdate, 'yyyy-MM-dd'), ' ', date_format(arrtime, 'HH:mm:ss')))"
                 ),
             ).alias("actual_arrival_time"),
+            # BTS-reported scheduled block time, in minutes. This is the
+            # authoritative flight duration: it is timezone-independent and
+            # DST-proof, unlike arrival-minus-departure. 100% populated.
+            col("crselapsedtime")
+            .cast(IntegerType())
+            .alias("scheduled_duration_minutes"),
+            col("actualelapsedtime")
+            .cast(IntegerType())
+            .alias("actual_duration_minutes"),
             # Additional fields
             col("distance").cast(FloatType()).alias("distance_miles"),
             col("tail_number"),
@@ -920,7 +973,10 @@ def load_bts_data(
         ).option(
             "node.keys", "code"
         ).mode(
-            "Append"
+            # "Overwrite" maps to MERGE on node.keys in the Neo4j connector;
+            # "Append" maps to CREATE, which ignores node.keys and duplicates
+            # rows on any re-run. Overwrite makes the load idempotent.
+            "Overwrite"
         ).save()
 
         # Create Airport nodes
@@ -944,7 +1000,7 @@ def load_bts_data(
         ).option(
             "node.keys", "code"
         ).mode(
-            "Append"
+            "Overwrite"  # MERGE on code — see Carrier write above
         ).save()
 
         # Create Schedule nodes
@@ -961,7 +1017,7 @@ def load_bts_data(
             "node.keys",
             "flightdate,reporting_airline,flight_number_reporting_airline,origin,dest",
         ).mode(
-            "Append"
+            "Overwrite"  # MERGE on the 5-part composite key — see Carrier write above
         ).save()
 
         node_time = time.time() - node_start_time

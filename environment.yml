@@ -39,6 +39,9 @@ dependencies:
     - pyspark==3.5.5
     - py4j==0.10.9.7
     - neo4j-parallel-spark-loader==0.5.2
+    # NOTE: the Neo4j Spark connector itself is a JAR, resolved at runtime by
+    # spark.jars.packages in load_bts_data.py (pinned to 5.5.0_for_spark_3).
+    # 5.4.0+ is required for timestamp_ntz -> LocalDateTime support.
 
     # Load Testing Framework (pip-only)
     - locust==2.37.14
