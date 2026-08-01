@@ -113,19 +113,110 @@ Worth understanding:
 - **`leg[0].flightdate = date($date)`** anchors the *first* leg to the search date
   while letting later legs spill into the next day.
 
-**Measured caveat:** on the full 2025 graph (6.9M flights), this returned the same
-itineraries as the explicit query above in **~48 seconds** versus **~200 ms** for
-LGA→DFW on a single date. The layover and same-carrier conditions relate
-*consecutive repetitions*, so they can't be pushed inside the quantifier; the
-planner expands candidate paths and filters afterwards, while the explicit join
-applies them during expansion.
+### Why it is slow: the supernode juncture
 
-Prefer the explicit form for 2-3 leg routing at this scale. QPPs pay off when the
-per-repetition predicates do most of the pruning, or when the hop count is
-genuinely open-ended.
+`PROFILE`d on the full 2025 graph (6,898,743 flights), LGA→DFW on one date:
 
-Note also that **path modes** `TRAIL` and `ACYCLIC` — useful for forbidding
-revisited airports — require Cypher 25 and are rejected under Cypher 5.
+| query | wall clock | dbHits | rows expanded |
+|---|---|---|---|
+| explicit 1-stop join (above) | **658 ms** | 1,364,930 | — |
+| QPP `{1,2}` | **44,566 ms** | 255,800,105 | 84,254,361 → 493,785 |
+| QPP `{1,1}` (never crosses a hub) | **304 ms** | — | — |
+| QPP `{1,2}`, *no* inter-repetition predicates | **20,800 ms** | — | — |
+
+The cause is the **data model**, not the phrasing. There is no
+`Schedule`→`Schedule` relationship, so each repetition must hop
+`Schedule → Airport → Schedule` — through an `Airport` node. `Airport` carries
+only `code`; it has **no date dimension**. So the moment expansion arrives at a
+hub, the next hop fans out to that hub's departures for *the entire loaded
+period* before any date predicate can apply. Measured directly: from the hubs LGA
+reaches on one date, the second hop walks **51,943,377** `DEPARTS_FROM` edges, of
+which **161,054** are on the search date — **99.69% wasted traversal**.
+
+`Airport` out-degree over a year is avg **19,599**, median 2,733, max **321,372**
+(ORD). For a single day it is avg 62.7, max 1,035 — but QPP cannot exploit that,
+because the date lives on `Schedule`, one hop away.
+
+The last two rows are the control that rules out predicate placement as the
+explanation. Removing *every* inter-repetition predicate — QPP's best possible
+case — still costs 20.8 s, while `{1,1}`, which never crosses a hub, costs 304 ms.
+No rewrite of the QPP avoids the juncture.
+
+**So itinerary search stays on the explicit join.** That is a deliberate choice
+about where QPP fits this model, not an artifact of the repo predating QPP.
+
+## Quantified path patterns over `ROUTE`: where they do win
+
+The loader also writes an aggregated route network, which is the projection QPP is
+actually suited to:
+
+```
+(:Airport)-[:ROUTE {flights, carriers, first_date, last_date}]->(:Airport)
+```
+
+One edge per distinct directed route rather than one per flight. It has no
+supernodes — 352 airports, ~6,900 edges, out-degree avg ~20 / max 186, versus
+19,599 for `DEPARTS_FROM` — so bounded expansion stays cheap, and none of these
+questions need per-flight temporal data.
+
+**Bounded reachability** — how much of the network is within N legs of LGA:
+
+```cypher
+MATCH (:Airport {code: $origin})-[:ROUTE]->{1,3}(reachable:Airport)
+RETURN count(DISTINCT reachable) AS airports;
+```
+
+Measured from LGA (**1-2 ms**, 7,985 dbHits at `{1,3}`): 78 airports nonstop, 326
+within 2 legs, 348 within 3 — of 352 total. The US domestic network is a
+small-world graph; almost all of it is three legs from anywhere.
+
+**Thick routes only** — restrict expansion to routes with real service. The
+predicate sits *inside* the quantifier, so it prunes per repetition, which is the
+shape QPP handles well:
+
+```cypher
+MATCH (:Airport {code: $origin})
+      (()-[r:ROUTE WHERE r.flights >= $min_flights]->()){1,3}
+      (reachable:Airport)
+RETURN count(DISTINCT reachable) AS airports;
+```
+
+At `$min_flights = 500` this drops the 3-leg reach from 348 to **280** in 53 ms.
+
+**Fewest-legs path** — use `SHORTEST`, not `ORDER BY length(p)`:
+
+```cypher
+CYPHER 25
+MATCH p = SHORTEST 1 (:Airport {code: $origin})-[:ROUTE]->+(:Airport {code: $dest})
+RETURN length(p) AS legs, [n IN nodes(p) | n.code] AS route;
+```
+
+**1 ms**, and it needs no upper bound. The obvious-looking alternative —
+`-[:ROUTE]->{1,4}` with `ORDER BY legs LIMIT 1` — enumerates every path up to
+length 4 before sorting: **1,425 ms** and 13.6M dbHits for the same one-row
+answer. Widening the bound is what costs, not the answer's depth; `{1,2}` returns
+in 1 ms. `SHORTEST` stops at the first hit. (BUR→SPN returns
+`BUR, JFK, HNL, GUM, SPN` — 4 legs — also in 1 ms.)
+
+**Path modes** `TRAIL` (no repeated relationship) and `ACYCLIC` (no repeated node)
+forbid doubling back. Both need **Cypher 25**; under `CYPHER 5` the parser rejects
+them with `Invalid input 'ACYCLIC'`. Note the word order — the mode goes after
+`=`, not after `MATCH`:
+
+```cypher
+CYPHER 25
+MATCH p = ACYCLIC (:Airport {code: $origin})-[:ROUTE]->{1,3}(:Airport {code: $dest})
+RETURN [n IN nodes(p) | n.code] AS route, length(p) AS legs
+ORDER BY legs
+LIMIT 10;
+```
+
+37 ms for LGA→DFW.
+
+**What `ROUTE` does not answer.** It has no date and no times, so it cannot tell
+you whether a connection is *bookable* — only whether the route pairs exist. Treat
+it as a planner: use it to find candidate hubs cheaply, then verify against
+`Schedule` with the explicit join above.
 
 ## Parameters
 

@@ -424,6 +424,63 @@ def setup_database_schema(
         driver.close()
 
 
+def create_route_projection(neo4j_uri, neo4j_user, neo4j_password, neo4j_database):
+    """
+    Build the aggregated (:Airport)-[:ROUTE]->(:Airport) network.
+
+    One edge per distinct (origin, dest) pair rather than one per flight: ~6,900
+    edges for a full year against ~20.7M for the three per-Schedule types.
+
+    Why it exists: multi-leg traversal over Schedule has to pass through Airport,
+    which is a supernode (out-degree up to ~321K across a year) and carries no
+    date, so a quantified path pattern fans out to a full year of flights at
+    every hop. This projection has out-degree ~20, so reachability and hop-count
+    questions are cheap over it. See ROUTING_QUERY_REFERENCE.md.
+
+    Deliberately computed in Cypher over the graph rather than as a Spark
+    groupBy over the file being loaded. The aggregates (flights, carriers,
+    first_date, last_date) describe *all* loaded data, and MERGE overwrites
+    properties rather than accumulating them — so a per-file aggregate would
+    make a --single-file run silently replace a full-year ROUTE network with
+    one month's numbers. Deriving from the graph is correct for any load order
+    and for incremental loads.
+    """
+    print("   🗺️  Creating ROUTE relationships (aggregated route network)...")
+    route_start_time = time.time()
+
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    try:
+        with driver.session(database=neo4j_database) as session:
+            # Aggregate per directed pair, then MERGE one edge each. Airport
+            # nodes already exist from the node-creation step, so this matches
+            # rather than creates them.
+            result = session.run(
+                """
+                MATCH (s:Schedule)
+                WITH s.origin AS origin, s.dest AS dest,
+                     count(*) AS flights,
+                     count(DISTINCT s.reporting_airline) AS carriers,
+                     min(s.flightdate) AS first_date,
+                     max(s.flightdate) AS last_date
+                MATCH (o:Airport {code: origin})
+                MATCH (d:Airport {code: dest})
+                MERGE (o)-[r:ROUTE]->(d)
+                SET r.flights = flights,
+                    r.carriers = carriers,
+                    r.first_date = first_date,
+                    r.last_date = last_date
+                RETURN count(*) AS routes
+                """
+            )
+            route_count = result.single()["routes"]
+    finally:
+        driver.close()
+
+    route_time = time.time() - route_start_time
+    print(f"     ✅ ROUTE completed in {route_time:.1f}s ({route_count:,} edges)")
+    return route_count
+
+
 def create_relationships_fast(
     spark,
     schedule_df,
@@ -614,8 +671,15 @@ def create_relationships_fast(
         f"     ✅ OPERATED_BY completed in {op_time:.1f}s ({dep_count/op_time:.0f} rels/sec)"
     )
 
+    # 4. ROUTE relationships — the aggregated route network.
+    route_count = create_route_projection(
+        neo4j_uri, neo4j_user, neo4j_password, neo4j_database
+    )
+
     total_rel_time = time.time() - total_start_time
-    total_relationships = dep_count * 3  # Each schedule creates 3 relationships
+    # 3 per-Schedule relationships (DEPARTS_FROM, ARRIVES_AT, OPERATED_BY) plus
+    # the aggregated Airport->Airport route network.
+    total_relationships = dep_count * 3 + route_count
 
     print(f"\n   📊 Total relationship creation: {total_rel_time:.1f}s")
     print(

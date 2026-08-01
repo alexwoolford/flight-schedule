@@ -10,6 +10,8 @@ The `neo4j_driver`, `neo4j_database` and `search_date` fixtures come from
 against any loaded year rather than a hard-coded one.
 """
 
+import pytest
+
 
 class TestBasicConnectivity:
     """Test basic database connectivity and data presence"""
@@ -30,14 +32,42 @@ class TestBasicConnectivity:
         ), f"Expected >400K Schedule nodes (>=1 BTS month), got {loaded_graph:,}"
 
     def test_relationships_present(self, neo4j_driver, neo4j_database, loaded_graph):
-        """Test that relationships exist: 3 per Schedule node"""
+        """Each Schedule has exactly one of each per-flight relationship"""
+        # Asserted per type rather than as a total, because ROUTE is an
+        # aggregated Airport->Airport edge (one per distinct route, not per
+        # flight) and would otherwise have to be subtracted out here.
         with neo4j_driver.session(database=neo4j_database) as session:
-            rel_count = session.run(
-                "MATCH ()-[r]->() RETURN count(r) AS count"
+            counts = {
+                rel_type: session.run(
+                    f"MATCH ()-[r:{rel_type}]->() RETURN count(r) AS count"
+                ).single()["count"]
+                for rel_type in ("DEPARTS_FROM", "ARRIVES_AT", "OPERATED_BY")
+            }
+        for rel_type, count in counts.items():
+            assert count == loaded_graph, (
+                f"Expected one {rel_type} per Schedule ({loaded_graph:,}), "
+                f"got {count:,}"
+            )
+
+    def test_route_projection_present(self, neo4j_driver, neo4j_database, loaded_graph):
+        """The aggregated ROUTE network exists and is one edge per route"""
+        with neo4j_driver.session(database=neo4j_database) as session:
+            route_edges = session.run(
+                "MATCH ()-[r:ROUTE]->() RETURN count(r) AS count"
             ).single()["count"]
-        assert rel_count == 3 * loaded_graph, (
-            f"Expected exactly 3 relationships per Schedule "
-            f"({3 * loaded_graph:,}), got {rel_count:,}"
+            distinct_routes = session.run(
+                "MATCH (s:Schedule) RETURN count(DISTINCT s.origin + '-' + s.dest) AS c"
+            ).single()["c"]
+
+        if route_edges == 0:
+            pytest.skip(
+                "No ROUTE edges — graph predates the ROUTE projection; re-run the loader"
+            )
+        # Exactly one edge per distinct directed route: proves the aggregation
+        # is right and that a re-run MERGEd rather than duplicated.
+        assert route_edges == distinct_routes, (
+            f"Expected one ROUTE edge per distinct route ({distinct_routes:,}), "
+            f"got {route_edges:,}"
         )
 
     def test_sample_schedule_properties(

@@ -169,7 +169,10 @@ This creates, from the full 2025 dataset:
 - **6,898,743** `Schedule` nodes (7,001,619 flights minus cancellations)
 - **352** `Airport` nodes
 - **14** `Carrier` nodes
-- **20,696,229** relationships — `DEPARTS_FROM`, `ARRIVES_AT`, `OPERATED_BY`
+- **20,696,229** per-flight relationships — `DEPARTS_FROM`, `ARRIVES_AT`,
+  `OPERATED_BY` (one of each per `Schedule`)
+- **6,933** `ROUTE` relationships — the aggregated `Airport`→`Airport` network,
+  one edge per distinct directed route
 
 On first run the loader creates 3 uniqueness constraints and 8 indexes, then
 verifies the constraints exist via `SHOW CONSTRAINTS` before loading anything.
@@ -275,18 +278,38 @@ LIMIT $limit
 It is more elegant, and `leg` being a *group variable* (a list of the matched
 `Schedule` nodes) is what makes `leg[0]`, `leg[-1]`, and the `reduce()` work.
 
-**But on this dataset it is much slower.** Measured on LGA→DFW for one date, this
-returned the same itineraries as the explicit query in **~48 seconds** versus
-**~200 ms**. The layover and same-carrier conditions relate *consecutive
-repetitions*, so they cannot be pushed inside the quantifier — the planner expands
-candidate paths first and filters afterwards. The explicit join gets to use those
-predicates as it goes.
+**But on this graph it is dramatically slower**, and the reason is the data model,
+not the query. Measured on LGA→DFW for one date:
 
-Use the explicit form for two- and three-leg routing on data this size. QPPs are
-the right tool when the per-repetition predicates do most of the pruning.
+| | wall clock | dbHits |
+|---|---|---|
+| explicit 1-stop join | **658 ms** | 1,364,930 |
+| QPP `{1,2}` | **44,566 ms** | 255,800,105 |
 
-> 📖 See [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) for parameters
-> and further caveats.
+There is no `Schedule`→`Schedule` relationship, so each repetition has to hop
+`Schedule → Airport → Schedule`, passing **through an `Airport` supernode**.
+`Airport` holds only `code` — it has no date — so the second hop fans out to a
+whole year of departures before any date filter can apply. From the hubs LGA
+reaches on one date, that is **51,943,377** `DEPARTS_FROM` edges walked, of which
+**161,054** are on the search date: **99.69% wasted traversal**.
+
+This is not a matter of where the predicates sit. A `{1,2}` pattern with *no*
+inter-repetition predicates at all still takes **20,800 ms**, while `{1,1}` —
+which never crosses a hub — takes **304 ms**. The supernode juncture is the cost,
+so no rewrite of the QPP avoids it.
+
+Use the explicit join for itinerary search. **QPPs are the right tool on the
+`ROUTE` projection instead** — 352 airports, ~6,900 edges, out-degree ~20 and no
+supernodes — for reachability and hop-count questions:
+
+```cypher
+// Airports reachable from LGA in at most 3 legs
+MATCH (:Airport {code: 'LGA'})-[:ROUTE]->{1,3}(reachable:Airport)
+RETURN count(DISTINCT reachable) AS airports;
+```
+
+> 📖 See [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) for the `ROUTE`
+> QPP examples, parameters, and further caveats.
 >
 > The shipped load test (`neo4j_flight_load_test.py`) still uses an older
 > formulation with the flawed duration idiom and no carrier predicate; migrating
@@ -299,9 +322,24 @@ the right tool when the per-repetition predicates do most of the pruning.
 (Schedule)-[:DEPARTS_FROM]->(Airport)
 (Schedule)-[:ARRIVES_AT]->(Airport)
 (Schedule)-[:OPERATED_BY]->(Carrier)
+
+(Airport)-[:ROUTE {flights, carriers, first_date, last_date}]->(Airport)
 ```
 
 `Airport` and `Carrier` carry only a `code`. `Schedule` holds everything else.
+
+`ROUTE` is an **aggregated projection**, not per-flight data: one edge per
+distinct `(origin, dest)` pair, carrying how many flights and how many distinct
+carriers served it and over what date span. It is derived from the `Schedule`
+nodes already in the graph at the end of each load, so it always describes
+everything loaded — not just the file that happened to run.
+
+It exists because `Airport` is a supernode with no date property, which makes
+multi-hop traversal over `Schedule` expensive; `ROUTE` has out-degree ~20 instead
+of ~19,600, so reachability and hop-count questions over it are millisecond-scale.
+It answers *which routes exist*, not *which connections are bookable* — for that,
+join back to `Schedule`. See
+[ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md).
 
 `Schedule` has **no surrogate ID** — its identity is the 5-part composite key
 `(flightdate, reporting_airline, flight_number_reporting_airline, origin, dest)`,
@@ -489,7 +527,7 @@ graph TB
         H[Schedule Nodes<br/>Flight records with timestamps]
         I[Airport Nodes<br/>IATA codes]
         J[Carrier Nodes<br/>Airlines]
-        K[Relationships<br/>DEPARTS_FROM, ARRIVES_AT, OPERATED_BY]
+        K[Relationships<br/>DEPARTS_FROM, ARRIVES_AT, OPERATED_BY, ROUTE]
     end
 
     subgraph "🔍 Query & Analysis"
