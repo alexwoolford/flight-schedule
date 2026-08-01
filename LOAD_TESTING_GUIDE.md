@@ -12,15 +12,11 @@ conda env update -f environment.yml
 # conda install -c conda-forge locust faker psutil
 ```
 
-### 1.5. Generate Flight Scenarios (Required)
-```bash
-# Generate realistic flight scenarios from your loaded data
-# This creates flight_test_scenarios.json from your actual flight database
-python generate_flight_scenarios.py
+### 1.5. Flight scenarios — not required
 
-# ⚠️ IMPORTANT: This file is NOT committed to git (it's generated)
-# You must run this after loading flight data and before load testing
-```
+`generate_flight_scenarios.py` writes `flight_test_scenarios.json`, but
+**nothing reads that file.** `neo4j_flight_load_test.py` queries your database
+directly for airports and dates at startup. You can skip this step.
 
 ### 2. Configure Database Connection
 The load test automatically loads credentials from your `.env` file using `python-dotenv`:
@@ -73,14 +69,22 @@ Navigate to: http://localhost:8089
 
 Our load test simulates realistic user behavior:
 
-| Query Type | Percentage | Complexity | Purpose |
-|------------|------------|------------|---------|
-| **Popular Route Search** | 70% | Simple-Moderate | Hub-to-hub routes (likely direct flights) |
-| **Medium Route Search** | 20% | Moderate | Hub-to-spoke routes (mix of direct/connections) |
-| **Niche Route Search** | 10% | Complex | Spoke-to-spoke routes (mostly connections) |
-| **Random Exploration** | 30% | Variable | Simulates user browsing behavior |
+What the harness actually runs — two Locust tasks:
 
-> **Note**: Each search returns both direct flights AND 1-stop connections in a single unified query, just like real flight booking websites.
+| Weight | Task | Query |
+|---|---|---|
+| 70% | `direct_flight_search` | Counts direct flights on a random route and date |
+| 30% | `comprehensive_routing_search` | Direct + 1-stop connections via a hub |
+
+> ⚠️ There is **no** "popular / medium / niche" tiering in the code, and no
+> 2-stop search. Earlier versions of this table described a distribution that
+> summed to 130% and does not exist.
+>
+> ⚠️ **Route sampling is skewed.** `_load_airports()` orders airports
+> lexicographically and keeps the first 100, so the sampling universe runs
+> ABE…ELM and excludes most major hubs (ORD, LAX, JFK, LGA, SFO, EWR, MIA, SEA,
+> PHX, LAS, ATL, …). Most random routes have no flights, so the majority of the
+> 70%-weighted task returns zero rows. Treat throughput figures accordingly.
 
 ## 📈 Key Metrics to Monitor
 
@@ -136,11 +140,14 @@ locust -f neo4j_flight_load_test.py --worker --master-host=<master-ip>
 
 ## 🔍 Performance Expectations by Query Type
 
-### Direct Flight Queries (50% of load)
+### Direct Flight Queries (70% of load)
 ```cypher
 MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(d:Airport {code: $dest})
-WHERE s.flightdate = $flight_date AND s.cancelled = 0
+WHERE s.flightdate = date($flight_date)
 ```
+> ⚠️ Do **not** add `AND s.cancelled = 0`. Cancelled flights are filtered out
+> during loading and `cancelled` is never stored as a property, so that
+> predicate matches nothing and the query returns zero rows.
 - **Expected**: 20-50ms
 - **Bottlenecks**: Airport code lookups, date filtering
 - **Optimization**: Ensure indexes on `Airport.code`, `Schedule.flightdate`
@@ -154,23 +161,8 @@ MATCH (dep:Airport)<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
 - **Bottlenecks**: Complex join patterns, time calculations
 - **Optimization**: Composite indexes on `(flightdate, scheduled_departure_time)`
 
-### Multi-hop Queries (15% of load)
-```cypher
-MATCH path = (dep)<-[:DEPARTS_FROM]-(s1)-[:ARRIVES_AT]->(hub1)
-             <-[:DEPARTS_FROM]-(s2)-[:ARRIVES_AT]->(hub2)
-             <-[:DEPARTS_FROM]-(s3)-[:ARRIVES_AT]->(arr)
-```
-- **Expected**: 100-300ms
-- **Bottlenecks**: Triple joins, complex filtering
-- **Optimization**: Consider query hints, limit result sets
-
-### Analytics Queries (5% of load)
-```cypher
-MATCH (a:Airport)<-[:DEPARTS_FROM|:ARRIVES_AT]-(s:Schedule)
-```
-- **Expected**: 50-200ms
-- **Bottlenecks**: Aggregations, counting
-- **Optimization**: Consider caching for frequent analytics
+> The 2-stop and analytics query types previously listed here are **not in the
+> harness**. The two tasks above are all it runs.
 
 ## 🚨 Warning Signs
 
@@ -208,41 +200,42 @@ MATCH (a:Airport)<-[:DEPARTS_FROM|:ARRIVES_AT]-(s:Schedule)
 
 ## 📊 Interpreting Results
 
-### Successful Load Test Results
-```
-Target: 50 users, 5/sec spawn rate, 5 minutes
-✅ Average Response Time: 120ms
-✅ 95th Percentile: 250ms
-✅ RPS: 45-50 queries/second
-✅ Error Rate: 0.1%
-✅ All query types performing within expected ranges
-```
+Run your own baseline before trusting any target — the numbers below are shapes
+to look for, not measurements from this repo.
 
-### Problematic Results
-```
-Target: 100 users, 10/sec spawn rate, 5 minutes
-❌ Average Response Time: 800ms
-❌ 95th Percentile: 2000ms
-❌ RPS: 25 queries/second (degraded)
-❌ Error Rate: 15%
-❌ Multi-hop queries timing out
-```
+**Healthy:** response times stable as users climb, error rate near zero,
+throughput rising roughly linearly with concurrency.
 
-## 🎯 Performance Goals
+**Saturated:** latency climbing while throughput plateaus or falls, error rate
+rising, timeouts appearing on the routing task first.
 
-### Minimum Acceptable Performance
-- **Direct flights**: <200ms average
-- **Connections**: <300ms average
-- **Multi-hop**: <500ms average
-- **Analytics**: <400ms average
-- **Overall error rate**: <2%
+### Two things that distort the reported numbers
 
-### Optimal Performance Targets
-- **Direct flights**: <50ms average
-- **Connections**: <150ms average
-- **Multi-hop**: <300ms average
-- **Analytics**: <200ms average
-- **Overall error rate**: <0.5%
+- **Per-route stats names.** Each airport pair is passed as Locust's request
+  `name`, producing thousands of near-single-sample entries. Percentiles per
+  entry are therefore meaningless, and `quick_load_test_analysis.py` matches
+  none of these names — it labels every row "Other". Read the aggregate row.
+- **Throughput ceiling is built in.** With `wait_time = between(1, 3)` and about
+  1.3 requests per iteration, 100 users cannot exceed roughly 65 req/s no matter
+  how fast the database is. If you want to find the database's limit, lower
+  `wait_time`.
+
+## 🎯 Setting Performance Goals
+
+Establish your own baseline on your own hardware, then set targets relative to
+it. Query latency here depends heavily on dataset size, page cache size relative
+to store size, and whether the route you sampled has any flights at all.
+
+For reference, measured directly (not through Locust) against the full 2025
+graph of 6.9M flights on a local instance, warm:
+
+| Query | Latency |
+|---|---|
+| Direct flights, one route + date (20 rows) | ~110 ms |
+| 1-stop connections via any hub, same carrier (10 rows) | ~200 ms |
+
+Your numbers will differ. Measure before and after any change rather than
+comparing against these.
 
 ## 🚀 Next Steps
 

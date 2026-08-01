@@ -2,33 +2,30 @@
 
 Get from zero to a fully populated Neo4j graph with load testing in **one command**:
 
-## True One-Liner Setup
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/alexwoolford/flight-schedule/main/setup-and-run.sh | bash
-```
-
-**Or clone and run locally:**
+## Setup
 
 ```bash
 git clone https://github.com/alexwoolford/flight-schedule.git && cd flight-schedule && ./setup-and-run.sh
 ```
 
+Read the script before piping it anywhere — it prompts for credentials and writes
+a `.env` file.
+
 ## What This Does (Fully Automated)
 
 1. **✅ Environment Setup**: Creates conda environment with all dependencies
-2. **📥 Data Download**: Downloads real BTS flight data (7-8M+ records, all 12 months of 2024)
+2. **📥 Data Download**: Downloads real BTS flight data (all 12 months of 2025)
 3. **🔗 Neo4j Integration**: Connects to your Neo4j instance (Aura, self-hosted, etc.)
-4. **⚡ Data Loading**: Loads ALL flight data using optimized Spark pipeline (~15-30 minutes)
-5. **🧪 Testing**: Validates system with comprehensive test suite
-6. **🚀 Load Testing**: Sets up production-ready Locust framework
+4. **⚡ Data Loading**: Loads ALL flight data using a Spark pipeline (~30 minutes)
+5. **🧪 Testing**: Runs the unit test suite
 
 ## Prerequisites
 
 - **Conda** installed ([Get it here](https://docs.conda.io/en/latest/miniconda.html))
-- **Neo4j instance** accessible (Aura, self-hosted, cloud)
+- **Neo4j 5.25+** accessible (Aura, self-hosted, cloud)
 - **16GB+ RAM** recommended
 - **~10GB disk space** for flight data
+- **Internet access on first load** — Spark downloads the Neo4j connector JAR
 
 ## What You'll Need During Setup
 
@@ -36,7 +33,13 @@ The script will prompt you for:
 - Neo4j URI (e.g., `bolt://localhost:7687` or `neo4j+s://your-aura.neo4j.io`)
 - Username (usually `neo4j`)
 - Password
-- Database name (`neo4j` for Aura, `flights` for self-hosted)
+- Database name (`neo4j` for Aura and Community Edition, `flights` for self-hosted Enterprise)
+
+If you use `flights`, create it first — the loader does not create databases:
+
+```cypher
+CREATE DATABASE flights IF NOT EXISTS;   // run against the `system` database
+```
 
 ## After Setup Completes
 
@@ -46,37 +49,26 @@ locust -f neo4j_flight_load_test.py
 # Visit: http://localhost:8089
 ```
 
-**📊 Query Your Data:**
+**📊 Query Your Data — direct flights:**
 ```cypher
-// FLEXIBLE ROUTING: Dynamic multi-hop search (no hardcoded hop counts!)
-// Step 1: Direct flights
-MATCH (origin:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: 'DFW'})
-WHERE s.flightdate = date('2024-03-01')
-  AND s.scheduled_departure_time IS NOT NULL
-
-WITH s,
-     CASE
-         WHEN s.scheduled_departure_time <= s.scheduled_arrival_time THEN
-             duration.between(s.scheduled_departure_time, s.scheduled_arrival_time).minutes
-         ELSE
-             // Cross-day flight handling (red-eye flights)
-             duration.between(s.scheduled_departure_time, time('23:59')).minutes + 1 +
-             duration.between(time('00:00'), s.scheduled_arrival_time).minutes
-     END AS flight_duration
-
-WHERE flight_duration > 0 AND flight_duration < 1440
-RETURN 0 AS connections,
-       s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
-       s.scheduled_departure_time AS departure,
-       s.scheduled_arrival_time AS arrival,
-       flight_duration AS duration_minutes
-
-// Step 2: If need more results → 1-stop connections (with temporal constraints)
-// Step 3: If need more results → 2-stop connections...
-// Algorithm continues dynamically until enough results found!
-
-LIMIT 5
+MATCH (:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(:Airport {code: 'DFW'})
+WHERE s.flightdate = date('2025-01-15')
+RETURN s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
+       s.scheduled_departure_time AS departs,
+       s.scheduled_arrival_time AS arrives,
+       s.scheduled_duration_minutes AS minutes
+ORDER BY departs
+LIMIT 5;
 ```
+
+> ⚠️ Use `scheduled_duration_minutes` for flight length. Do **not** subtract
+> `scheduled_departure_time` from `scheduled_arrival_time`: departure is local
+> time at the origin and arrival is local time at the destination, so the
+> difference is wrong whenever the two airports are in different timezones.
+> `scheduled_duration_minutes` is BTS's own reported block time, which is
+> timezone- and DST-independent.
+
+See [README.md](README.md) for the multi-hop routing query.
 
 ## Time Estimates
 
@@ -84,18 +76,18 @@ LIMIT 5
 |-------|------|-------|
 | Environment Setup | 2-3 min | Conda environment creation |
 | Data Download | 10-15 min | Real BTS data (government servers) |
-| Data Loading | 15-30 min | Spark → Neo4j (~4K records/sec, 7-8M records) |
-| Validation | 1-2 min | Test suite execution |
-| **Total** | **~35-50 minutes** | **Fully hands-off after credential input** |
+| Data Loading | ~30 min | Spark → Neo4j, 6.9M flights + 20.7M relationships |
+| Validation | 1-2 min | Unit test suite |
+| **Total** | **~45-50 minutes** | **Hands-off after credential input** |
 
 ## What You Get
 
-- **7-8M+ Flight Schedules** (All 12 months of 2024 real data)
-- **331 US Airports** with actual codes
-- **15 Airlines** with real flight numbers
-- **21M+ Relationships** (optimized graph structure)
-- **Production Load Testing** (331 airports = 109K+ route combinations)
-- **Sub-second Queries** with proper indexing
+From the full 2025 BTS On-Time Performance dataset (7,001,619 flights):
+
+- **6,898,743 `Schedule` nodes** (cancelled flights filtered at load)
+- **352 `Airport` nodes** with real IATA codes
+- **14 `Carrier` nodes** with real flight numbers
+- **20,696,229 relationships** — `DEPARTS_FROM`, `ARRIVES_AT`, `OPERATED_BY`
 
 ## Troubleshooting
 

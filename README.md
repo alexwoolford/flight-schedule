@@ -10,38 +10,45 @@
 [![Issues](https://img.shields.io/github/issues/alexwoolford/flight-schedule)](https://github.com/alexwoolford/flight-schedule/issues)
 [![Pull Requests](https://img.shields.io/github/issues-pr/alexwoolford/flight-schedule)](https://github.com/alexwoolford/flight-schedule/pulls)
 
-A production-ready Neo4j graph database system that processes real Bureau of Transportation Statistics (BTS) flight data using Apache Spark. Designed for flight schedule analysis and graph-based queries.
+A Neo4j graph database system that loads real Bureau of Transportation Statistics (BTS) flight data using Apache Spark, for flight schedule analysis and graph-based route queries.
 
-> *Load 7-8M+ real government flight records and query them with sub-second response times.*
+> *Load a full year of real US domestic flight records — 7,001,619 of them — and query routes over them in Cypher.*
 
-The system provides a complete pipeline from BTS data download to Neo4j graph creation with comprehensive testing and monitoring.
+The system provides a complete pipeline from BTS data download to Neo4j graph creation.
 
-## ✈️ Key Features
+## ✈️ What's in the graph
 
-- **Real Flight Search**: Origin → destination with departure time preferences
-- **Connection Logic**: Multi-hop routes with connection timing (45-300 minutes)
+Loaded from the 2025 BTS On-Time Performance dataset (all 12 months):
 
-- **Graph Performance**: Sub-second queries on 7-8M+ real BTS flight records
-- **Business Logic**: Realistic connection rules and timing validation
+| | |
+|---|---|
+| **Flights in source data** | 7,001,619 |
+| **`Schedule` nodes** | 6,898,743 (cancelled flights are filtered at load) |
+| **`Airport` nodes** | 352 |
+| **`Carrier` nodes** | 14 |
+| **Relationships** | 20,696,229 (3 per `Schedule`) |
 
-## 🚀 One-Liner Setup (Zero to Production in ~35-50 minutes)
+Every record corresponds to a real BTS-reported flight. This project never generates
+synthetic data.
 
-**Get everything running with a single command:**
+## 🚀 Guided Setup (~45-50 minutes end to end)
 
 ```bash
 git clone https://github.com/alexwoolford/flight-schedule.git && cd flight-schedule && ./setup-and-run.sh
 ```
 
-✅ **What this does automatically:**
-- Creates conda environment with all dependencies
-- Downloads real BTS flight data (7-8M+ records, all 12 months)
-- Loads data into your Neo4j instance (Aura, self-hosted, etc.)
-- Sets up production-ready load testing framework
-- Runs comprehensive validation tests
+The script is interactive — it prompts for your Neo4j credentials, then:
+- creates the conda environment
+- downloads all 12 months of 2025 BTS data (~226 MB, 10-15 min)
+- creates the target database if needed and loads the graph (~30 min)
+- runs the unit test suite
 
-**Prerequisites:** [Conda](https://docs.conda.io/en/latest/miniconda.html) + Neo4j instance + 16GB RAM + 10GB disk
+**Prerequisites:** [Conda](https://docs.conda.io/en/latest/miniconda.html) +
+Neo4j 5.25+ + 16GB RAM + 10GB disk + internet access on the first load
+(Spark fetches the Neo4j connector JAR).
 
-👉 **See [QUICK_START.md](QUICK_START.md) for detailed one-liner guide**
+Prefer to run the steps yourself? See **Complete Setup** below — the manual path
+is fully documented and is what the script automates.
 
 ---
 
@@ -87,6 +94,9 @@ docker run -v $(pwd):/app -it flight-schedule bash
 
 ### 1. Start Neo4j Database
 
+Neo4j **5.25 or newer** is required (the loader writes `LocalDateTime` values and
+uses `SHOW CONSTRAINTS` to verify schema setup).
+
 ```bash
 # Local Neo4j installation
 neo4j start
@@ -95,154 +105,192 @@ neo4j start
 docker run --name neo4j \
     -p 7474:7474 -p 7687:7687 \
     -e NEO4J_AUTH=neo4j/password \
-    -e NEO4J_dbms_default__database=flights \
-    neo4j:5.11
+    neo4j:5.26
 ```
+
+Then create the database this project loads into. In Neo4j Browser
+(http://localhost:7474) or `cypher-shell`, against the `system` database:
+
+```cypher
+CREATE DATABASE flights IF NOT EXISTS;
+```
+
+> **Neo4j Community Edition** supports only one database, named `neo4j`. On
+> Community — and on Aura — set `NEO4J_DATABASE=neo4j` in step 2 and skip the
+> `CREATE DATABASE` above. Everything else is identical.
 
 ### 2. Configure Connection
 
-Create `.env` file:
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` with your real values:
+
 ```bash
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your_password
-NEO4J_DATABASE=flights
+NEO4J_DATABASE=flights      # use "neo4j" on Aura or Community Edition
 ```
+
+Every script reads these via `load_dotenv()`; nothing is hard-coded.
 
 ### 3. Download Flight Data
 
 ```bash
-# Download real BTS flight data (Bureau of Transportation Statistics)
+# Download all 12 months of 2025 BTS data (~226 MB of Parquet, 10-15 min)
 python download_bts_flight_data.py
 
 # Check downloaded data
 ls data/bts_flight_data/
-# bts_flights_2024_01.parquet, bts_flights_2024_02.parquet, ...
+# bts_flights_2025_01.parquet, bts_flights_2025_02.parquet, ...
+
+# Optional: confirm counts and cross-file schema consistency
+python download_bts_flight_data.py --summary
+python download_bts_flight_data.py --validate
+```
+
+To iterate faster, download a single month instead:
+
+```bash
+python download_bts_flight_data.py --year 2025 --month 3
 ```
 
 ### 4. Load Data into Graph
 
 ```bash
-# Load ALL BTS data (7-8M+ records for all 12 months of 2024) using Spark
+# Load ALL BTS data into Neo4j using Spark (~30 min for the full year)
 python load_bts_data.py --load-all-files --data-path data/bts_flight_data
-
-# This creates:
-# - 7-8M+ Schedule nodes
-# - 331 Airport nodes
-# - 15 Carrier nodes
-# - 21M+ relationships (3x Schedule nodes for DEPARTS_FROM, ARRIVES_AT, OPERATED_BY)
 ```
+
+This creates, from the full 2025 dataset:
+
+- **6,898,743** `Schedule` nodes (7,001,619 flights minus cancellations)
+- **352** `Airport` nodes
+- **14** `Carrier` nodes
+- **20,696,229** relationships — `DEPARTS_FROM`, `ARRIVES_AT`, `OPERATED_BY`
+
+On first run the loader creates 3 uniqueness constraints and 8 indexes, then
+verifies the constraints exist via `SHOW CONSTRAINTS` before loading anything.
+It is **idempotent** — node and relationship writes use `MERGE` on the key
+properties, so re-running against a populated database updates in place rather
+than duplicating.
+
+The Neo4j Spark Connector is a JAR downloaded at runtime by Spark (pinned in
+`load_bts_data.py`), so the **first** run needs internet access beyond the BTS
+download. Version **5.4.0+ is required**: earlier connectors silently write
+`timestamp_ntz` columns as raw epoch integers instead of `LocalDateTime`.
 
 ### 5. Verify Installation
 
 ```bash
-# Run tests to verify everything is working
-pytest tests/test_flight_search_unit.py -v
-
-# Query the database directly
-# Use Neo4j Browser at http://localhost:7474
+# Unit tests (no database needed)
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
+       tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
+       tests/test_system_validation_unit.py -v
 ```
 
-## 📊 Performance Benchmarks
+Then confirm the graph itself, in Neo4j Browser or `cypher-shell`:
 
-| Metric | Value |
-|--------|-------|
-| **Test Environment** | MacBook Pro M1, Neo4j 5.x, Local Database |
-| **Dataset** | 586K+ real BTS flight schedules (March 2024)<br/>331 US airports, 15 airlines |
-| **Load Time** | ~2 minutes with schema optimization<br/>4,000+ records/sec throughput |
-| **Graph Result** | 586K+ nodes, 1.76M relationships<br/>Native DateTime objects |
-
-> ✅ **Note**: Real Bureau of Transportation Statistics data - 100% factual flight operations
-
-## 🔍 Query Performance & Business Logic
-
-### Example: Advanced Multi-Hop Flight Routing
-
-**Query**: Flexible Multi-Hop Routing (dynamic path finding, any number of connections)
 ```cypher
-// FLEXIBLE ROUTING: Finds paths of ANY length without hardcoding hop counts
-// Uses iterative deepening - starts with direct flights, then 1-stop, 2-stop, etc.
+MATCH (s:Schedule) RETURN count(s) AS schedules;
+SHOW CONSTRAINTS;
+```
 
-// Step 1: Direct flights (0 connections)
-MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
-WHERE s.flightdate = date($search_date)
-  AND s.scheduled_departure_time IS NOT NULL
-  AND s.scheduled_arrival_time IS NOT NULL
+## 🔍 Example Queries
 
-WITH s,
-     CASE
-         WHEN s.scheduled_departure_time <= s.scheduled_arrival_time THEN
-             duration.between(s.scheduled_departure_time, s.scheduled_arrival_time).minutes
-         ELSE
-             duration.between(s.scheduled_departure_time, time('23:59')).minutes + 1 +
-             duration.between(time('00:00'), s.scheduled_arrival_time).minutes
-     END AS flight_duration
+### Direct flights on a route and date
 
-WHERE flight_duration > 0 AND flight_duration < 1440
+```cypher
+MATCH (:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(:Airport {code: 'DFW'})
+WHERE s.flightdate = date('2025-01-15')
+RETURN s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
+       s.scheduled_departure_time AS departs,
+       s.scheduled_arrival_time AS arrives,
+       s.scheduled_duration_minutes AS minutes
+ORDER BY departs;
+```
 
-RETURN 0 AS connections,
-       [s.reporting_airline + toString(s.flight_number_reporting_airline)] AS flights,
-       s.scheduled_departure_time AS departure,
-       s.scheduled_arrival_time AS arrival,
-       flight_duration AS total_duration,
-       [] AS via_airports
+### One-stop connections through a hub
 
-UNION ALL
-
-// Step 2: 1-stop connections (if needed for more results)
-MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
-      <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
-WHERE s1.flightdate = date($search_date)
-  AND s2.flightdate IN [date($search_date), date($search_date) + duration('P1D')]
-  AND s1.scheduled_arrival_time IS NOT NULL
-  AND s2.scheduled_departure_time IS NOT NULL
+```cypher
+MATCH (:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
+      <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WHERE s1.flightdate = date($date)
+  // Allow the second leg to spill into the next day
+  AND s2.flightdate IN [date($date), date($date) + duration('P1D')]
   AND hub.code <> $origin AND hub.code <> $dest
-  // CRITICAL: Temporal sequencing - can't depart before arriving
-  AND s1.scheduled_arrival_time <= s2.scheduled_departure_time
-
+  // Same carrier throughout: splicing two unrelated airlines produces an
+  // itinerary nobody can actually sell you. Drop to allow interlining.
+  AND s1.reporting_airline = s2.reporting_airline
 WITH s1, s2, hub,
-     CASE
-         WHEN s1.flightdate = s2.flightdate THEN
-             duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes
-         ELSE
-             duration.between(s1.scheduled_arrival_time, time('23:59')).minutes + 1 +
-             duration.between(time('00:00'), s2.scheduled_departure_time).minutes
-     END AS connection_time
-
-WHERE connection_time >= 45 AND connection_time <= 720
-
-RETURN 1 AS connections,
-       [s1.reporting_airline + toString(s1.flight_number_reporting_airline),
+     // Both timestamps are local to the same hub, so this subtraction is valid
+     // (unlike arrival - departure, which spans two timezones).
+     duration.inSeconds(s1.scheduled_arrival_time,
+                        s2.scheduled_departure_time).seconds / 60 AS layover
+WHERE layover >= $min_layover AND layover <= $max_layover
+RETURN [s1.reporting_airline + toString(s1.flight_number_reporting_airline),
         s2.reporting_airline + toString(s2.flight_number_reporting_airline)] AS flights,
-       s1.scheduled_departure_time AS departure,
-       s2.scheduled_arrival_time AS arrival,
-       connection_time AS total_duration,
-       [hub.code] AS via_airports
-
-// Step 3: 2-stop connections would follow same pattern...
-// Algorithm continues until enough results found or max hops reached
-
-ORDER BY connections, departure
-LIMIT $max_results
+       hub.code AS via,
+       s1.scheduled_departure_time AS departs,
+       s2.scheduled_arrival_time AS arrives,
+       layover,
+       s1.scheduled_duration_minutes + s2.scheduled_duration_minutes AS air_minutes
+ORDER BY departs
+LIMIT $limit
 ```
 
-**Performance**: ~140ms on 586K+ BTS records (March 2024 data) - **Scalable to any path length**
-**Business Logic**: Dynamic hop discovery with temporal validation throughout entire journey
-**Graph Advantage**: Iterative deepening finds optimal paths without hardcoding connection counts
-**Key Innovation**: No more UNION of 1-hop, 2-hop, 3-hop - finds paths of ANY length dynamically
+Note `duration.inSeconds(...)`, **not** `duration.between(...).minutes` — the
+`.minutes` accessor covers only the seconds component group and **excludes whole
+days**, so a 25½-hour span reports as 90 minutes.
 
-### Results
-```
-Found 27 LGA → DFW routes on March 1, 2024:
-Direct flights:
-1. DL308 (201min) - 13:00 → 16:21
-2. AA1597 (211min) - 13:00 → 16:31
-3. AA1490 (206min) - 14:30 → 17:56
+### On quantified path patterns
 
-1-stop connections:
-4. AA1536 → AA481 via ORD (179min layover)
-5. DL308 → UA1071 via ATL (156min layover)
+Neo4j 5.9+ supports quantified path patterns, which can express "1 to N legs" in
+one pattern instead of a `UNION` per hop count:
+
+```cypher
+MATCH (origin:Airport {code: $origin})
+      ((a:Airport)<-[:DEPARTS_FROM]-(leg:Schedule)-[:ARRIVES_AT]->(b:Airport)
+        WHERE leg.flightdate IN [date($date), date($date) + duration('P1D')]
+      ){1,2}
+      (dest:Airport {code: $dest})
+WHERE leg[0].flightdate = date($date)
+  AND all(i IN range(0, size(leg) - 2) WHERE
+        leg[i].reporting_airline = leg[i + 1].reporting_airline
+    AND duration.inSeconds(leg[i].scheduled_arrival_time,
+                           leg[i + 1].scheduled_departure_time).seconds / 60 >= $min_layover
+    AND duration.inSeconds(leg[i].scheduled_arrival_time,
+                           leg[i + 1].scheduled_departure_time).seconds / 60 <= $max_layover)
+RETURN size(leg) - 1 AS stops,
+       [f IN leg | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
+       leg[0].scheduled_departure_time AS departs,
+       leg[-1].scheduled_arrival_time AS arrives,
+       reduce(t = 0, f IN leg | t + f.scheduled_duration_minutes) AS air_minutes
+ORDER BY stops, departs
+LIMIT $limit
 ```
+
+It is more elegant, and `leg` being a *group variable* (a list of the matched
+`Schedule` nodes) is what makes `leg[0]`, `leg[-1]`, and the `reduce()` work.
+
+**But on this dataset it is much slower.** Measured on LGA→DFW for one date, this
+returned the same itineraries as the explicit query in **~48 seconds** versus
+**~200 ms**. The layover and same-carrier conditions relate *consecutive
+repetitions*, so they cannot be pushed inside the quantifier — the planner expands
+candidate paths first and filters afterwards. The explicit join gets to use those
+predicates as it goes.
+
+Use the explicit form for two- and three-leg routing on data this size. QPPs are
+the right tool when the per-repetition predicates do most of the pruning.
+
+> 📖 See [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) for parameters
+> and further caveats.
+>
+> The shipped load test (`neo4j_flight_load_test.py`) still uses an older
+> formulation with the flawed duration idiom and no carrier predicate; migrating
+> it is an open task.
 
 ## 🏗️ Architecture
 
@@ -253,117 +301,122 @@ Direct flights:
 (Schedule)-[:OPERATED_BY]->(Carrier)
 ```
 
-### Query Types
-- **Direct Flights**: 3-hop graph traversal
-- **Connections**: 6-hop traversal + timing validation
-- **Multi-city**: Variable-length paths
+`Airport` and `Carrier` carry only a `code`. `Schedule` holds everything else.
 
-### Performance Characteristics (Post-Optimization)
-- **Direct searches**: <50ms (optimized indexes)
-- **Connection searches**: <150ms (query + index optimization)
-- **Complex multi-hop**: <200ms (improved path efficiency)
-- **Dataset queries**: <500ms (temporal index optimization)
-- **Overall improvement**: 40-60% faster than pre-optimization baseline
+`Schedule` has **no surrogate ID** — its identity is the 5-part composite key
+`(flightdate, reporting_airline, flight_number_reporting_airline, origin, dest)`,
+enforced by the `schedule_composite_unique` constraint. Minting a synthetic
+`schedule_id` would mean inventing data, which this project does not do.
+
+### Key properties on `Schedule`
+
+| Property | Type | Notes |
+|---|---|---|
+| `flightdate` | `Date` | |
+| `scheduled_departure_time` | `LocalDateTime` | local wall-clock **at the origin** |
+| `scheduled_arrival_time` | `LocalDateTime` | local wall-clock **at the destination** |
+| `scheduled_duration_minutes` | `Integer` | BTS scheduled block time — **use this for duration** |
+| `actual_duration_minutes` | `Integer` | BTS actual elapsed time |
+| `origin`, `dest` | `String` | IATA codes (also reachable via relationships) |
+| `reporting_airline` | `String` | |
+| `flight_number_reporting_airline` | `String` | |
+
+Property names are BTS CSV column names, lowercased with spaces → underscores.
+
+> ⚠️ **Never compute a flight duration as arrival − departure.** The two
+> timestamps are local to *different* airports, so their difference is wrong
+> for every flight that crosses a timezone — roughly half the dataset. Use
+> `scheduled_duration_minutes`, which is BTS's own reported block time and is
+> both timezone- and DST-independent.
+>
+> Layover arithmetic at a connecting hub *is* sound, because both timestamps
+> there are local to the same airport.
 
 ## 🧪 Testing
 
 ```bash
-# CI tests (fast, no database required)
-pytest tests/test_ci_unit.py tests/test_flight_search_unit.py -v
+# Unit tests — exactly what CI runs, no database needed
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
+       tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
+       tests/test_system_validation_unit.py -v --cov=. --cov-report=term-missing
 
-# Connection and validation tests
+# Tests that need a loaded database
 pytest tests/test_connection_logic.py tests/test_graph_validation.py -v
-
-# Integration tests (requires loaded database)
-pytest tests/test_integration_heavy.py -v
-
-# Performance benchmarks (requires loaded database)
-pytest tests/test_performance.py -v
-
-# Run all tests with coverage
-pytest tests/ --cov=. --cov-report=term-missing
 ```
+
+These read the date under test out of the graph (`search_date` in
+`tests/conftest.py`) rather than hard-coding one, so they pass against any loaded
+year and skip cleanly when the database is empty or unreachable.
+
+Not all test files in `tests/` currently pass: `test_performance.py` and parts of
+`test_integration_heavy.py` query property names from an earlier version of the
+schema. Neither is in the CI gate; `.github/workflows/ci.yml` defines the gate
+that matters.
 
 ## 🚀 Load Testing
 
-The system includes production-grade load testing using **Locust** to measure database performance under realistic query loads.
-
-### Quick Start Load Testing
+A [Locust](https://locust.io/) harness for driving concurrent query load at the
+graph.
 
 ```bash
-# 1. Generate realistic flight scenarios from your loaded data
-python generate_flight_scenarios.py
-
-# 2. Start the load test
 locust -f neo4j_flight_load_test.py
+# then open http://localhost:8089
 
-# 3. Open web UI and configure test
-# http://localhost:8089
-```
-
-### What the Load Test Measures
-
-| Query Type | Percentage | Purpose | Expected Response Time |
-|------------|------------|---------|----------------------|
-| **Popular Routes** | 70% | Hub-to-hub searches (direct + 1-stop options) | <100ms |
-| **Medium Routes** | 20% | Hub-to-spoke routes (1-2 stop connections) | <200ms |
-| **Niche Routes** | 10% | Spoke-to-spoke (complex multi-hop routing) | <300ms |
-
-**Query Sophistication**: Each test simulates realistic flight booking with:
-- **Multi-hop routing**: Direct, 1-stop, and 2-stop connections
-- **Connection timing**: 45+ minute minimums, 300min max layovers
-- **Intelligent prioritization**: Efficiency scoring based on total travel time
-- **Realistic constraints**: 16-hour max journeys, proper temporal validation
-
-### Performance Baselines
-
-- **Concurrent Users**: 50-100 users sustainable
-- **Queries Per Second**: 200+ QPS on standard hardware
-- **Response Times**: 95th percentile <300ms
-- **Connection Pooling**: ✅ Enabled for pure DB performance measurement
-
-### Advanced Load Testing
-
-```bash
-# Headless mode with specific parameters
+# or headless
 locust -f neo4j_flight_load_test.py \
-       --host=bolt://localhost:7687 \
-       --users 50 \
-       --spawn-rate 5 \
-       --run-time 300s \
-       --headless
-
-# Analyze results
-# 1. Use Locust's interactive web interface (recommended):
-#    Visit http://localhost:8089 for real-time charts and metrics
-# 2. Or get quick CLI analysis:
-python quick_load_test_analysis.py locust_stats.csv
+       --users 50 --spawn-rate 5 --run-time 300s --headless
 ```
 
-### Load Test Architecture
+Each simulated user picks a random origin, destination, and date from values read
+out of your database, then runs one of two tasks:
 
-- **Pre-generated Scenarios**: Uses actual airport pairs and dates from your database
-- **Sophisticated Routing**: Single query handles direct, 1-stop, and 2-stop connections
-- **Real Booking Logic**: Connection timing validation, efficiency scoring, route prioritization
-- **Connection Pooling**: Measures pure query performance, not driver overhead
-- **Realistic Distribution**: Simulates actual user search patterns (70% popular, 20% medium, 10% niche)
+| Weight | Task |
+|---|---|
+| 70% | Count direct flights on a route and date |
+| 30% | Search 1-stop connections through a hub |
 
-> 📖 **Detailed Guide**: See `LOAD_TESTING_GUIDE.md` for comprehensive setup, configuration, and interpretation instructions.
+### ⚠️ Read before trusting the numbers
+
+This harness measures *something*, but it is not a realistic traffic model, and
+it has known sampling defects:
+
+- **`_load_airports()` samples the wrong airports.** It orders airports
+  lexicographically and takes the first 100, giving a universe of ABE…ELM. That
+  excludes most major hubs — ORD, LAX, JFK, LGA, SFO, EWR, MIA, SEA, PHX, LAS,
+  ATL and more cannot be sampled at all. Most randomly-drawn routes therefore
+  have no flights, and the majority of the 70%-weighted task returns zero rows.
+- **Per-route stats names.** Each airport pair is passed as Locust's request
+  `name`, so percentiles are computed over 1-2 samples per entry rather than
+  aggregated. `quick_load_test_analysis.py` does not match these names and labels
+  everything "Other".
+- **One driver per simulated user**, so results include driver and connection
+  setup, not pure query time.
+- **The routing task uses the arrival-minus-departure duration idiom**, which is
+  affected by the timezone issue described under *Architecture*.
+
+Fixing these is a good first contribution. Until then, treat any figure it
+produces as a relative smoke test rather than a benchmark.
+
+`generate_flight_scenarios.py` writes `flight_test_scenarios.json`, but nothing
+reads that file — the load test queries the database directly.
+
+> 📖 See `LOAD_TESTING_GUIDE.md` for more detail (note it describes some options
+> that are not implemented).
 
 ## 📋 Development
 
 ### Code Quality Setup
 ```bash
-# Install pre-commit hooks (one-time setup)
-pip install pre-commit
+# Install pre-commit hooks (one-time setup, inside the conda env)
+conda install -c conda-forge pre-commit
 pre-commit install
 
 # Manual checks (optional - hooks run automatically on commit)
 pre-commit run --all-files
-
-# Run tests
-pytest tests/ --cov=. --cov-report=term-missing
 ```
+
+Dependencies belong in `environment.yml` — this project uses conda only and has
+no `requirements.txt`.
 
 ### Pre-commit Hooks
 The project uses pre-commit hooks to ensure code quality:
@@ -376,39 +429,44 @@ The project uses pre-commit hooks to ensure code quality:
 Hooks run automatically on `git commit` and prevent commits with quality issues.
 
 ### CI/CD
-- Automated testing on Python 3.9, 3.10, 3.11
-- Code quality enforcement (black, isort, flake8, mypy)
-- Security scanning (bandit, safety)
-- Performance validation
-- Docker build verification
+`.github/workflows/ci.yml` enforces, as hard failures: `black --check`,
+`isort --check-only`, `flake8` error-class checks, and the 5 unit test files
+listed above. `mypy`, `bandit`, and `safety` run with `continue-on-error`.
 
-## 🛠️ Core Scripts
+Note the Python version matrix is cosmetic — the conda step installs the
+interpreter pinned by `environment.yml` (3.12.8), so every leg runs the same
+Python.
 
-| Script | Purpose |
-|--------|---------|
-| `setup-and-run.sh` | ✅ Complete end-to-end setup script for everything |
-| `download_bts_flight_data.py` | ✅ Downloads real BTS flight data (Bureau of Transportation Statistics) |
-| `load_bts_data.py` | ✅ Load BTS data using Spark with Neo4j connector |
-| `neo4j_flight_load_test.py` | ✅ Production-ready Locust load testing framework |
-| `tests/` | Comprehensive test suite with unit, integration, and performance tests |
-
-### Load Testing Tools
+## 🛠️ Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `generate_flight_scenarios.py` | ✅ Generate realistic test scenarios from actual flight data |
-| `neo4j_flight_load_test.py` | ✅ Locust load test with advanced routing and cross-day flight handling |
-| `quick_load_test_analysis.py` | ✅ Quick CLI analysis of load test results |
+| `setup-and-run.sh` | Interactive end-to-end setup: env → download → load → validate |
+| `download_bts_flight_data.py` | Downloads BTS monthly data to normalized Parquet |
+| `load_bts_data.py` | Loads Parquet into Neo4j via Spark; owns all schema setup |
+| `neo4j_flight_load_test.py` | Locust load test (see caveats above) |
+| `quick_load_test_analysis.py` | CLI summary of a Locust stats CSV |
+| `generate_flight_scenarios.py` | Writes `flight_test_scenarios.json` — currently unused by any script |
 
-**📊 Primary Analysis**: Use Locust's **interactive web interface** at `http://localhost:8089` for real-time charts, metrics, and professional visualizations.
+There is no package or `src/` directory; the three pipeline scripts sit at the
+repo root and tests import them as modules.
 
 ## 📊 Dataset
 
-- **Source**: ✅ **Bureau of Transportation Statistics (BTS)** - US Department of Transportation
-- **Scale**: 586,647 real flight records (March 2024) - 100% factual data
-- **Coverage**: All US domestic flights from major airlines (AA, UA, DL, etc.)
-- **Format**: Parquet with microsecond-precision timestamps and native Neo4j Date/DateTime objects
-- **Status**: ✅ **REAL DATA LOADED** - No synthetic data ever used
+- **Source**: [Bureau of Transportation Statistics](https://www.transtats.bts.gov/) On-Time Performance, US DOT
+- **Scale**: 7,001,619 real flight records — all 12 months of 2025
+- **Coverage**: US domestic flights, 14 reporting airlines, 352 airports
+- **Format**: Parquet, written through a fixed ~110-column schema so every
+  month is byte-compatible (BTS's own monthly CSVs are not dtype-stable)
+- **Filtering at load**: cancelled flights are dropped; diverted flights are
+  kept, including a small number that never reached the airport their
+  `ARRIVES_AT` edge points to
+
+To load a different year, pass `--year`:
+
+```bash
+python download_bts_flight_data.py --year 2024
+```
 
 ## 🏗️ Current System Workflow
 
@@ -421,7 +479,7 @@ graph TB
     end
 
     subgraph "⚡ Data Processing & Loading"
-        D[load_bts_data.py<br/>Apache Spark 3.5.3]
+        D[load_bts_data.py<br/>Apache Spark 3.5.5]
         E[Pre-flight Schema Setup<br/>Constraints & Indexes]
         F[Data Transformation<br/>Type conversion & validation]
         G[Neo4j Graph Creation<br/>Nodes & Relationships]
@@ -474,60 +532,68 @@ graph TB
     style Q fill:#fff3e0
 ```
 
-## 🎯 Technical Approach
+## 🎯 How the Pipeline Works
 
-### Graph Database Benefits
-- **Single query** finds multi-hop connection paths
-- **Relationship-based modeling** matches real-world flight networks
-- **Variable-length path queries** for flexible routing
-- **Real-time connection validation** during graph traversal
+### Why the download step normalizes types
 
-### Data Pipeline
-- **Apache Spark 3.5.3+** for parallel processing of large parquet files
-- **Neo4j Spark Connector** for native integration with batch processing
-- **Pre-flight schema optimization** with strategic index creation
-- **Constraint-based** data integrity with unique node identification
-- **Performance monitoring** with detailed logging and metrics
+BTS's monthly CSVs are **not dtype-stable across months**, which caused
+`ClassCastException` and `TIMESTAMP(NANOS)` failures in Spark. So
+`download_bts_flight_data.py` declares an explicit ~110-column type map plus a
+matching PyArrow schema and writes every month through it, flooring timestamps
+to microseconds (Spark cannot read nanosecond Parquet timestamps).
+`--validate` re-checks consistency afterwards.
 
-### Loading Strategy
-The system uses a careful approach to ensure reliable data loading:
-- **Schema-first approach**: Creates constraints and indexes before data loading
-- **Optimized batching**: Configures Spark batch sizes for Neo4j performance
-- **Usage-based indexing**: Only creates indexes that are proven beneficial
-- **Error handling**: Robust fallback mechanisms for edge cases
+`load_bts_data.py` still keeps a three-tier fallback on the Parquet read: strict
+→ permissive with `mergeSchema` → per-file reads that union whatever succeeds.
+If you see "individual file processing" in the output, a month's schema drifted
+and is worth investigating rather than ignoring.
 
-### Query Performance
-The system demonstrates sub-second response times for complex multi-hop flight searches on datasets with millions of flight records.
+### Schema setup
 
-## 🎯 Current System Status
+`setup_database_schema()` in `load_bts_data.py` is the single source of truth for
+all indexes and constraints — there are no `.cypher` files. It runs as a
+pre-flight step on every load, and now **verifies via `SHOW CONSTRAINTS`** that
+the 3 uniqueness constraints actually exist rather than assuming creation
+succeeded. Add or change indexes there.
 
-### ✅ **Production Ready Features**
-- **Real BTS Data Loading**: Complete pipeline from BTS download to Neo4j graph
-- **Schema Optimization**: Pre-flight index creation with usage-based optimization
-- **Robust Loading**: Error handling, fallback mechanisms, comprehensive logging
-- **Quality Assurance**: Full CI/CD pipeline with automated testing
-- **Professional Standards**: Black formatting, type checking, security scanning
+The index set is deliberately pruned based on `readCount` analysis; unused
+indexes cost write throughput during bulk loading.
 
-### 🔧 **Technical Implementation**
-- **Apache Spark 3.5.3** with modern configuration options
-- **Neo4j Spark Connector** for native database integration
-- **Strategic Indexing**: Only creates indexes proven beneficial (3 core indexes vs 9 unused)
-- **Performance Monitoring**: Detailed metrics and throughput reporting
-- **Clean Architecture**: Professional naming, no "fixed" or "optimized" qualifiers
+### Relationship loading
 
-### 🚀 **Ready for Extension**
-The system provides a solid foundation for:
-- **Flight search applications** - Add web interface for traveler queries
-- **Route optimization** - Implement connection scoring and ranking algorithms
-- **Real-time updates** - Stream live flight status into the graph
-- **Analytics dashboards** - Build insights on flight patterns and delays
-- **Multi-modal travel** - Extend graph to include trains, buses, etc.
+Relationship writes go through `neo4j_parallel_spark_loader`'s
+`group_and_batch_spark_dataframe`, which partitions by source/target so
+concurrent writers never touch the same nodes. Without it, parallel relationship
+creation deadlocks in Neo4j. `--no-parallel-loader` disables this, for debugging
+only.
 
-### 📊 **Proven Performance**
-- **Loading Speed**: 4,000+ records/sec with full relationship creation
-- **Query Speed**: Sub-second response for multi-hop flight searches
-- **Data Scale**: Handles 586K+ flight records with 1.76M relationships
-- **Reliability**: Comprehensive test coverage and CI validation
+Both loader scripts log to `logs/{script}_{timestamp}.log`.
+
+### Generated files — regenerate, never commit
+
+| File | Regenerate with |
+|---|---|
+| `data/bts_flight_data/*.parquet` | `python download_bts_flight_data.py` |
+| `logs/*.log` | produced on every run |
+
+## 🚀 Ideas for Extension
+
+Some data is already loaded but unqueried, and points at better-supported
+projects than flight search:
+
+- **`tail_number`** is 100% populated and used by zero queries. Sorting by
+  `(tail_number, flightdate, crsdeptime)` reconstructs each aircraft's rotation:
+  ~97% of consecutive same-tail pairs have `next.origin == this.dest`, and the
+  ~3% that don't are themselves a diagnostic signal. A single added
+  `(:Schedule)-[:NEXT_LEG {ground_minutes}]->(:Schedule)` relationship would
+  make **delay propagation** queryable — and unlike route duration, it doesn't
+  depend on any timezone arithmetic.
+- **Delay properties** (`departure_delay_minutes`, `arrival_delay_minutes`, and
+  the actual-time properties) are loaded and unused. BTS attributes more delay
+  minutes to late-arriving aircraft than to any other single cause.
+- **Cancellations are currently discarded at load.** They're a real signal, not
+  noise — out-of-position aircraft sharply raise the next leg's cancellation
+  probability.
 
 ## 📄 License
 
