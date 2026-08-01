@@ -176,6 +176,25 @@ Per-carrier hub sets derived from the graph match the real networks with no
 exceptions (DL at ATL/MSP/DTW/SLC, WN at DEN/LAS/MDW/BWI, HA at HNL/OGG/LIH/KOA,
 G4 at PIE/SFB). `tests/test_graph_validation.py` asserts this.
 
+**These guarantees gate every push.** The `integration-test` job in
+`.github/workflows/ci.yml` loads a committed one-day BTS fixture
+(`tests/fixtures/bts_flights_2025_07_18.parquet` — real records, see the README
+there) into a throwaway Neo4j, builds `CONNECTS_TO` with the production loader,
+and runs the assertions against the result. So the claims on this page are
+checked on real data continuously, not just when someone remembers to load
+locally.
+
+Two things keep that gate honest:
+
+- The conftest fixtures skip cleanly when Neo4j is unreachable, which would make
+  an all-skipped run look green. `tests/ci_verify_loaded.py` runs first and fails
+  if the graph does not hold what the fixture should have produced.
+- The regression tests assert the defect is *absent* **and** that the fixture
+  could have exposed it — 893 overnight legs and 110,642 cross-family edges are
+  asserted non-zero. Otherwise a dataset without those properties would pass
+  while gating nothing. Verified by injecting one bad edge of each kind into
+  625,220 good ones: each trips its own assertion and nothing else.
+
 Two defects that validation found, both now fixed in the builder:
 
 **Inbound legs that land the next day.** 17,502 edges (3.29%) connected off a leg

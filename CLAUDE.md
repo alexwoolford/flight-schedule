@@ -32,11 +32,24 @@ Required `.env` keys: `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DA
 
 `pytest.ini` sets `testpaths = tests` and declares the `integration`, `slow`, and `unit` markers.
 
+CI has **two** gates: the DB-free `test` job, and a `integration-test` job that
+loads a real one-day fixture into a Neo4j service container and runs the routing
+assertions against it.
+
 ```bash
-# Exactly what CI runs (no database needed) — the gate that must pass before committing
+# Gate 1 — what the `test` job runs (no database needed); must pass before committing
 pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
        tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
        tests/test_system_validation_unit.py -v --cov=. --cov-report=term-missing
+
+# Gate 2 — what the `integration-test` job runs, reproducible locally against an
+# EMPTY database (the loader is not idempotent for Schedule). Takes ~35s.
+python load_bts_data.py --single-file bts_flights_2025_07_18.parquet \
+                        --data-path tests/fixtures
+python load_bts_data.py --build-connections 2025-07-18
+python tests/ci_verify_loaded.py     # guards against a false green from all-skipped
+pytest tests/test_graph_validation.py tests/test_connection_logic.py \
+       tests/test_integration_heavy.py -v
 
 # Single file / class / test
 pytest tests/test_load_bts_unit.py -v
@@ -47,7 +60,9 @@ pytest tests/test_load_bts_unit.py::TestSparkConfiguration::test_default_spark_c
 pytest tests/ -m "not slow" -v
 ```
 
-**Tests that require a loaded Neo4j database** (they open a real driver in a session fixture, so they error rather than skip when nothing is listening): `test_connection_logic.py`, `test_graph_validation.py`, `test_integration_heavy.py`, `test_performance.py`, `test_performance_baseline.py`. Everything else is pure-Python and DB-free. `test_flight_search_unit.py` is mixed — one test reaches for the DB but skips cleanly if it can't connect.
+**Tests that require a loaded Neo4j database**: `test_connection_logic.py`, `test_graph_validation.py`, `test_integration_heavy.py`, `test_performance.py`, `test_performance_baseline.py`. The first three are in the `integration-test` gate and pass against the one-day fixture; the last two are not, because they hard-code `date('2024-03-01')` and legacy property names (see "Known documentation drift"). Everything else is pure-Python and DB-free. `test_flight_search_unit.py` is mixed — one test reaches for the DB but skips cleanly if it can't connect.
+
+The `conftest.py` fixtures **skip** rather than fail when Neo4j is unreachable, which is right for a laptop and dangerous for a gate — an all-skipped run reports success. `tests/ci_verify_loaded.py` exists to close that hole and runs before the assertions in CI. For the same reason, the `CONNECTS_TO` regression tests assert both that the defect is absent *and* that the fixture could have exposed it (893 overnight legs, 110,642 cross-family edges, asserted non-zero); swapping in a fixture that lacks either property fails loudly instead of silently gating nothing. Pinning matters too: the service container is `neo4j:2026.05.0-community` because the loader uses the variable-scope `CALL (r) { ... } IN TRANSACTIONS` form that 5.x parsers reject.
 
 `test_load_testing_framework.py` skips most of its body unless `flight_test_scenarios.json` exists (a generated, gitignored file — see below).
 
@@ -159,6 +174,8 @@ There are no `.cypher` schema files. `setup_database_schema()` in `load_bts_data
 
 Consequently, **the single-file debug command below is not safe to re-run** against a populated database without clearing it first.
 
+**Fixed, but related, and worth knowing:** when `setup_database_schema()` returned `False`, `load_bts_data()` printed "aborting load" and did a bare `return` — so the process **exited 0 having loaded nothing**. Any caller gating on the loader (the `integration-test` CI job does) saw a successful load against an empty database. It now raises `RuntimeError`. The usual trigger is bad credentials, and note that `load_dotenv()` here is called *without* `override=True`, so an exported `NEO4J_PASSWORD` from another project beats `.env` and produces exactly this failure.
+
 ### Why the loaders are defensive
 
 BTS's monthly CSVs are not dtype-stable across months, which produced `ClassCastException` and `TIMESTAMP(NANOS)` failures in Spark. Two mitigations, in this order:
@@ -191,7 +208,7 @@ If asked to build something new on this graph, delay propagation over `NEXT_LEG`
 ## Known documentation drift
 
 - **`AGENTS.md` documents an older graph schema.** It refers to `schedule_id`, `date_of_operation`, `first_seen_time`, and `last_seen_time`. None of those exist in the current graph — the current names are the composite key plus `flightdate` / `scheduled_departure_time` / `scheduled_arrival_time`. Its "Critical Indexes" and "Sample Query" sections are stale for the same reason; `load_bts_data.py` is authoritative.
-- **`tests/test_performance.py` and parts of `tests/test_integration_heavy.py` still query those legacy property names**, so they cannot pass against data loaded by the current `load_bts_data.py`. Neither is in the CI set. Treat failures there as pre-existing rather than something you broke.
+- **`tests/test_performance.py` and `tests/test_performance_baseline.py` cannot pass against current data** — the former asserts `>1M schedules` and the latter hard-codes `date('2024-03-01')` and uses the broken `CASE` duration idiom. Deliberately excluded from the `integration-test` gate; treat failures there as pre-existing. (`test_integration_heavy.py` was in this list but does pass, and is now in the gate.)
 - **`AGENTS.md`'s pre-commit checklist lists 8 test files; CI runs 5.** The three extras (`test_data_transformations.py`, `test_business_rules.py`, `test_error_scenarios.py`) are DB-free and fast, so running them too is harmless — but `.github/workflows/ci.yml` defines the actual gate.
 - **`REAL_DATA_SETUP.md` references `setup_real_data.py` and `pip install -r requirements.txt`.** Neither exists, and the latter violates rule 4. Use `setup-and-run.sh` and `environment.yml`.
 - **A credential was committed and has been removed from this repo's history, but is still exposed on GitHub.** Fixed in `fbfac4a`: `.env.backup` is gone, `.env.example` now holds `changeme`, and `AGENTS.md` no longer quotes the value. The three commits that contained it (81edc69, a28b421, aaa4fc8) survive locally as unreachable objects but are **not** ancestors of `HEAD`, so pushing does not transmit them. **However** — this repo is public, and GitHub serves unreachable objects by SHA indefinitely, so the value remains fetchable from the hosted copy via those commit URLs. A history rewrite does not close that; only rotating the credential (or asking GitHub Support to purge the objects) does. The owner has been told and declined rotation, so treat the password as **disclosed**: never reuse it, and don't copy it or the RFC-1918 host into code.

@@ -30,13 +30,23 @@ class TestBasicConnectivity:
             record = result.single()
             assert record["status"] == "Connected"
 
-    def test_schedule_nodes_present(self, loaded_graph):
-        """Test that Schedule nodes exist"""
-        # One BTS month is ~500K flights; a full year is ~6.9M. The floor is
-        # set for a single-month load so the test works either way.
-        assert (
-            loaded_graph > 400000
-        ), f"Expected >400K Schedule nodes (>=1 BTS month), got {loaded_graph:,}"
+    def test_schedule_nodes_present(
+        self, neo4j_driver, neo4j_database, loaded_graph, loaded_days
+    ):
+        """Every loaded day carries a full day's worth of flights"""
+        # Asserted per day rather than as an absolute total, because the same
+        # suite runs against a full month locally (~500K flights) and against
+        # the one-day CI fixture (~21K). An absolute floor can only be right
+        # for one of those. The invariant that holds for both is density: US
+        # domestic BTS reports ~19-22K flights on every day of 2025, so a day
+        # holding materially fewer means the load truncated — which is the
+        # failure this test exists to catch.
+        per_day = loaded_graph / loaded_days
+        assert per_day > 15000, (
+            f"Expected >15K Schedule nodes per loaded day (a full BTS day is "
+            f"~20K), got {per_day:,.0f} across {loaded_days} day(s) "
+            f"({loaded_graph:,} total) — the load looks truncated"
+        )
 
     def test_relationships_present(self, neo4j_driver, neo4j_database, loaded_graph):
         """Each Schedule has exactly one of each per-flight relationship"""
@@ -139,10 +149,30 @@ class TestBasicConnectivity:
                 RETURN count(r) AS count
                 """
             ).single()["count"]
+            # Anti-vacuity: the assertion above is only meaningful if the graph
+            # actually contains overnight legs for the builder to have excluded.
+            # On a dataset with none it would pass no matter what the builder
+            # did. One BTS day holds ~900 of them (893 on 2025-07-18).
+            overnight_legs = session.run(
+                """
+                MATCH (s:Schedule)
+                WITH duration.inSeconds(s.scheduled_departure_time,
+                                        s.scheduled_arrival_time
+                                        ).seconds / 60 AS apparent,
+                     s.scheduled_duration_minutes AS block
+                WHERE apparent < 0 AND abs(apparent + 1440 - block) <= 180
+                RETURN count(*) AS count
+                """
+            ).single()["count"]
 
         assert false_edges == 0, (
             f"{false_edges:,} of {total:,} CONNECTS_TO edges connect off an "
             "inbound leg that actually arrives the next calendar day"
+        )
+        assert overnight_legs > 0, (
+            "No overnight legs in the graph at all, so the assertion above "
+            "proves nothing — the dataset under test cannot detect a "
+            "regression in the builder's overnight exclusion"
         )
 
     def test_connects_to_carrier_is_sellable(
@@ -172,10 +202,28 @@ class TestBasicConnectivity:
                 """,
                 family=CARRIER_FAMILY,
             ).single()["count"]
+            # Anti-vacuity, the other direction: a builder that used strict
+            # operating-carrier equality would also pass the assertion above,
+            # while silently dropping ~112K sellable AA<->MQ/OH connections a
+            # day. Require that the family mapping is actually doing work.
+            cross_family = session.run(
+                """
+                MATCH (s1:Schedule)-[r:CONNECTS_TO]->(s2:Schedule)
+                WHERE s1.reporting_airline <> s2.reporting_airline
+                RETURN count(r) AS count
+                """
+            ).single()["count"]
 
         assert mismatched == 0, (
             f"{mismatched:,} of {total:,} CONNECTS_TO edges splice two "
             "unrelated carriers into an unsellable itinerary"
+        )
+        assert cross_family > 0, (
+            "No connection joins two different operating carriers, so "
+            "CARRIER_FAMILY is not being applied — mainline<->wholly-owned "
+            "regional connections (AA<->MQ/OH) are being dropped. Expected "
+            "if the edges were built with --strict-carrier, which is not the "
+            "default policy this suite gates."
         )
 
     def test_connects_to_hubs_are_real(

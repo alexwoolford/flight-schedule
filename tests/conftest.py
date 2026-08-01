@@ -71,6 +71,20 @@ def loaded_graph(neo4j_driver, neo4j_database):
 
 
 @pytest.fixture(scope="session")
+def loaded_days(neo4j_driver, neo4j_database, loaded_graph):
+    """
+    Number of distinct dates in the graph.
+
+    Lets size assertions be expressed per day, so the same test is meaningful
+    against a one-day CI fixture and a full-month local load.
+    """
+    with neo4j_driver.session(database=neo4j_database) as session:
+        return session.run(
+            "MATCH (s:Schedule) RETURN count(DISTINCT s.flightdate) AS days"
+        ).single()["days"]
+
+
+@pytest.fixture(scope="session")
 def search_date(neo4j_driver, neo4j_database, loaded_graph):
     """
     An ISO date string for a day that actually has flights loaded.

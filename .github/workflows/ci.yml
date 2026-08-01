@@ -101,31 +101,61 @@ jobs:
         fail_ci_if_error: false
 
   integration-test:
+    # Loads one real BTS day into a throwaway Neo4j, builds the CONNECTS_TO
+    # routing edges with the production loader, and runs the graph assertions
+    # against the result. This is what makes the routing guarantees gate a
+    # merge: the correctness claims in ROUTING_QUERY_REFERENCE.md (no overnight
+    # inbound legs, sellable carrier pairs, real hub concentration) are checked
+    # on every push rather than only when someone remembers to load locally.
     runs-on: ubuntu-latest
     needs: test
+    # The whole sequence takes ~35s of real work locally; the rest is conda and
+    # the Spark connector download. A cap well above that keeps a hung Neo4j or
+    # a stalled Maven fetch from burning a full six hours of runner time.
+    timeout-minutes: 30
 
     services:
       neo4j:
-        image: neo4j:5.11-community
+        # Pinned to the same major the loader is developed against. Do NOT
+        # downgrade to 5.x: create_connects_to() uses the variable-scope
+        # `CALL (r) { ... } IN TRANSACTIONS` form, which older parsers reject,
+        # and the QPP assertions need 5.9+.
+        image: neo4j:2026.05.0-community
         env:
           NEO4J_AUTH: neo4j/testpassword
-          NEO4J_dbms_default__database: flights
+          NEO4J_server_memory_heap_max__size: 2G
+          NEO4J_server_memory_pagecache_size: 1G
         ports:
           - 7687:7687
           - 7474:7474
+        # This healthcheck only proves HTTP is up, which happens before Bolt
+        # will serve a session — the explicit wait step below is what the load
+        # actually depends on.
         options: >-
           --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 12
+
+    env:
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: testpassword
+      # Community edition can only host one database, so this must be the
+      # default `neo4j` — the old `NEO4J_dbms_default__database: flights`
+      # setting on this job was both 4.x-era syntax and unachievable here.
+      NEO4J_DATABASE: neo4j
+      # The date held by tests/fixtures/bts_flights_2025_07_18.parquet.
+      FIXTURE_DATE: "2025-07-18"
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v4
+    - name: Set up Java (required for PySpark)
+      uses: actions/setup-java@v3
       with:
-        python-version: '3.10'
+        distribution: 'temurin'
+        java-version: '11'
 
     - name: Setup Conda
       uses: conda-incubator/setup-miniconda@v3
@@ -134,18 +164,59 @@ jobs:
         activate-environment: flight-schedule
         auto-activate-base: false
 
-    - name: Wait for Neo4j to be ready
+    - name: Wait for Neo4j to accept authenticated Bolt connections
+      shell: bash -l {0}
       run: |
-        timeout 60 bash -c 'until curl -f http://localhost:7474; do sleep 2; done'
+        # NOT a curl on 7474, which is what this step used to be: the published
+        # port answers HTTP at t=0 while Bolt needs ~5s more, so an HTTP 200 is
+        # not a green light for the loader. See the module docstring.
+        python tests/ci_wait_for_neo4j.py
 
-    - name: Skip integration tests (require loaded data)
+    # The Neo4j Spark connector is resolved from Maven at runtime via
+    # spark.jars.packages, so cache Ivy's download directory rather than
+    # re-fetching the JAR and its transitive deps on every run.
+    - name: Cache Spark connector JARs
+      uses: actions/cache@v4
+      with:
+        path: ~/.ivy2
+        key: ivy2-neo4j-connector-5.5.0-for-spark-3
+
+    - name: Load one real BTS day
+      shell: bash -l {0}
       run: |
-        echo "Integration tests skipped - require loaded dataset"
-      env:
-        NEO4J_URI: bolt://localhost:7687
-        NEO4J_USERNAME: neo4j
-        NEO4J_PASSWORD: testpassword
-        NEO4J_DATABASE: flights
+        # A committed 21,495-row slice of real BTS On-Time Performance data for
+        # 2025-07-18, carrying the full 110-column schema. Real records, not
+        # generated ones (CLAUDE.md rule 1). Loaded by the production loader so
+        # this also covers the loader itself, not just the queries.
+        python load_bts_data.py \
+          --single-file bts_flights_2025_07_18.parquet \
+          --data-path tests/fixtures
+
+    - name: Build CONNECTS_TO routing edges
+      shell: bash -l {0}
+      run: |
+        python load_bts_data.py --build-connections "$FIXTURE_DATE"
+
+    - name: Verify the graph is actually loaded
+      shell: bash -l {0}
+      run: |
+        # Guards against a false green: the conftest fixtures skip cleanly when
+        # Neo4j is unreachable or empty, which would otherwise let this job pass
+        # having asserted nothing.
+        python tests/ci_verify_loaded.py
+
+    - name: Run graph and routing assertions
+      shell: bash -l {0}
+      run: |
+        # -p no:randomly is not in play; order is file order. These three files
+        # all pass against a single real BTS day. Deliberately excluded:
+        # test_performance.py and test_performance_baseline.py, which query the
+        # legacy property names and hard-code date('2024-03-01') (see "Known
+        # documentation drift" in CLAUDE.md) — they fail for reasons that
+        # predate this job.
+        pytest tests/test_graph_validation.py \
+               tests/test_connection_logic.py \
+               tests/test_integration_heavy.py -v
 
   docker-build:
     runs-on: ubuntu-latest

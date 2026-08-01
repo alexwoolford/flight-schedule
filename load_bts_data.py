@@ -908,7 +908,16 @@ def load_bts_data(
             logger,
             level=logging.ERROR,
         )
-        return
+        # Raise rather than `return`: a bare return here aborted the load while
+        # still exiting 0, so a caller — notably the `integration-test` job in
+        # .github/workflows/ci.yml — saw a successful load step against a
+        # database that had received nothing. Any automation gating on this
+        # loader needs a non-zero exit when it does not load.
+        raise RuntimeError(
+            "Database schema setup failed - aborting load. The most common "
+            "cause is bad Neo4j credentials or an unreachable server; check "
+            "NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD."
+        )
 
     # Create Spark session
     logger.info("Creating Spark session")
