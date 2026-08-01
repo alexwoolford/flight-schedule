@@ -96,6 +96,17 @@ class TestBasicFunctionality:
 
             driver = GraphDatabase.driver(uri, auth=(username, password))
 
+            # This file is in the DB-free CI set, so an unreachable or
+            # unauthenticated database must skip, not fail. Probing connectivity
+            # up front is more reliable than string-matching the error text
+            # later: DNS failures, TLS errors and auth rejections all word
+            # themselves differently.
+            try:
+                driver.verify_connectivity()
+            except Exception as exc:
+                driver.close()
+                pytest.skip(f"Neo4j not available - skipping datetime type test: {exc}")
+
             query = """
             MATCH (s:Schedule)
             RETURN
