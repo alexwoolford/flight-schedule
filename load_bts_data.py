@@ -8,6 +8,7 @@ import argparse
 import logging
 import os
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -61,6 +62,33 @@ CARRIER_FAMILY = {
     "9E": "DL",  # Endeavor Air -> Delta Connection
     "QX": "AS",  # Horizon Air -> Alaska
 }
+
+# Anchor for the UTC-offset solve (see solve_airport_offsets). BFS over the
+# directed-pair graph recovers every airport's offset *relative* to one reference,
+# so one absolute value has to be supplied to place them all on the UTC scale.
+#
+# Phoenix is the right choice precisely because Arizona does not observe DST: PHX
+# is UTC-7 all year, so this constant needs no seasonal branch. Anchoring on an
+# airport that does observe DST (JFK, ORD) would require knowing which side of the
+# transition each loaded date falls on -- exactly the complexity this avoids.
+# Verified against known offsets in both seasons: with PHX=-420, a July week and a
+# January week each resolve with 0 conflicts and every spot check exact
+# (Jul: JFK -4, ORD -5, LAX -7, HNL -10, ANC -8, GUM +10;
+#  Jan: JFK -5, ORD -6, LAX -8, HNL -10, ANC -9).
+OFFSET_ANCHOR = ("PHX", -420)
+
+# Minimum flights per directed airport pair before its offset delta is treated as
+# self-checking. A pair flown three or more times has had several independent
+# flights agree on the delta; a pair flown once has no cross-check against a data
+# error in that single row.
+#
+# This is a preference, not a filter -- see the two-tier solve in
+# solve_airport_offsets(). Measured 2025-07-18: the >=3 tier alone covers 225 of
+# the day's 341 airports, and treating it as a hard cutoff left 386 flights with
+# no UTC timestamp at all. Thin pairs are used to reach the remaining 116
+# low-frequency stations (STT, BET, BRW, SCC...) and are still cross-checked
+# against the solution, so a bad one raises rather than propagating.
+OFFSET_MIN_FLIGHTS_PER_PAIR = 3
 
 
 def setup_logging(verbose_cli=True):
@@ -507,6 +535,271 @@ def create_route_projection(neo4j_uri, neo4j_user, neo4j_password, neo4j_databas
     return route_count
 
 
+# Per-directed-pair offset delta.
+#
+# Overnight legs need no special handling, which is worth stating because it is
+# not obvious. Their stored arrival is stamped a day early, so the raw
+# arrival-minus-departure is wrong by exactly -1440 minutes -- and `(... + 2880)
+# % 1440` folds that away. Measured on 2025-07-18: excluding them changes nothing,
+# 341 airports and 0 conflicts either way.
+#
+# An earlier version of this query did exclude them, via a heuristic that tested
+# whether adding a day reconciled the subtraction with the block time to within
+# 180 minutes. That heuristic is now deleted rather than kept as belt-and-braces:
+# it cannot span the widest US offset gaps (HNL->DFW needs 240-360 minutes), so
+# leaving it in the file invited reuse somewhere it would be load-bearing and
+# wrong -- which is exactly how 11,975 impossible CONNECTS_TO edges got built.
+#
+# Returns the flight count so the solve can prefer well-supported pairs and fall
+# back to thin ones only where it must; it does not filter on support here.
+# Contradictory pairs are dropped outright -- there are none on a single date, so
+# any that appear are a data problem, and the caller's conflict assertion is what
+# surfaces them.
+_OFFSET_DELTA_QUERY = """
+    MATCH (s:Schedule)
+    WHERE s.flightdate = date($date)
+      AND s.scheduled_duration_minutes IS NOT NULL
+    WITH s.origin AS origin, s.dest AS dest,
+         (duration.inSeconds(s.scheduled_departure_time,
+                             s.scheduled_arrival_time).seconds / 60
+          - s.scheduled_duration_minutes + 2880) % 1440 AS delta
+    WITH origin, dest, count(*) AS flights, collect(DISTINCT delta) AS deltas
+    WHERE size(deltas) = 1
+    RETURN origin, dest, flights, deltas[0] AS delta
+"""
+
+
+def solve_airport_offsets(session, search_date, min_flights=None):
+    """Recover every airport's UTC offset (in minutes) for one date.
+
+    No external timezone database is needed, and none is used. BTS gives local
+    departure time at the origin, local arrival time at the destination, and the
+    timezone-independent block time (CRSElapsedTime). For any flight,
+
+        (arrival_local - departure_local) - block = offset(dest) - offset(origin)
+
+    so each directed airport pair yields the *difference* between its endpoints'
+    offsets. Treating airports as nodes and those differences as weighted edges,
+    a BFS from any starting airport propagates relative offsets across the whole
+    network; fixing one known absolute value converts them to true UTC offsets.
+
+    Solved per-date on purpose. Offsets are DST-dependent -- 18 of 317 airports
+    differ between January and July, and mainland airports shift wholesale (ORD
+    -6 -> -5) -- so there is no single correct value to store on an Airport node.
+    A week straddling the 2025-03-09 transition yields 603 of 5,037 pairs (12.0%)
+    with contradictory deltas; any single day yields 0.
+
+    Returns {airport_code: offset_minutes}. Raises on any inconsistency: with real
+    BTS data the solve is exact, so a conflict means a data problem, not a case to
+    paper over.
+    """
+    if min_flights is None:
+        min_flights = OFFSET_MIN_FLIGHTS_PER_PAIR
+
+    pairs = session.run(_OFFSET_DELTA_QUERY, date=search_date).data()
+    if not pairs:
+        raise RuntimeError(
+            f"No usable airport pairs on {search_date} — is the date loaded?"
+        )
+
+    # Undirected: delta forward, -delta reverse. offset(dest) - offset(origin).
+    # Two tiers. Well-supported pairs (>= min_flights) are self-checking: several
+    # independent flights had to agree on the delta. Thin pairs are not, so they
+    # are held back and used only to reach airports the first tier misses -- on
+    # 2025-07-18 that is 116 low-frequency stations (STT, BET, BRW, SCC...), and
+    # skipping them would silently leave 386 flights with no UTC time at all.
+    # Every thin edge is still cross-checked against the solution, so a bad one
+    # raises rather than propagating.
+    strong = defaultdict(list)
+    weak = defaultdict(list)
+    for row in pairs:
+        bucket = strong if row["flights"] >= min_flights else weak
+        bucket[row["origin"]].append((row["dest"], row["delta"]))
+        bucket[row["dest"]].append((row["origin"], -row["delta"]))
+
+    # Root the BFS at the best-connected airport, so the traversal is driven by
+    # data rather than by a hard-coded hub. Deliberately NOT the anchor: the root
+    # only has to be well connected, while the anchor has to have a known,
+    # DST-free offset.
+    root = max(strong, key=lambda code: len(strong[code]))
+    relative = {root: 0}
+    conflicts = []
+
+    def bfs(adjacency, sources):
+        """Propagate offsets outward, recording rather than raising on conflict."""
+        queue = deque(sources)
+        while queue:
+            code = queue.popleft()
+            for neighbour, delta in adjacency.get(code, ()):
+                implied = relative[code] + delta
+                if neighbour not in relative:
+                    relative[neighbour] = implied
+                    queue.append(neighbour)
+                elif (relative[neighbour] - implied) % 1440 != 0:
+                    conflicts.append(
+                        f"{code}->{neighbour}: have {relative[neighbour]}, "
+                        f"implied {implied}"
+                    )
+
+    bfs(strong, [root])
+
+    # Then pull in whatever only the thin pairs can reach. Alternating lets an
+    # airport reached by a thin edge serve as a bridge back into strong pairs.
+    combined = defaultdict(list)
+    for adjacency in (strong, weak):
+        for code, edges in adjacency.items():
+            combined[code].extend(edges)
+    while True:
+        frontier = [
+            c
+            for c in relative
+            if any(n not in relative for n, _ in combined.get(c, ()))
+        ]
+        if not frontier:
+            break
+        bfs(combined, frontier)
+
+    if conflicts:
+        raise RuntimeError(
+            f"{len(conflicts)} contradictory airport offset(s) on {search_date}. "
+            "Every directed pair should agree exactly; disagreement means the "
+            "underlying times are inconsistent, not that the solve needs a "
+            f"tolerance. First few: {conflicts[:5]}"
+        )
+
+    unreached = set(combined) - set(relative)
+    if unreached:
+        raise RuntimeError(
+            f"Airport offset graph for {search_date} is disconnected: "
+            f"{len(unreached)} airport(s) unreachable from {root}, e.g. "
+            f"{sorted(unreached)[:10]}. A single day of US domestic BTS is one "
+            "component; a split means the date is only partially loaded."
+        )
+
+    # Shift the relative solution onto the absolute UTC scale.
+    anchor_code, anchor_offset = OFFSET_ANCHOR
+    if anchor_code not in relative:
+        raise RuntimeError(
+            f"Offset anchor {anchor_code} has no flights on {search_date}, so "
+            "the relative solution cannot be placed on the UTC scale. "
+            f"{anchor_code} is a top-10 airport by volume and is present on any "
+            "real BTS day; its absence means the load is incomplete."
+        )
+    shift = anchor_offset - relative[anchor_code]
+
+    offsets = {}
+    for code, value in relative.items():
+        offset = (value + shift) % 1440
+        # Wrap to (-720, 720]. Everything east of the dateline lands here
+        # directly; GUM and SPN would otherwise come out as -840 rather than
+        # +600 -- exactly 24h off, which is the dateline, not an error.
+        if offset > 720:
+            offset -= 1440
+        if offset % 60 != 0:
+            raise RuntimeError(
+                f"{code} solved to {offset} minutes, which is not a whole hour. "
+                "Every US airport offset is a whole hour; a fractional result "
+                "means the block times and clock times disagree."
+            )
+        offsets[code] = offset
+
+    return offsets
+
+
+def write_utc_times(
+    neo4j_uri, neo4j_user, neo4j_password, neo4j_database, dates, min_flights=None
+):
+    """Solve offsets per date and store absolute UTC timestamps on Schedule.
+
+    Adds two properties, leaving the existing local-time ones untouched:
+
+      scheduled_departure_utc = scheduled_departure_time - offset(origin)
+      scheduled_arrival_utc   = scheduled_departure_utc + block_minutes
+
+    The local times are correct as local wall clock and some filters legitimately
+    want them ("arrives before 3pm local"). What they cannot support is
+    subtraction, because both are composed onto the origin's flightdate: on
+    2025-07-18, arrival-minus-departure matches the BTS block time for only
+    10,453 of 21,376 flights (48.9%) and 934 flights appear to arrive before they
+    depart. The UTC pair fixes durations, journey totals, and cross-midnight
+    sequencing.
+
+    Arrival is derived by *adding the block time* rather than by converting the
+    stored local arrival. Both routes agree, but adding is the one that cannot
+    inherit a wrong date -- the stored arrival's DATE is unreliable for exactly
+    the overnight legs this is meant to repair.
+
+    It then *repairs* `scheduled_arrival_time` in place, rewriting it as
+    `arrival_utc + offset(dest)`. Only the DATE changes: the loader composes both
+    timestamps onto the origin's `flightdate`, so a leg crossing local midnight
+    was stamped a day early (893 of 21,376 on 2025-07-18). The time-of-day was
+    already the correct destination-local wall clock and is preserved exactly --
+    `TestUtcTimestamps` asserts the round-trip on 100% of rows.
+
+    This is what makes a deadline filter correct with no guard at all. The
+    ±180-minute block-time heuristic this replaces was an attempt to *infer* the
+    destination offset at query time, which is not recoverable there; it missed
+    the widest gaps (HNL->DFW needs 240-360) and so left real red-eyes passing a
+    deadline they miss. `date(arrival_utc) = date(departure_utc)` is not a
+    substitute either -- that tests UTC midnight, and on 2025-07-18 it wrongly
+    excludes 3,135 ordinary evening flights while admitting 876 genuine
+    overnights. Fixing the stored date is the only correct fix, and it can only
+    be done here, where the offsets are known.
+    """
+    print("   🕐 Solving airport UTC offsets and writing UTC timestamps...")
+    start_time = time.time()
+
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+    solved = {}
+    try:
+        with driver.session(database=neo4j_database) as session:
+            for search_date in dates:
+                offsets = solve_airport_offsets(
+                    session, search_date, min_flights=min_flights
+                )
+
+                # Offsets go in as a parameter map rather than onto Airport nodes:
+                # they are date-specific (DST), so a single Airport.utc_offset
+                # would be wrong for half the year.
+                written = session.run(
+                    """
+                    MATCH (s:Schedule)
+                    WHERE s.flightdate = date($date)
+                      AND s.scheduled_duration_minutes IS NOT NULL
+                      AND $off[s.origin] IS NOT NULL
+                      AND $off[s.dest] IS NOT NULL
+                    CALL (s) {
+                        WITH s.scheduled_departure_time
+                             - duration({minutes: $off[s.origin]}) AS dep_utc
+                        WITH dep_utc, dep_utc + duration({minutes:
+                                 s.scheduled_duration_minutes}) AS arr_utc
+                        SET s.scheduled_departure_utc = dep_utc,
+                            s.scheduled_arrival_utc = arr_utc,
+                            // Rewrite the local arrival off the UTC instant so
+                            // its DATE is the destination's, not the origin's.
+                            // The time-of-day is unchanged; only overnight legs
+                            // move, and they move onto the day they land.
+                            s.scheduled_arrival_time = arr_utc
+                                + duration({minutes: $off[s.dest]})
+                    } IN TRANSACTIONS OF 25000 ROWS
+                    """,
+                    date=search_date,
+                    off=offsets,
+                ).consume()
+
+                print(
+                    f"     • {search_date}: {len(offsets)} airports, "
+                    f"{written.counters.properties_set // 3:,} flights"
+                )
+                solved[search_date] = offsets
+    finally:
+        driver.close()
+
+    elapsed = time.time() - start_time
+    print(f"     ✅ UTC timestamps written in {elapsed:.1f}s")
+    return solved
+
+
 def create_connects_to(
     neo4j_uri,
     neo4j_user,
@@ -535,9 +828,19 @@ def create_connects_to(
       their mainline parent, so AA->MQ (American Eagle) connects but unrelated
       carriers never splice. `strict_carrier=True` compares raw operating codes
       instead, which drops ~112K sellable connections per day.
-    - layover within [min_layover, max_layover]
+    - layover within [min_layover, max_layover], measured in UTC
     - no immediate backtrack to the first leg's origin
-    - the inbound leg does not land the next calendar day (see below)
+
+    Sequencing is enforced here, at load time, rather than in the search query.
+    That is deliberate: `lay >= min_layover` with a positive minimum is what
+    guarantees the second leg departs after the first one lands, so every path
+    over these edges is chronologically valid by construction. Sequencing is
+    transitive, so it needs no path-level check; airport revisits are not, and
+    the `s2.dest <> s1.origin` guard here is only pairwise — a multi-leg search
+    must still compare airport codes itself.
+
+    **Requires `--solve-offsets` to have run for each date first.** The layover
+    is computed from `scheduled_*_utc`, which that step creates.
 
     Encoding the policy in the edge is the tradeoff — change the layover window
     or the carrier rule and this must be rebuilt. `MERGE` will not remove edges
@@ -550,27 +853,6 @@ def create_connects_to(
     """
     print("   🔀 Creating CONNECTS_TO relationships (bookable connections)...")
     start_time = time.time()
-
-    # s1's stored arrival is local at the hub and carries no timezone, so its
-    # DATE cannot be trusted (see the timezone defect in CLAUDE.md). BTS
-    # scheduled_duration_minutes (CRSElapsedTime) is timezone-independent
-    # ground truth: when arrival-minus-departure is negative AND adding a day
-    # reconciles it with the block time, s1 really lands the NEXT morning and
-    # this same-day connection cannot be made. Measured on 2025-07-18: 17,502
-    # of 532,080 edges (3.29%) were false this way, e.g. AA1009 LAX-ORD
-    # dep 22:59 arr 05:18 spliced to a 06:55 ORD departure.
-    #
-    # The 180-minute tolerance covers the observed timezone-offset histogram
-    # (+/-60, +/-120, +/-180) without matching genuine same-day legs.
-    overnight_inbound = """
-                      duration.inSeconds(s1.scheduled_departure_time,
-                                         s1.scheduled_arrival_time
-                                         ).seconds / 60 < 0
-                  AND abs(duration.inSeconds(s1.scheduled_departure_time,
-                                             s1.scheduled_arrival_time
-                                             ).seconds / 60
-                          + 1440 - s1.scheduled_duration_minutes) <= 180
-    """
 
     if strict_carrier:
         carrier_match = "s2.reporting_airline = s1.reporting_airline"
@@ -601,17 +883,33 @@ def create_connects_to(
                 # the Airport supernode: seeks the day's flights, then joins on
                 # dest = origin. Batched so one day does not build a single
                 # oversized transaction.
+                #
+                # The layover is computed in UTC, which is what makes it correct.
+                # This previously subtracted the two LOCAL timestamps and guarded
+                # against next-day arrivals with a block-time heuristic (since
+                # deleted). That heuristic allowed only +/-180 minutes of
+                # timezone skew and so missed the widest spans: 11,975 edges
+                # survived where the inbound leg lands the next morning, e.g.
+                # AA6 HNL->DFW dep 17:36 arr 06:02+1 (446-min block, 240-360 min
+                # to reconcile) spliced to an 08:10 DFW departure the previous
+                # day. Comparing scheduled_*_utc needs no tolerance and no
+                # heuristic, because both sides are absolute instants.
+                #
+                # Requires --solve-offsets to have run for this date; the IS NOT
+                # NULL guard below would otherwise silently produce no edges, so
+                # the count check after this raises instead.
                 session.run(
                     f"""
                     MATCH (s1:Schedule) WHERE s1.flightdate = date($date)
-                      AND NOT ({overnight_inbound})
+                      AND s1.scheduled_arrival_utc IS NOT NULL
                     MATCH (s2:Schedule) WHERE s2.flightdate = date($date)
                       AND s2.origin = s1.dest
+                      AND s2.scheduled_departure_utc IS NOT NULL
                       AND {carrier_match}
                       AND s2.dest <> s1.origin
                     WITH s1, s2,
-                         duration.inSeconds(s1.scheduled_arrival_time,
-                                            s2.scheduled_departure_time
+                         duration.inSeconds(s1.scheduled_arrival_utc,
+                                            s2.scheduled_departure_utc
                                             ).seconds / 60 AS lay
                     WHERE lay >= $min_layover AND lay <= $max_layover
                     CALL (s1, s2, lay) {{
@@ -633,6 +931,33 @@ def create_connects_to(
                     """,
                     date=search_date,
                 ).single()["count"]
+
+                # Zero edges on a loaded date means the UTC properties are
+                # missing, not that the day has no connections. Without this the
+                # build would report success having written nothing -- the same
+                # class of silent-empty failure that conftest's skip-on-no-DB
+                # once hid in CI.
+                if count == 0:
+                    flights = session.run(
+                        """
+                        MATCH (s:Schedule) WHERE s.flightdate = date($date)
+                        RETURN count(s) AS flights,
+                               count(s.scheduled_departure_utc) AS with_utc
+                        """,
+                        date=search_date,
+                    ).single()
+                    if flights["flights"] == 0:
+                        raise RuntimeError(
+                            f"No flights loaded for {search_date}; nothing to "
+                            "connect."
+                        )
+                    if flights["with_utc"] == 0:
+                        raise RuntimeError(
+                            f"{search_date} has {flights['flights']:,} flights "
+                            "but none carry scheduled_departure_utc. Run "
+                            f"--solve-offsets {search_date} first."
+                        )
+
                 total += count
                 print(f"     • {search_date}: {count:,} connections")
     finally:
@@ -1304,6 +1629,26 @@ def load_bts_data(
         spark.stop()
 
 
+def _neo4j_credentials(logger):
+    """Read Neo4j connection details from the environment (rule 5: never inline).
+
+    Note load_dotenv() is called without override=True, matching the rest of this
+    module: an exported NEO4J_PASSWORD from another project beats .env and shows
+    up as an auth failure here rather than as a missing key.
+    """
+    load_dotenv()
+    uri = os.getenv("NEO4J_URI")
+    user = os.getenv("NEO4J_USERNAME")
+    password = os.getenv("NEO4J_PASSWORD")
+    database = os.getenv("NEO4J_DATABASE", "neo4j")
+    if not all([uri, user, password]):
+        msg = "Missing Neo4j credentials — copy .env.example to .env"
+        logger.error(msg)
+        print(f"❌ {msg}")
+        raise SystemExit(1)
+    return uri, user, password, database
+
+
 def main():
     parser = argparse.ArgumentParser(description="BTS flight data loader for Neo4j")
     parser.add_argument("--single-file", help="Load single parquet file for testing")
@@ -1328,6 +1673,17 @@ def main():
         help=(
             "Build CONNECTS_TO edges for the given date(s) and exit. Requires an "
             "already-loaded graph; does not start Spark. ~625K edges per day."
+        ),
+    )
+    parser.add_argument(
+        "--solve-offsets",
+        metavar="YYYY-MM-DD",
+        nargs="+",
+        help=(
+            "Recover airport UTC offsets for the given date(s) from the loaded "
+            "block times and write scheduled_departure_utc / "
+            "scheduled_arrival_utc, then exit. Requires an already-loaded graph; "
+            "does not start Spark. Run this BEFORE --build-connections."
         ),
     )
     parser.add_argument(
@@ -1369,36 +1725,38 @@ def main():
     # Setup logging - disable console output if in CLI mode (to avoid duplication)
     logger = setup_logging(verbose_cli=cli_mode)
 
-    # CONNECTS_TO works purely over the loaded graph, so it runs standalone
-    # rather than as a step in the Spark pipeline.
-    if args.build_connections:
-        load_dotenv()
-        neo4j_uri = os.getenv("NEO4J_URI")
-        neo4j_user = os.getenv("NEO4J_USERNAME")
-        neo4j_password = os.getenv("NEO4J_PASSWORD")
-        neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
-        if not all([neo4j_uri, neo4j_user, neo4j_password]):
-            msg = "Missing Neo4j credentials — copy .env.example to .env"
-            logger.error(msg)
-            print(f"❌ {msg}")
-            raise SystemExit(1)
-        try:
-            create_connects_to(
-                neo4j_uri,
-                neo4j_user,
-                neo4j_password,
-                neo4j_database,
-                args.build_connections,
-                min_layover=args.min_layover,
-                max_layover=args.max_layover,
-                strict_carrier=args.strict_carrier,
-                rebuild=args.rebuild_connections,
-            )
-        except Exception as e:
-            error_msg = f"CONNECTS_TO build failed: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            print(f"❌ {error_msg}")
-            raise
+    # The UTC solve and the CONNECTS_TO build both work purely over the loaded
+    # graph, so they run standalone rather than as steps in the Spark pipeline.
+    # Offsets must be written first: once scheduled_arrival_utc exists, the
+    # connection build can eventually compare UTC directly instead of inferring
+    # overnight legs from the block time.
+    if args.solve_offsets or args.build_connections:
+        creds = _neo4j_credentials(logger)
+
+        if args.solve_offsets:
+            try:
+                write_utc_times(*creds, args.solve_offsets)
+            except Exception as e:
+                error_msg = f"UTC offset solve failed: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                print(f"❌ {error_msg}")
+                raise
+
+        if args.build_connections:
+            try:
+                create_connects_to(
+                    *creds,
+                    args.build_connections,
+                    min_layover=args.min_layover,
+                    max_layover=args.max_layover,
+                    strict_carrier=args.strict_carrier,
+                    rebuild=args.rebuild_connections,
+                )
+            except Exception as e:
+                error_msg = f"CONNECTS_TO build failed: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                print(f"❌ {error_msg}")
+                raise
         return
 
     logger.info(

@@ -6,8 +6,13 @@ Load Testing Framework Validation Tests
 Tests the load testing framework setup and configuration without actually
 running database queries. These are lightweight validation tests to ensure
 the framework is correctly configured before running real load tests.
+
+**Runs in its own pytest process.** Importing this file imports locust, which
+gevent-patches `threading` process-wide, and that deadlocks FastAPI's
+`TestClient`. See `TestGeventIsolation` below, which gates the separation.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -34,12 +39,11 @@ class TestLoadTestScriptValidation:
         """
         import neo4j_flight_load_test
 
-        assert hasattr(neo4j_flight_load_test, "Neo4jUser")
-        user_class = neo4j_flight_load_test.Neo4jUser
+        user_class = neo4j_flight_load_test.ItinerarySearchUser
 
-        # Should have required Locust methods
+        # Note: no on_stop. The driver is process-wide (flight_search.get_driver()),
+        # so a per-user teardown would close a pool other users are still using.
         assert hasattr(user_class, "on_start")
-        assert hasattr(user_class, "on_stop")
         assert hasattr(user_class, "wait_time")
 
         # Should have task methods
@@ -49,105 +53,95 @@ class TestLoadTestScriptValidation:
         ]
         assert (
             len(task_methods) >= 2
-        )  # Should have multiple task types (direct + connection)
+        )  # Should have multiple task types (nonstop + full search)
+
+    def test_load_test_holds_no_cypher_of_its_own(self):
+        """The load test must drive the served code path, not a private copy.
+
+        This is the defect the rewrite fixed: the old file carried its own query
+        with a CASE-based duration that read a westbound timezone offset as a
+        midnight crossing (1439 minutes for a 59-minute flight), so it was
+        measuring a query the service would never run. One airport-sampling query
+        is legitimate -- itinerary Cypher is not.
+
+        Matches on Cypher syntax rather than words like "CONNECTS_TO", which appear
+        legitimately in the file's own prose explaining why the Cypher is gone.
+        """
+        source = (
+            Path(__file__).parent.parent / "neo4j_flight_load_test.py"
+        ).read_text()
+
+        assert "flight_search" in source, "load test must call flight_search"
+
+        # Traversal syntax, which prose never contains. The one permitted query
+        # samples airports and uses -[:DEPARTS_FROM]-> exactly once.
+        assert "-[:CONNECTS_TO]->" not in source
+        assert "-[:ARRIVES_AT]->" not in source
+        assert "duration.between" not in source
+        assert source.count("-[:DEPARTS_FROM]->") == 1, (
+            "expected exactly one DEPARTS_FROM, in the airport-volume sampling "
+            "query; more than that means itinerary Cypher came back"
+        )
 
     def test_query_construction_logic(self):
-        """Test that queries can be constructed without syntax errors"""
-        # Test the unified query structure (this is the core query logic)
-        unified_query = """
-        // Direct flights
-        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(direct:Schedule)
-              -[:ARRIVES_AT]->(d:Airport {code: $dest})
-        WHERE direct.flightdate = $search_date
-          AND direct.scheduled_departure_time IS NOT NULL
-          AND direct.scheduled_arrival_time IS NOT NULL
+        """The query the load test drives is built by flight_search, and is sane.
 
-        WITH collect({
-            type: "direct",
-            departure_time: direct.scheduled_departure_time,
-            arrival_time: direct.scheduled_arrival_time,
-            flight: direct.reporting_airline +
-                    toString(direct.flight_number_reporting_airline),
-            duration_minutes: duration.between(direct.scheduled_departure_time,
-                                               direct.scheduled_arrival_time).minutes,
-            distance: direct.distance_miles
-        }) AS direct_flights
+        This replaces a test that defined a ~60-line Cypher string inline and then
+        asserted that string contained "MATCH", "WHERE", "$origin" and so on. It
+        could only fail if someone edited the literal directly above the
+        assertions, so it gated nothing — and the literal it carried was a copy of
+        the *deleted* wrong query, complete with
+        `duration.between(scheduled_arrival_time, scheduled_departure_time)`,
+        which subtracts two local clocks at different airports (CLAUDE.md: never
+        do this). A test asserting a banned idiom is worse than no test.
 
-        // One-stop connections
-        MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)
-              -[:ARRIVES_AT]->(hub:Airport)<-[:DEPARTS_FROM]-(s2:Schedule)
-              -[:ARRIVES_AT]->(d:Airport {code: $dest})
-
-        WHERE s1.flightdate = $search_date
-          AND s2.flightdate = $search_date
-          AND s1.scheduled_arrival_time IS NOT NULL
-          AND s2.scheduled_departure_time IS NOT NULL
-          AND s2.scheduled_departure_time > s1.scheduled_arrival_time
-          AND hub.code <> $origin
-          AND hub.code <> $dest
-
-        WITH direct_flights, s1, s2, hub,
-             duration.between(s1.scheduled_arrival_time,
-                              s2.scheduled_departure_time).minutes AS layover_minutes,
-             duration.between(s1.scheduled_departure_time,
-                              s2.scheduled_arrival_time).minutes AS total_duration
-
-        WHERE layover_minutes >= 45 AND layover_minutes <= 300
-
-        WITH direct_flights, collect({
-            type: "connection",
-            departure_time: s1.scheduled_departure_time,
-            arrival_time: s2.scheduled_arrival_time,
-            hub: hub.code,
-            layover_minutes: layover_minutes,
-            total_duration: total_duration,
-            flight1: s1.reporting_airline +
-                     toString(s1.flight_number_reporting_airline),
-            flight2: s2.reporting_airline +
-                     toString(s2.flight_number_reporting_airline)
-        }) AS connection_flights
-
-        // Combine and return all options
-        WITH direct_flights + connection_flights AS all_flights
-        UNWIND all_flights AS flight
-
-        RETURN flight
-        ORDER BY flight.departure_time
-        LIMIT 20
+        So assert against the query that actually runs.
         """
+        import flight_search
 
-        # Basic validation - should not have obvious syntax issues
-        assert "MATCH" in unified_query
-        assert "WHERE" in unified_query
-        assert "RETURN" in unified_query
-        assert "ORDER BY" in unified_query
-        assert "$origin" in unified_query
-        assert "$dest" in unified_query
-        assert "$search_date" in unified_query
+        query = flight_search.build_search_query(0, 2)
 
-        # Should have reasonable layover constraints
-        assert "layover_minutes >= 45" in unified_query
-        assert "layover_minutes <= 300" in unified_query
+        assert "MATCH" in query and "RETURN" in query
+        assert "ORDER BY total_minutes" in query
+        assert "$origin" in query and "$dest" in query and "$date" in query
+
+        # The two frames must not be mixed. Journey length comes from real block
+        # times and real layovers, never from subtracting local timestamps.
+        assert "duration.between" not in query, "local-clock subtraction is banned"
+        assert "scheduled_duration_minutes" in query
+
+        # The path-level guard CONNECTS_TO cannot express.
+        assert "airports[0..i]" in query, "acyclicity guard missing"
 
 
 class TestConnectionPoolingSetup:
     """Test connection pooling configuration"""
 
     def test_connection_configuration_structure(self):
-        """Test that connection pooling settings are reasonable"""
-        # These are the settings from our load test
-        config = {
-            "max_connection_lifetime": 3600,  # 1 hour
-            "max_connection_pool_size": 100,  # Max connections per driver
-            "connection_acquisition_timeout": 60,  # Seconds to wait for connection
-        }
+        """The real pool size is set and in a sane range.
 
-        # Validate reasonable values
-        assert 1800 <= config["max_connection_lifetime"] <= 7200  # 30 min to 2 hours
-        assert 10 <= config["max_connection_pool_size"] <= 200  # Reasonable pool size
-        assert (
-            30 <= config["connection_acquisition_timeout"] <= 120
-        )  # Reasonable timeout
+        This used to define a `config` dict of plausible-looking numbers and then
+        assert bounds on its own literals -- it passed regardless of what the code
+        did, and in fact `max_connection_lifetime` and
+        `connection_acquisition_timeout` are not set anywhere in this repo. Read
+        the actual value instead.
+        """
+        import flight_search
+
+        assert 10 <= flight_search.DEFAULT_POOL_SIZE <= 200
+
+    def test_load_test_does_not_build_a_driver_per_user(self):
+        """One pooled driver for the process, from flight_search.
+
+        The old load test constructed a driver per simulated user, which put
+        driver and TLS setup inside every measurement. Nothing here may call
+        GraphDatabase.driver() itself.
+        """
+        source = (
+            Path(__file__).parent.parent / "neo4j_flight_load_test.py"
+        ).read_text()
+        assert "GraphDatabase.driver(" not in source
+        assert "flight_search.get_driver()" in source
 
     def test_neo4j_driver_parameters(self):
         """Test that Neo4j driver parameters are valid"""
@@ -164,6 +158,58 @@ class TestConnectionPoolingSetup:
             assert uri.startswith(("bolt://", "neo4j://", "bolt+s://", "neo4j+s://"))
             parts = uri.split("://")[1]
             assert ":" in parts  # Should have host:port
+
+
+class TestGeventIsolation:
+    """
+    This file must keep running in a pytest process of its own.
+
+    Importing it imports locust, which has gevent monkey-patch `threading` for the
+    remaining life of the interpreter. FastAPI's `TestClient` drives the app
+    through an anyio blocking-portal *thread*; once that thread is a greenlet, the
+    two deadlock and the process parks in `gevent/hub.py` forever.
+
+    That failure mode is worse than a test failure: CI would hang until the job
+    timeout rather than report red. Verified by reproduction —
+    `TestApiStatusMapping` in test_flight_search_service_unit.py passes alone in
+    0.42s and never returns when this module is imported first.
+    """
+
+    def test_ci_runs_this_file_in_its_own_step(self):
+        """The workflow must not fold this file in with the TestClient tests."""
+        workflow = Path(__file__).parent.parent / ".github/workflows/ci.yml"
+        if not workflow.exists():
+            pytest.skip("workflow not present")
+        content = workflow.read_text()
+
+        steps = [s for s in content.split("- name:") if "pytest" in s]
+        our_steps = [s for s in steps if "test_load_testing_framework.py" in s]
+        assert our_steps, "this file is not in any CI step"
+        assert len(our_steps) == 1, "this file is invoked by more than one step"
+
+        # The step that runs this file must run ONLY this file. Anything importing
+        # fastapi.testclient alongside it deadlocks.
+        step = our_steps[0]
+        others = [
+            name
+            for name in re.findall(r"tests/(test_\w+\.py)", step)
+            if name != "test_load_testing_framework.py"
+        ]
+        assert not others, (
+            f"gevent deadlock risk: {others} share a pytest process with this "
+            "file. It must run in a step of its own — see this class's docstring."
+        )
+
+    def test_locust_import_really_does_patch_threading(self):
+        """Anti-vacuity: the guard above only matters if the patch is real."""
+        from gevent.monkey import is_module_patched
+
+        import neo4j_flight_load_test  # noqa: F401
+
+        assert is_module_patched("threading"), (
+            "locust no longer monkey-patches threading; if that is permanent, the "
+            "separate CI step and this class can go"
+        )
 
 
 class TestLoadTestFrameworkReadiness:

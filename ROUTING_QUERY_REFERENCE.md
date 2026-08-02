@@ -6,55 +6,92 @@ This document gives the recommended Cypher for multi-hop flight routing over thi
 graph, and explains the one modeling trap you need to know about before writing
 your own.
 
-## Read this first: durations
+## Read this first: durations and time zones
 
-`Schedule` carries two local wall-clock timestamps:
+`Schedule` carries **two pairs** of timestamps. Picking the right pair is the
+single most important thing on this page.
 
-- `scheduled_departure_time` — local time **at the origin**
-- `scheduled_arrival_time` — local time **at the destination**
+| property | type | frame | use it for |
+|---|---|---|---|
+| `scheduled_departure_time` | LOCAL DATETIME | local at the **origin** | "departs after 09:00 local" |
+| `scheduled_arrival_time` | LOCAL DATETIME | local at the **destination** | "arrives before 15:00 local" |
+| `scheduled_departure_utc` | LOCAL DATETIME | **UTC** | durations, sequencing, sorting across airports |
+| `scheduled_arrival_utc` | LOCAL DATETIME | **UTC** | durations, sequencing, sorting across airports |
+| `scheduled_duration_minutes` | INTEGER | — | block time (BTS `CRSElapsedTime`) |
 
-They are in **different timezones**. Subtracting one from the other therefore
-does not give a flight duration. Measured across a full month of loaded data,
-naive `arrival − departure` agrees with BTS's own reported block time for only
-about **49%** of flights, and produces a *negative* result for roughly **2.7%**.
+**The rule: compare or subtract only within one frame.** Arithmetic goes in UTC;
+wall-clock filters go in local time. Never mix the two.
 
-Use **`scheduled_duration_minutes`** instead. It is BTS's reported scheduled
-block time (`CRSElapsedTime`), it is 100% populated, and it is both timezone- and
-DST-independent.
+The local pair is in **different timezones from each other**, so subtracting them
+is meaningless: naive `arrival − departure` agrees with BTS's own block time for
+only **48.9%** of flights on 2025-07-18 (10,453 of 21,376) and goes *negative* for
+**940**. That is not a defect in the stored times — see below — it is simply the
+wrong operation.
 
-### What that 49% does and does not mean
+The UTC pair exists to make that operation correct. It is produced by
+`--solve-offsets` and satisfies, for **100%** of flights:
 
-It is a statement about **subtraction**, not about the stored timestamps. Read as
-"arrival times are 50% wrong" it is badly misleading, and the distinction decides
-whether an "arrives before 3pm" filter is usable.
+```
+scheduled_arrival_utc − scheduled_departure_utc == scheduled_duration_minutes
+```
 
-The stored **time-of-day is the correct destination-local wall clock**. Verified
-two ways on 2025-07-18:
+with **zero** flights arriving at or before their departure.
+
+### Where the UTC times come from — no timezone database
+
+`Airport` carries no timezone, and none is downloaded. The offsets are *recovered
+from the loaded data*, which works because BTS gives local times at both ends plus
+the timezone-independent block time. For any flight:
+
+```
+(arrival_local − departure_local) − block  =  offset(dest) − offset(origin)
+```
+
+Each directed airport pair therefore reveals the **difference** between its
+endpoints' offsets. Treat airports as nodes and those differences as edges, BFS
+from any airport to propagate relative offsets across the network, then pin the
+result to absolute UTC with one known value (`PHX = −07:00`, chosen because Arizona
+does not observe DST and so needs no seasonal branch).
+
+On 2025-07-18 this solves all **341** airports as one connected component with
+**0** conflicting deltas, every offset a whole hour, and all 22 spot-checked
+against real-world values exactly — including `GUM`, which requires a dateline
+wrap to come out at UTC+10 rather than −14.
+
+Solved **per date**, because offsets are DST-dependent: 18 of 317 airports differ
+between January and July, and mainland airports shift wholesale (ORD −6 → −5). A
+single `Airport.utc_offset` property would be wrong for half the year, which is why
+none exists.
+
+### The local times are correct — only their dates are not
+
+Worth stating plainly, because "48.9%" invites the wrong conclusion. The stored
+**time-of-day is the correct local wall clock at its own airport**. Verified two
+ways on 2025-07-18:
 
 - `DL304 DTW→SNA` stores dep 08:45, arr 10:25, block 280 min. 08:45 Eastern is
   05:45 Pacific; 05:45 + 280 min = **10:25 Pacific** — exactly what is stored.
-- Structurally: if the times are right and only the frames differ, then
-  `(arrival − departure − block) mod 1440` must be **constant for every directed
-  airport pair**, because it is that pair's UTC-offset delta. Measured over all
-  2,737 directed pairs with ≥3 flights that day: **2,737 (100.00%)** yield a
-  single value, and every value is a whole hour (0, ±60, ±120, ±180, ±240, ±300).
-  A pair whose stored times were arbitrarily wrong could not do this.
+- Structurally, reconstructing local arrival from `scheduled_arrival_utc` plus the
+  destination's solved offset reproduces the stored `scheduled_arrival_time`
+  time-of-day for **21,376 of 21,376 flights (100.00%)**. Times that were
+  arbitrarily wrong could not do this.
 
-So the defect is narrower than the 49% figure suggests. What is wrong is the
-**date**, not the time: both timestamps are composed onto the origin's
+What is wrong is the **date**: both local timestamps are composed onto the origin's
 `flightdate`, so a leg crossing local midnight is stamped a day early. On
-2025-07-18, **893 of 21,376 flights (4.18%)** are such overnights.
+2025-07-18, **893 of 21,376 flights (4.18%)** are such overnights. The UTC pair has
+no such problem — 3,152 flights that day correctly land on the following UTC day.
 
 Consequences, precisely:
 
-| you want | safe? |
+| you want | use |
 |---|---|
-| a leg or journey **duration** | ✗ subtraction is wrong — use `scheduled_duration_minutes` |
-| **layover** at a hub | ✓ both timestamps share the hub's timezone |
-| **"arrives before HH:MM local"** | ✓ time-of-day is right, **but** you must exclude overnight legs or they falsely pass — see below |
-| ordering arrivals **across different airports** | ✗ different frames; no timezone table is loaded |
+| a leg or journey **duration** | ✓ UTC pair, or `scheduled_duration_minutes` |
+| **layover** at a hub | ✓ UTC pair (what `CONNECTS_TO` stores); the local pair also works at a single hub since both share its timezone |
+| **"arrives before HH:MM local"** | ✓ `scheduled_arrival_time` with `localdatetime()` — no extra guard needed |
+| ordering arrivals **across different airports** | ✓ UTC pair; ✗ the local pair, whose frames differ |
+| **sequencing** two legs | ✓ UTC pair — or rely on `CONNECTS_TO`, which already enforces it |
 
-### Deadline filters: two traps, both silent
+### Deadline filters: one trap left, one repaired at load time
 
 **1. `datetime()` vs `localdatetime()` — this one returns no error at all.**
 `scheduled_arrival_time` is a `LOCAL DATETIME` (the loader writes
@@ -73,27 +110,36 @@ A BUF→CHS search with 40 valid itineraries returns **zero** and looks like "no
 route exists". Always use `localdatetime()` — or `datetime()` only after loading
 a real timezone for each airport, which this graph does not have.
 
-**2. Overnight legs pass a deadline they do not meet.** Because the arrival date
-is the origin's, a red-eye landing at 00:01 the *next* day is stored as 00:01 on
-the departure date and sails through `< 15:00`. Real examples on 2025-07-18:
-`AS636 SEA-LAS` and `DL2645 LAX-SEA`, both stored 00:01 on 07-18, both actually
-landing 07-19. Of the 16,212 legs that terminate a `CONNECTS_TO` itinerary,
-**862 (5.32%)** would be wrongly accepted.
+**2. Overnight legs used to pass a deadline they do not meet — fixed at load
+time, no query-side guard.** The loader originally composed *both* timestamps onto
+the origin's `flightdate`, so a red-eye landing at 00:18 the *next* day was stored
+as 00:18 on the departure date and sailed through `< 15:00`.
 
-The same block-time test the builder uses excludes them:
+`--solve-offsets` now rewrites `scheduled_arrival_time` as
+`scheduled_arrival_utc + offset(dest)`, so the DATE is the destination's. The
+time-of-day is unchanged — it was already correct. On 2025-07-18, **915 of 21,376
+flights (4.28%)** move to the following local day, and a deadline filter with no
+guard at all now wrongly accepts **0** of them. `AA983 MIA→RIC` departs 21:51 and
+is stored `2025-07-19T00:18`, which is simply the truth.
 
-```cypher
-AND NOT (duration.inSeconds(f.scheduled_departure_time,
-                            f.scheduled_arrival_time).seconds / 60 < 0
-     AND abs(duration.inSeconds(f.scheduled_departure_time,
-                                f.scheduled_arrival_time).seconds / 60
-             + 1440 - f.scheduled_duration_minutes) <= 180)
-```
+Two things this replaced, both wrong, recorded so nobody reintroduces them:
 
-`CONNECTS_TO` already applies this to every *inbound* leg, so intermediate hops
-are clean. The **final** leg is not covered — it is not the inbound side of any
-connection — so a deadline query has to add the guard itself. See
-"Arrive-before-a-deadline" below for the complete query.
+- **A ±180-minute block-time tolerance** (what this repo shipped). It tried to
+  *infer* the destination offset from the local subtraction, and could not span the
+  widest gaps — `AA6` HNL→DFW needs 240–360 minutes and read as same-day.
+- **`date(arrival_utc) = date(departure_utc)`.** Tempting and still wrong: it tests
+  **UTC** midnight, not local. Measured on 2025-07-18 it excludes **3,135** ordinary
+  evening flights (`AA976` CLT→FLL, 19:21→21:19 local, is 23:21→01:19 UTC) while
+  admitting **876** genuine red-eyes.
+
+The general lesson: the destination's UTC offset is not recoverable inside a query,
+so a correct local arrival date can only be written by the loader, which knows it.
+
+A leg may still legitimately arrive on an *earlier* local date than it departed:
+`UA200 GUM→HNL` departs 07:15 on 07-18 and lands 18:25 on **07-17**, crossing the
+dateline. Twenty more land at an earlier local *time* on the same day — `DL2250
+ATL→BHM`, 09:40→09:32, a 52-minute flight westbound one hour. Both are correct;
+never "repair" them.
 
 ### The `CASE`-based idiom is wrong — don't copy it
 
@@ -107,9 +153,21 @@ Worst observed case: a short ATL→HSV hop scheduled 22:55 → 22:56 local (61 r
 minutes, one timezone westbound). The `CASE` idiom returns **1439 minutes**, and a
 `WHERE duration > 0 AND duration < 1440` guard does *not* filter it out.
 
-**What is still sound:** layover arithmetic at a connecting hub. Both timestamps
-at the hub are local to the same airport, so connection windows computed by
-subtraction are correct.
+There is now no reason to reach for any such workaround: subtract the **UTC**
+timestamps, or read `scheduled_duration_minutes`. Both are exact.
+
+### Beware ±180-minute block-time heuristics too
+
+The same warning applies to a subtler workaround that this repo itself shipped.
+Before UTC times existed, `CONNECTS_TO` detected next-day arrivals by testing
+whether adding 1440 minutes reconciled the local subtraction with the block time,
+to within ±180 minutes. That tolerance cannot span the widest US offset gaps:
+`AA6` HNL→DFW (dep 17:36, arr 06:02 next day, 446-min block) needs 240–360 minutes
+and so read as same-day, leaving **11,975 impossible edges** in the graph.
+
+The lesson generalises. Any tolerance wide enough to absorb every real timezone gap
+is also wide enough to swallow genuine same-day legs. Compare absolute instants
+instead — that is what the UTC pair is for.
 
 ## Explicit 1-stop join
 
@@ -158,15 +216,28 @@ in the client. On this graph they need one thing first: a direct
 ### Build the connection edges
 
 ```bash
+python load_bts_data.py --solve-offsets 2025-07-18       # required first
 python load_bts_data.py --build-connections 2025-07-18
 ```
 
+The offset step is a prerequisite, not an optimisation: the layover is computed
+from `scheduled_departure_utc` / `scheduled_arrival_utc`, which it creates. See
+"Durations and time zones" below.
+
 That writes `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for every
 **bookable** connection on those dates — same marketing carrier, layover within
-45–300 minutes, no immediate backtrack, and no inbound leg that actually lands the
-next day. **514,000-625,000 edges per day** (measured over 2025-07-14...20; mean 577,228,
-lowest on Saturday), built in **~7 seconds** per date. Idempotent (`MERGE`), so
+45–300 minutes **of absolute time**, and no immediate backtrack.
+**512,000-624,000 edges per day** (measured over 2025-07-14...20; mean 575,510,
+lowest on Saturday), built in **~9 seconds** per date. Idempotent (`MERGE`), so
 re-running is safe. Accepts several dates in one invocation.
+
+Because the window is measured in UTC, an inbound leg that lands the next morning
+is excluded arithmetically rather than by a heuristic. The previous local-time
+build used a ±180-minute block-time test that could not span the widest US offset
+gaps and left **11,975 impossible edges** — e.g. `AA6` HNL→DFW arriving 06:02 the
+next day spliced to an 08:10 DFW departure the day before. Switching to UTC
+removed exactly those (a strict subset: all 623,508 surviving edges for
+2025-07-18 were already present, and nothing new was admitted).
 
 The connection policy is baked into the edges. After changing
 `--min-layover`/`--max-layover` or `--strict-carrier`, rebuild with
@@ -208,9 +279,9 @@ whole path — that no airport repeats — so that guard stays in the query.
 ### Arrive-before-a-deadline
 
 "Find me a route from A to B that arrives before 3pm" — the query most real
-requests actually are. It is the base QPP plus the two guards from
-"Deadline filters" above. Both matter: without the first it returns nothing,
-without the second it returns itineraries that land the following day.
+requests actually are. It is the base QPP plus one line, and the only trap left is
+using `localdatetime()` rather than `datetime()`; get that wrong and it returns
+nothing at all. The overnight problem is handled by the loader, not here.
 
 ```cypher
 MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
@@ -226,15 +297,11 @@ WHERE size(airports) = size([i IN range(0, size(airports) - 1)
 // comparing it against a ZONED DATETIME yields NULL rather than false, which
 // silently discards every row. See "Deadline filters" above.
   AND f.scheduled_arrival_time < localdatetime($deadline)
-// The stored time-of-day is the correct destination-local wall clock, but the
-// DATE comes from the origin's flightdate, so a leg crossing local midnight is
-// stamped a day early and would falsely satisfy the deadline. CONNECTS_TO
-// already excludes overnight INBOUND legs; the final leg needs this guard.
-  AND NOT (duration.inSeconds(f.scheduled_departure_time,
-                              f.scheduled_arrival_time).seconds / 60 < 0
-       AND abs(duration.inSeconds(f.scheduled_departure_time,
-                                  f.scheduled_arrival_time).seconds / 60
-               + 1440 - f.scheduled_duration_minutes) <= 180)
+// No overnight guard is needed. scheduled_arrival_time now carries the
+// DESTINATION's date (--solve-offsets rewrites it from the UTC instant), so a
+// red-eye landing after midnight compares as the next day, which it is. Earlier
+// revisions of this query needed a guard here; see "Deadline filters" above for
+// why every query-side version of it was wrong.
 RETURN size(legs) - 1 AS stops,
        [x IN legs | x.reporting_airline +
                     toString(x.flight_number_reporting_airline)] AS flights,
@@ -262,11 +329,11 @@ Measured, `{1,2}`, `LIMIT 5`, warm — three routes with no nonstop:
 `AA360+MQ3354` is `CARRIER_FAMILY` doing its job: a real American Eagle
 connection that strict operating-carrier equality would have dropped.
 
-The remaining honest limitation is **cross-airport comparison**. Ranking by
-`total_minutes` is sound, and each itinerary's own deadline test is sound, but
-"which of these arrives earliest in absolute time" is not answerable for
-destinations in different timezones — nothing in the graph carries a UTC offset.
-Within a single `$dest`, as here, that does not arise.
+Cross-airport comparison used to be a limitation here — "which of these arrives
+earliest in absolute time" was unanswerable across timezones. It no longer is:
+order by `f.scheduled_arrival_utc` and the comparison is exact regardless of where
+the destinations are. Keep `scheduled_arrival_time` for *display* and for the
+deadline predicate, since a passenger's "before 3pm" means 3pm where they land.
 
 ### Depart-after-a-time
 
@@ -370,18 +437,33 @@ never going to rank):
 
 The tables above are hand-picked routes. Across **40 origin/destination pairs
 drawn from the graph's 60 busiest origins**, top-20 sorted, acyclicity guard on,
-departing after 08:00, warm cache:
+repeat-warm cache.
 
-| depth | p50 | p95 | max | over 200 ms | empty results |
-|---|---|---|---|---|---|
-| `{0,2}` | **36 ms** | **56 ms** | 124 ms | **0 / 40** | 0 |
-| `{0,3}` | **114 ms** | **218 ms** | 279 ms | **5 / 40** | 0 |
+**The departure-time filter is not a detail — it dominates the cost**, so both
+conditions are reported. An earlier revision of this table gave only the
+`depart_after 08:00` row and did not carry the condition into README.md or
+CLAUDE.md, where it was read as the unfiltered cost and understated `{0,3}` by
+roughly 2.7x:
 
-**Two stops holds a 200 ms budget with room to spare. Three stops does not** — it
-misses on about 12% of pairs, worst on dense hub-to-hub routes where the
-candidate set is largest (LGA→DFW enumerates 11,488 itineraries to return 20).
-If you need a hard 200 ms ceiling, serve `{0,2}` and treat `{0,3}` as a
-widen-on-demand second request rather than the default.
+| depth | filter | p50 | p95 | max | over 200 ms | empty results |
+|---|---|---|---|---|---|---|
+| `{0,2}` | `depart_after 08:00` | **35 ms** | **64 ms** | 67 ms | **0 / 40** | 0 |
+| `{0,2}` | none (whole day) | **85 ms** | **175 ms** | 199 ms | **0 / 40** | 0 |
+| `{0,3}` | `depart_after 08:00` | 116 ms | 243 ms | 267 ms | 5 / 40 | 0 |
+| `{0,3}` | none (whole day) | 395 ms | 595 ms | 624 ms | **34 / 40** | 0 |
+
+**Two stops holds a 200 ms budget under both conditions. Three stops does not** —
+it misses on about 12% of pairs with a morning filter and on **85%** without one,
+worst on dense hub-to-hub routes where the candidate set is largest (LGA→DFW
+enumerates 11,488 itineraries to return 20). If you need a hard 200 ms ceiling,
+serve `{0,2}` and treat `{0,3}` as a widen-on-demand second request.
+
+These are repeat-warm, not first-hit: re-running `{0,3}` LGA→DFW twelve times in a
+row converges to ~440 ms, consistent with the 436 ms in the guard-cost table above,
+so the cost is path expansion rather than a cold page cache. Measured against the
+full-year graph (6,898,743 `Schedule` nodes) on a date carrying 623,508
+`CONNECTS_TO` edges — the same edge count as the CI fixture, so route density is
+not what separates the two conditions.
 
 ### Measured
 
@@ -446,23 +528,34 @@ locally.
 Two things keep that gate honest:
 
 - The conftest fixtures skip cleanly when Neo4j is unreachable, which would make
-  an all-skipped run look green. `tests/ci_verify_loaded.py` runs first and fails
-  if the graph does not hold what the fixture should have produced.
+  an all-skipped run look green. `tests/ci_verify_loaded.py <date>` runs first and
+  fails if the graph does not hold what the fixture should have produced. It takes
+  the date because node counts alone cannot tell whether `--solve-offsets` ran —
+  a `Schedule` exists either way — so it also requires both `scheduled_*_utc`
+  properties on every flight of that day.
 - The regression tests assert the defect is *absent* **and** that the fixture
-  could have exposed it — 893 overnight legs and 110,642 cross-family edges are
-  asserted non-zero. Otherwise a dataset without those properties would pass
-  while gating nothing. Verified by injecting one bad edge of each kind into
-  625,220 good ones: each trips its own assertion and nothing else.
+  could have exposed it — 915 legs landing on a later local day, 110,642
+  cross-family edges, and 2 dateline airports are all asserted non-zero.
+  Otherwise a dataset without those properties would pass while gating nothing.
+  Verified by injecting one bad edge of each kind into 623,508 good ones: each
+  trips its own assertion and nothing else.
 
 Two defects that validation found, both now fixed in the builder:
 
-**Inbound legs that land the next day.** 17,502 edges (3.29%) connected off a leg
-whose stored arrival was same-day but which really arrives the following morning —
-`AA1009 LAX-ORD dep 22:59 arr 05:18` spliced to a 06:55 ORD departure. This is the
-timezone defect at the top of this document leaking into connection *dates*. The
-detector needs no timezone table: if apparent duration is negative **and** adding
-1440 minutes reconciles it with `scheduled_duration_minutes`, the leg is an
-overnight. Those legs are now excluded.
+**Inbound legs that land the next day.** Edges connected off a leg whose stored
+arrival looked same-day but which really arrives the following morning —
+`AA1009 LAX→ORD dep 22:59 arr 05:18` spliced to a 06:55 ORD departure. The builder
+now compares `scheduled_arrival_utc` against `scheduled_departure_utc`: both are
+absolute instants, so the layover is a positive interval by construction and needs
+no tolerance at all.
+
+The first attempt at this used a heuristic on the *local* pair — negative apparent
+duration that reconciles with the block time once 1440 minutes are added, within
+±180. It removed 17,502 edges and looked like a fix, but the tolerance cannot span
+the widest US offset gaps, so **11,975 impossible edges survived it** (`AA6`
+HNL→DFW needs 240–360 minutes to reconcile and read as same-day). Switching to UTC
+removed exactly those and nothing else — verified as a strict subset: all 623,508
+surviving edges were already present, zero new ones appeared.
 
 **Regional affiliates are not interline.** BTS reports the *operating* carrier and
 the feed has **no marketing-carrier column**, so Envoy (`MQ`) and PSA (`OH`) —
@@ -477,6 +570,18 @@ to say which one a given flight was sold under. They stay strict rather than
 guessed. True interline between unrelated carriers (AA↔AS) is also not derivable
 here — and matters, since allowing arbitrary cross-carrier connections would add
 1.1M pairs a day, most unsellable.
+
+**Being strict does not make those two safe, and the residual is not small.**
+Measured over the seven built dates: **348,000 of 4,028,572 edges (8.64%)** are
+`OO`→`OO` (283,368) or `YX`→`YX` (64,632). Every one passes the carrier predicate,
+because the operating codes match — but SkyWest sells the same aircraft as Delta
+Connection, United Express, American Eagle and Alaska SkyWest depending on the
+route, so an `OO` arrival sold under one mainline connecting to an `OO` departure
+sold under another is **not** a sellable itinerary. Which mainline applies is
+**not recoverable from this feed at all**: it needs the marketing carrier, and BTS
+On-Time Performance does not publish one. Treat that 8.64% as an upper bound on
+edges the strict rule cannot vouch for — closing it requires a schedule source
+with marketing carriers (OAG, ATPCO, a GDS feed), not a better query.
 
 **Known and accepted:** 142 airports act as a connecting point for fewer than 100
 connections each (TTN, WYS, MGW…), which no airline would sell. That is **0.49%**
@@ -645,23 +750,45 @@ One-stop:
   AA628 → AA1203   via CLT   dep 06:00  196 min layover
 ```
 
-Note the nonstop block times (~257 min) differ from `arrival − departure`
-(~197 min) by exactly the one-hour Eastern→Central offset — a concrete instance
-of the trap described at the top of this document.
+Note the nonstop block times (~257 min) differ from local
+`arrival − departure` (~197 min) by exactly the one-hour Eastern→Central offset.
+That gap is why the local pair must never be subtracted; `scheduled_duration_minutes`
+and the UTC pair both give 257.
 
 ## Notes and caveats
 
-- **The shipped load test does not use these queries.**
-  `neo4j_flight_load_test.py` still uses the older `UNION ALL` form with the
-  `CASE` duration idiom and no carrier predicate. Migrating it is an open task.
-- **Layover bounds are inconsistent across this repo** (300, 720, and 1200
-  minutes appear in different files). Pick a value deliberately.
+- **The load test drives the served query.** `neo4j_flight_load_test.py` calls
+  `flight_search.py` and holds no Cypher of its own beyond one airport-sampling
+  query, gated by `test_load_test_holds_no_cypher_of_its_own`. The older
+  `UNION ALL` form with the `CASE` duration idiom is deleted, not migrated. (This
+  bullet used to say the opposite; it was stale.)
+- **Layover bounds have one authority: the `CONNECTS_TO` edge**, built at
+  [45, 300] minutes in `create_connects_to()`. Since `flight_search.py` traverses
+  that edge and the load test calls `flight_search.py`, no client restates it —
+  the old 300/720/1200 spread across this repo is gone. The hand-rolled explicit
+  join above still takes `$min_layover`/`$max_layover`, because it does the join
+  itself.
 - **Without a carrier predicate, most returned itineraries are unsellable.**
   A 1-stop query with no carrier condition freely splices any airline to any
-  other — including carriers that interline with nobody. But note the predicate
-  cuts both ways: a *strict* `s1.reporting_airline = s2.reporting_airline` is too
+  other — including carriers that interline with nobody. But the predicate cuts
+  both ways: a *strict* `s1.reporting_airline = s2.reporting_airline` is too
   tight, because BTS reports operating carriers and so separates mainlines from
-  their own wholly-owned regional feeders. `CONNECTS_TO` compares marketing
-  carriers via `CARRIER_FAMILY` instead; the explicit join above still uses the
+  their own wholly-owned regional feeders. `CONNECTS_TO` compares
+  `CARRIER_FAMILY`-mapped codes instead; the explicit join above still uses the
   strict form and will miss American Eagle connections.
 - **No APOC.** Everything here is plain Cypher, for Aura compatibility.
+
+### Scope: three things this cannot answer
+
+Stated plainly because none of them is a query problem.
+
+- **Routing covers the 7 dates whose edges are built** — `2025-07-14 … 2025-07-20`,
+  4,028,572 edges — out of 365 dates of loaded `Schedule` nodes. Every other date
+  returns zero itineraries, correctly and with no error. `GET /dates` reports the
+  real coverage; a full year would be ~211M edges.
+- **No price, seat availability, booking class, or per-airport minimum connection
+  time.** The flat [45, 300] window stands in for MCT everywhere. These queries
+  answer "is this flyable as scheduled", not "is this purchasable".
+- **8.64% of edges carry an unresolvable marketing carrier** — the `OO`/`YX`
+  measurement above. Not a modelling gap; BTS On-Time Performance simply has no
+  marketing-carrier column.

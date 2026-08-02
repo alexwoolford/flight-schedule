@@ -1,323 +1,203 @@
 #!/usr/bin/env python3
 """
-NEO4J FLIGHT LOAD TEST - FLEXIBLE ROUTING
-==========================================
+Load test for itinerary search.
+===============================
 
-Advanced load testing for Neo4j flight search with FLEXIBLE multi-hop routing.
-Uses iterative deepening instead of hardcoded hop counts.
+Drives concurrent traffic at the same code path the service serves —
+`flight_search.search_itineraries()` — rather than holding its own copy of the
+Cypher. That matters for more than tidiness: the previous version of this file
+carried a *different, wrong* query (a `CASE`-based duration that read a westbound
+timezone offset as a midnight crossing, returning 1439 minutes for a 59-minute
+flight), so it was load-testing something the service would never run.
 
-Key Features:
-• Dynamic path finding: finds routes of ANY length without hardcoding hops
-• Temporal sequencing: proper timing constraints throughout entire journey
-• Real flight search patterns: mimics airline booking platforms
-• Comprehensive cross-day flight handling (red-eye flights)
-• Performance optimized: bounded queries with early termination
+    locust -f neo4j_flight_load_test.py                      # web UI at :8089
+    locust -f neo4j_flight_load_test.py --headless \
+           --users 50 --spawn-rate 5 --run-time 300s --csv locust
+
+Then: `python quick_load_test_analysis.py locust_stats.csv`.
+
+Two tasks, weighted 70/30 — a nonstop lookup and a full multi-stop search, which
+is roughly how a booking front end behaves (most searches are on routes with
+nonstops). The weights are stated here rather than in prose elsewhere; there is no
+other distribution.
+
+What this file gets right that its predecessor did not, all of which changed the
+numbers rather than just the code:
+
+* **Sampling is by flight volume**, not `ORDER BY a.code` then `[:100]`. That slice
+  was alphabetical — ABE…ELM — which excluded 19 of the 30 busiest airports (ORD,
+  LAX, JFK, LGA, SFO, EWR, …) and left ~95% of the weighted task returning zero
+  rows. A load test where the hot path is empty measures nothing.
+* **One driver for the whole process**, from `flight_search.get_driver()`, created
+  on first use and shared by every simulated user. The old code built one per
+  user, so driver construction and TLS setup landed inside every measurement.
+* **Constant Locust stat names.** Per-pair names produced up to 29,700
+  single-sample rows, making every reported percentile a percentile of one or two
+  observations.
+* **Dates come from `CONNECTS_TO` coverage**, so sampled dates are searchable.
+  `--build-connections` is per-date, and searching an unbuilt date returns empty
+  instantly — fast, and meaningless. The old unbounded `DISTINCT` over every
+  Schedule node also ran once per simulated user.
+
+Requires a loaded graph with `--solve-offsets` and `--build-connections` run for at
+least one date; it fails at startup with that instruction rather than reporting
+zeros.
 """
 
-import os
 import random
+import threading
 import time
-from typing import Any, Dict, List, Tuple
 
-from dotenv import load_dotenv
 from locust import User, between, task
-from neo4j import GraphDatabase
+
+import flight_search
+
+# Sampling universe. 60 origins is enough to spread load across real hubs without
+# the sample degenerating to a handful of supernodes.
+TOP_ORIGINS = 60
+
+# Depth served by default. See the latency table in flight_search.py: {0,3} exceeds
+# 200 ms on 34 of 40 pairs unfiltered, so load-testing it would measure a
+# configuration the service does not serve.
+MAX_STOPS = flight_search.DEFAULT_MAX_STOPS
+
+# Locust stat names. Constant on purpose — these are what percentiles aggregate
+# over, and they are the strings quick_load_test_analysis.py matches on.
+NONSTOP_TASK = "nonstop lookup"
+SEARCH_TASK = f"itinerary search {{0,{MAX_STOPS}}}"
 
 
-class Neo4jUser(User):
+def _busiest_origins(driver, database, date):
+    """The `TOP_ORIGINS` airports with the most departures on `date`."""
+    query = """
+    MATCH (s:Schedule {flightdate: date($date)})-[:DEPARTS_FROM]->(a:Airport)
+    RETURN a.code AS code, count(*) AS flights
+    ORDER BY flights DESC, code
+    LIMIT $limit
     """
-    Locust user that performs realistic flight searches against Neo4j.
-    Uses flexible routing with iterative deepening approach.
+    with driver.session(database=database) as session:
+        return [
+            record["code"]
+            for record in session.run(query, date=date, limit=TOP_ORIGINS)
+        ]
+
+
+class ItinerarySearchUser(User):
+    """
+    One simulated traveller issuing searches against the graph.
+
+    The airport and date universe is loaded once per process (class attributes),
+    not per user: it is identical for every user and the queries behind it are not
+    what this test is measuring.
     """
 
-    wait_time = between(1, 3)  # Realistic user think time
+    wait_time = between(1, 3)
+
+    airports = None
+    dates = None
+
+    # Locust starts each user in its own greenlet, and every one of them calls
+    # on_start. An unlocked `if cls.airports is None` check therefore races: a
+    # measured 10-user run ran the setup queries 5 times, because each greenlet
+    # yielded inside session.run() before any of them had assigned the result.
+    # Same double-checked pattern as flight_search.get_driver().
+    _setup_lock = threading.Lock()
+
+    @classmethod
+    def _prepare(cls):
+        if cls.airports is not None:
+            return
+        with cls._setup_lock:
+            if cls.airports is not None:
+                return
+            cls._load_universe()
+
+    @classmethod
+    def _load_universe(cls):
+        driver = flight_search.get_driver()
+        database = flight_search.get_database()
+
+        dates = flight_search.searchable_dates(driver, database)
+        if not dates:
+            raise RuntimeError(
+                "No dates have CONNECTS_TO edges, so every search would return "
+                "empty instantly and measure nothing. Run:\n"
+                "  python load_bts_data.py --solve-offsets YYYY-MM-DD\n"
+                "  python load_bts_data.py --build-connections YYYY-MM-DD"
+            )
+
+        # Sample airports from a date that is actually searchable, so volume rank
+        # reflects the day being queried.
+        airports = _busiest_origins(driver, database, dates[0])
+        if len(airports) < 2:
+            raise RuntimeError(
+                f"Only {len(airports)} airports found — load data first: "
+                "python load_bts_data.py"
+            )
+
+        # Assigned last, and `airports` last of the two: it is the sentinel
+        # _prepare() checks, so setting it before validation would cache a
+        # rejected universe and let later users skip the error entirely.
+        cls.dates = dates
+        cls.airports = airports
+        print(
+            f"✅ {len(airports)} origins by volume, "
+            f"{len(dates)} searchable dates ({dates[0]}…{dates[-1]})"
+        )
 
     def on_start(self):
-        """Initialize Neo4j connection and load test data"""
-        load_dotenv()
+        self._prepare()
 
-        # Connect to Neo4j
-        self.driver = GraphDatabase.driver(
-            os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-            auth=(
-                os.getenv("NEO4J_USERNAME", "neo4j"),
-                os.getenv("NEO4J_PASSWORD", "password"),
-            ),
-        )
-        self.database = os.getenv("NEO4J_DATABASE", "neo4j")
+    def _route(self):
+        """A random real origin/destination pair. `random` selects among values
+        read out of the database; it never invents one (CLAUDE.md rule 1)."""
+        origin, dest = random.sample(self.airports, 2)  # nosec B311
+        return origin, dest, random.choice(self.dates)  # nosec B311
 
-        # Load available airports dynamically from database
-        self.airports = self._load_airports()
-        if len(self.airports) < 2:
-            raise Exception(
-                "Need at least 2 airports in database. "
-                "Run data loading first: python load_bts_data.py"
-            )
-
-        # Load available dates dynamically from database
-        self.dates = self._load_dates()
-        if not self.dates:
-            raise Exception(
-                "No flight dates found in database. "
-                "Ensure Schedule nodes have flightdate property."
-            )
-
-        print(f"✅ Loaded {len(self.airports)} airports, {len(self.dates)} dates")
-
-    def _load_airports(self) -> List[str]:
-        """Load airport codes from database dynamically"""
-        query = (
-            "MATCH (a:Airport) WHERE a.code IS NOT NULL "
-            "RETURN DISTINCT a.code ORDER BY a.code"
-        )
-
-        with self.driver.session(database=self.database) as session:
-            result = session.run(query)
-            airports = [record["a.code"] for record in result]
-
-        return (
-            airports[:100] if len(airports) > 100 else airports
-        )  # Limit for performance
-
-    def _load_dates(self) -> List[str]:
-        """Load available flight dates from database"""
-        query = """
-        MATCH (s:Schedule)
-        WHERE s.flightdate IS NOT NULL
-        RETURN DISTINCT s.flightdate
-        ORDER BY s.flightdate
-        """
-
-        with self.driver.session(database=self.database) as session:
-            result = session.run(query)
-            dates = [record["s.flightdate"].isoformat() for record in result]
-
-        if not dates:
-            # If no dates found, this indicates a serious data problem
-            raise Exception(
-                "No flight dates found. Check that Schedule nodes have flightdate property."
-            )
-
-        return dates
-
-    def generate_random_route(self) -> Tuple[str, str]:
-        """Generate random origin/destination pair"""
-        origin = random.choice(self.airports)  # nosec B311
-        dest = random.choice(self.airports)  # nosec B311
-
-        # Ensure different airports
-        while dest == origin:
-            dest = random.choice(self.airports)  # nosec B311
-
-        return origin, dest
-
-    def neo4j_request(
-        self, name: str, query: str, params: Dict[str, Any]
-    ) -> List[Dict]:
-        """Execute Neo4j query with Locust performance tracking"""
-        start_time = time.time()
-
+    def _timed(self, name, call):
+        """Run `call`, reporting wall clock and result count to Locust."""
+        started = time.perf_counter()
         try:
-            with self.driver.session(database=self.database) as session:
-                result = session.run(query, params)
-                records = list(result)
-
-            # Record success
-            total_time = int((time.time() - start_time) * 1000)
+            results = call()
+        except Exception as exc:
             self.environment.events.request.fire(
                 request_type="Neo4j",
                 name=name,
-                response_time=total_time,
-                response_length=len(records),
-            )
-
-            return [dict(record) for record in records]
-
-        except Exception as e:
-            # Record failure
-            total_time = int((time.time() - start_time) * 1000)
-            self.environment.events.request.fire(
-                request_type="Neo4j",
-                name=name,
-                response_time=total_time,
+                response_time=int((time.perf_counter() - started) * 1000),
                 response_length=0,
-                exception=e,
+                exception=exc,
             )
             return []
+        self.environment.events.request.fire(
+            request_type="Neo4j",
+            name=name,
+            response_time=int((time.perf_counter() - started) * 1000),
+            response_length=len(results),
+        )
+        return results
 
-    @task(70)  # 70% direct flight searches
-    def direct_flight_search(self):
-        """
-        Simple direct flight count query - most common search pattern.
-        Fast query that mimics "Are there direct flights?" checks.
-        """
-        origin, dest = self.generate_random_route()
-        search_date = random.choice(self.dates)  # nosec B311
-
-        query = """
-        MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
-        WHERE s.flightdate = date($search_date)
-          AND s.scheduled_departure_time IS NOT NULL
-          AND s.scheduled_arrival_time IS NOT NULL
-        RETURN count(s) as flight_count
-        """
-
-        result = self.neo4j_request(
-            f"Direct Flight Search ({origin}→{dest})",
-            query,
-            {"origin": origin, "dest": dest, "search_date": search_date},
+    @task(70)
+    def nonstop_lookup(self):
+        """ "Is there a nonstop?" — the cheapest and commonest search."""
+        origin, dest, date = self._route()
+        self._timed(
+            NONSTOP_TASK,
+            lambda: flight_search.search_itineraries(
+                origin, dest, date, max_stops=0, limit=10
+            ),
         )
 
-        # More realistic output
-        count = result[0]["flight_count"] if result else 0
-        if count > 0:
-            print(f"✈️  Direct {origin}→{dest}: {count} flights available")
-        else:
-            print(f"❌ Direct {origin}→{dest}: No direct flights")
-
-    @task(30)  # 30% flexible routing search - dynamic multi-hop
-    def flexible_routing_search(self):
-        """
-        FLEXIBLE ROUTING: Finds paths of ANY length without hardcoding hop counts.
-        Uses iterative deepening - starts with direct flights, then 1-stop, 2-stop, etc.
-        Handles cross-day flights and temporal sequencing throughout entire journey.
-
-        This is the breakthrough approach that replaces hardcoded UNION ALL queries!
-        """
-        origin, dest = self.generate_random_route()
-        search_date = random.choice(self.dates)  # nosec B311
-
-        total_routes = 0
-        route_details = []
-
-        # Step 1: Try direct flights first (most efficient)
-        direct_results = self._find_direct_flights(origin, dest, search_date)
-        if direct_results:
-            total_routes += len(direct_results)
-            route_details.append(f"{len(direct_results)} direct")
-
-        # Step 2: If we need more results, try 1-stop connections
-        if total_routes < 5:  # Need more results - continue searching
-            connection_results = self._find_one_stop_connections(
-                origin, dest, search_date
-            )
-            if connection_results:
-                total_routes += len(connection_results)
-                route_details.append(f"{len(connection_results)} 1-stop")
-
-        # Step 3: Could extend to 2-stop, 3-stop... as needed
-        # This is the key insight - algorithm continues dynamically!
-        # No hardcoded UNION of 0-hop, 1-hop, 2-hop queries
-
-        # Display results
-        if total_routes > 0:
-            details = ", ".join(route_details)
-            print(f"🛫 {origin}→{dest}: {total_routes} routes ({details})")
-        else:
-            print(f"❌ {origin}→{dest}: No routes found")
-
-    def _find_direct_flights(
-        self, origin: str, dest: str, search_date: str
-    ) -> List[Dict]:
-        """Find direct flights with cross-day handling."""
-        query = """
-        MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
-        WHERE s.flightdate = date($search_date)
-          AND s.scheduled_departure_time IS NOT NULL
-          AND s.scheduled_arrival_time IS NOT NULL
-
-        WITH s,
-             CASE
-                 WHEN s.scheduled_departure_time <= s.scheduled_arrival_time THEN
-                     duration.between(s.scheduled_departure_time, s.scheduled_arrival_time).minutes
-                 ELSE
-                     // Cross-day flight handling (red-eye flights)
-                     duration.between(s.scheduled_departure_time, time('23:59')).minutes + 1 +
-                     duration.between(time('00:00'), s.scheduled_arrival_time).minutes
-             END AS flight_duration
-
-        WHERE flight_duration > 0 AND flight_duration < 1440
-
-        RETURN s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
-               s.scheduled_departure_time AS departure,
-               flight_duration AS duration_minutes
-        ORDER BY departure
-        LIMIT 10
-        """
-
-        return self.neo4j_request(
-            f"Direct Flights ({origin}→{dest})",
-            query,
-            {"origin": origin, "dest": dest, "search_date": search_date},
+    @task(30)
+    def itinerary_search(self):
+        """Full search across all depths at once, ranked by total journey."""
+        origin, dest, date = self._route()
+        self._timed(
+            SEARCH_TASK,
+            lambda: flight_search.search_itineraries(
+                origin, dest, date, max_stops=MAX_STOPS, limit=20
+            ),
         )
-
-    def _find_one_stop_connections(
-        self, origin: str, dest: str, search_date: str
-    ) -> List[Dict]:
-        """Find 1-stop connections with proper temporal sequencing."""
-        query = """
-        MATCH (origin:Airport {code: $origin})<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
-              <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(dest:Airport {code: $dest})
-        WHERE s1.flightdate = date($search_date)
-          AND s2.flightdate IN [date($search_date), date($search_date) + duration('P1D')]
-          AND s1.scheduled_arrival_time IS NOT NULL
-          AND s2.scheduled_departure_time IS NOT NULL
-          AND hub.code <> $origin AND hub.code <> $dest
-          // CRITICAL: Temporal sequencing - can't depart before arriving
-          AND s1.scheduled_arrival_time <= s2.scheduled_departure_time
-
-        WITH s1, s2, hub,
-             CASE
-                 WHEN s1.flightdate = s2.flightdate THEN
-                     duration.between(s1.scheduled_arrival_time, s2.scheduled_departure_time).minutes
-                 ELSE
-                     // Overnight connection handling
-                     duration.between(s1.scheduled_arrival_time, time('23:59')).minutes + 1 +
-                     duration.between(time('00:00'), s2.scheduled_departure_time).minutes
-             END AS connection_time
-
-        WHERE connection_time >= 45 AND connection_time <= 720  // 45min - 12hr layover
-
-        RETURN s1.reporting_airline + toString(s1.flight_number_reporting_airline) AS flight1,
-               s2.reporting_airline + toString(s2.flight_number_reporting_airline) AS flight2,
-               hub.code AS via_hub,
-               s1.scheduled_departure_time AS departure,
-               connection_time AS layover_minutes
-        ORDER BY departure
-        LIMIT 10
-        """
-
-        return self.neo4j_request(
-            f"1-Stop Connections ({origin}→{dest})",
-            query,
-            {"origin": origin, "dest": dest, "search_date": search_date},
-        )
-
-    def on_stop(self):
-        """Clean up connection"""
-        if hasattr(self, "driver"):
-            self.driver.close()
 
 
 if __name__ == "__main__":
-    print("🚀 NEO4J FLEXIBLE ROUTING LOAD TEST")
-    print("===================================")
-    print("🎯 BREAKTHROUGH: Dynamic multi-hop routing without hardcoded hop counts!")
-    print("")
-    print("📊 Load test distribution:")
-    print("   • 70% Direct flights (fast count queries)")
-    print(
-        "   • 30% Flexible routing (iterative deepening: direct → 1-stop → 2-stop...)"
-    )
-    print("")
-    print("✨ Key Innovation:")
-    print("   • NO hardcoded UNION of 0-hop, 1-hop, 2-hop queries")
-    print("   • Finds paths of ANY length dynamically")
-    print("   • Proper temporal sequencing throughout entire journey")
-    print("   • Stops when enough good results found")
-    print("")
-    print("🎯 Dynamic airport + date selection from actual database")
-    print("✅ Cross-day flight handling (red-eye flights)")
-    print("⚡ Performance optimized with bounded queries")
-    print("")
-    print("▶️  Start: locust -f neo4j_flight_load_test.py")
+    print(__doc__)

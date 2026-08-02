@@ -136,6 +136,39 @@ NEO4J_DATABASE=flights      # use "neo4j" on Aura or Community Edition
 
 Every script reads these via `load_dotenv()`; nothing is hard-coded.
 
+<details>
+<summary><strong>Connection not working?</strong></summary>
+
+```bash
+python -c "
+import os
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+load_dotenv(override=True)
+GraphDatabase.driver(
+    os.getenv('NEO4J_URI'),
+    auth=(os.getenv('NEO4J_USERNAME'), os.getenv('NEO4J_PASSWORD')),
+).verify_connectivity()
+print('✅ Connected')
+"
+```
+
+`override=True` matters: without it an exported `NEO4J_PASSWORD` left over from
+another project beats the one in `.env`, and the loader then authenticates
+against the wrong database. That is the most common cause of a "successful" run
+that loads nothing.
+
+If you are using a database other than `neo4j`, create it first — the loader does
+not create databases:
+
+```cypher
+CREATE DATABASE flights IF NOT EXISTS;   // run against the `system` database
+```
+
+Setup and loader logs are in `logs/` (gitignored): `tail -f logs/setup_*.log`.
+
+</details>
+
 ### 3. Download Flight Data
 
 ```bash
@@ -268,16 +301,24 @@ Direct, 1-stop, or 2-stop itineraries from **one query with one number to change
 query until you build the edges. Pass every date you intend to search:
 
 ```bash
+# Offsets first — the layover arithmetic reads the UTC properties this writes.
+python load_bts_data.py --solve-offsets 2025-07-18
 python load_bts_data.py --build-connections 2025-07-18
-python load_bts_data.py --build-connections 2025-07-14 2025-07-15 2025-07-16   # several at once
+
+# Several at once, same ordering:
+python load_bts_data.py --solve-offsets 2025-07-14 2025-07-15 2025-07-16
+python load_bts_data.py --build-connections 2025-07-14 2025-07-15 2025-07-16
 ```
 
 That materialises `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for
 every bookable connection — same carrier or its wholly-owned regional affiliate,
-45-300 minute layover, no backtracking, no overnight inbound leg. Measured over
-2025-07-14…20: **514K-625K edges per day** (mean 577K; the spread is real weekday
-/ weekend schedule variation, lowest on Saturday the 19th), ~7s per date,
+45-300 minute layover measured in **UTC**, no backtracking. Measured over
+2025-07-14…20: **512K-624K edges per day** (mean 575K; the spread is real weekday
+/ weekend schedule variation, lowest on Saturday the 19th), ~9s per date,
 idempotent.
+
+`--build-connections` raises if a date has flights but no UTC timestamps, rather
+than writing zero edges and reporting success.
 
 Scoping is deliberate. A full year would be ~211M edges — roughly 10x the rest of
 the graph — and a date-specific search never touches them. But it does mean the
@@ -318,16 +359,26 @@ search by departure time, or filter on the last leg's arrival for a deadline —
 both forms, with their traps, are in the reference doc.
 
 **Latency, across 40 origin/destination pairs drawn from the graph's 60 busiest
-origins** — top-20 sorted, acyclicity guard on, warm cache:
+origins** — top-20 sorted, acyclicity guard on, warm cache. **A departure-time
+filter dominates the cost, so both cases are given**; quoting one without saying
+which is how a 36 ms claim ends up next to a 400 ms reality:
 
-| depth | p50 | p95 | max | over 200 ms |
-|---|---|---|---|---|
-| `{0,2}` | **36 ms** | **56 ms** | 124 ms | **0 / 40** |
-| `{0,3}` | **114 ms** | **218 ms** | 279 ms | **5 / 40** |
+| depth | filter | p50 | p95 | max | over 200 ms |
+|---|---|---|---|---|---|
+| `{0,2}` | `depart_after 08:00` | **35 ms** | **64 ms** | 67 ms | **0 / 40** |
+| `{0,2}` | none (whole day) | **85 ms** | **175 ms** | 199 ms | **0 / 40** |
+| `{0,3}` | `depart_after 08:00` | 116 ms | 243 ms | 267 ms | 5 / 40 |
+| `{0,3}` | none (whole day) | 395 ms | 595 ms | 624 ms | **34 / 40** |
 
-Two stops holds a 200 ms budget comfortably; three stops misses on ~12% of pairs,
-worst on dense hub-to-hub routes (LGA→DFW enumerates 11,488 itineraries to return
-20). Serve `{0,2}` by default and widen on demand.
+Two stops holds a 200 ms budget either way. Three stops misses on ~12% of pairs
+with a morning filter and on **85%** without one, worst on dense hub-to-hub routes
+(LGA→DFW enumerates 11,488 itineraries to return 20). Serve `{0,2}` by default and
+widen on demand.
+
+Measured against the full-year graph (6,898,743 `Schedule` nodes; the searched date
+carries 623,508 `CONNECTS_TO` edges, matching the CI fixture), stable across three
+runs, and repeat-warm rather than first-hit — a fully warmed `{0,3}` LGA→DFW still
+costs ~440 ms, so this is expansion work, not a cold page cache.
 
 At 1-stop the QPP matches a hand-written explicit join exactly — same 135
 itineraries for LGA→DFW, same latency. Beyond 1-stop there is no join to compare
@@ -350,10 +401,29 @@ supernode with no date property: reaching a hub forces the next hop to bind
 that juncture and puts the connection rules in the edge, so no query can
 accidentally splice two unrelated carriers into an unsellable itinerary.
 
-**What this does *not* model.** No price, no seat availability, no per-airport
-minimum connection time (a flat 45-300 minutes stands in), and no interline
-between unrelated carriers. It answers "is this flyable as scheduled", not "is
-this purchasable".
+### What this does *not* model
+
+Three limits, stated plainly because each one is a question the graph cannot
+answer and no amount of query work changes that.
+
+- **Routing covers only the dates you build, currently 7 of 365.** The loaded
+  graph holds a full year of `Schedule` nodes, but `CONNECTS_TO` exists for
+  **2025-07-14 … 2025-07-20** and nothing else. Itinerary search on any other date
+  returns zero results, correctly and silently. Build more with `--solve-offsets`
+  then `--build-connections`; a full year would be ~211M edges, ~10x the rest of
+  the graph. `GET /dates` reports what is actually available.
+- **No price, no seat availability, no booking class, no per-airport minimum
+  connection time** (a flat 45-300 minutes stands in for all of them). It answers
+  "is this flyable as scheduled", not "is this purchasable".
+- **8.64% of edges splice regional flights whose marketing carrier is unknowable
+  from BTS.** 348,000 of 4,028,572 are `OO`→`OO` (SkyWest, 283,368) or `YX`→`YX`
+  (Republic, 64,632). Both fly for several mainlines under different brands, and
+  BTS On-Time Performance publishes only the *operating* carrier — so an `OO` leg
+  sold as Delta Connection connecting to an `OO` leg sold as United Express passes
+  the carrier check and is still unsellable. That is a **source** limitation, not a
+  modelling one: it needs a feed with marketing carriers (OAG, ATPCO, a GDS).
+  Wholly-owned regionals with exactly one parent (`MQ`, `OH`, …) *are* resolved —
+  see `CARRIER_FAMILY`.
 
 > 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the
 > depart-after and arrive-before queries in full, the two silent traps in any
@@ -361,9 +431,75 @@ this purchasable".
 > edges were validated against published airline route data, and why moving
 > predicates inside the quantifier does *not* fix the supernode problem.
 >
-> The shipped load test (`neo4j_flight_load_test.py`) still uses an older
-> formulation with the flawed duration idiom and no carrier predicate; migrating
-> it is an open task.
+> The load test (`neo4j_flight_load_test.py`) drives `flight_search.py` rather
+> than its own Cypher, so the query above is what gets benchmarked. The older
+> formulation with the flawed duration idiom is gone.
+
+## 🔎 Itinerary search as a service
+
+The query above, behind a callable interface and an HTTP endpoint. `flight_search.py`
+is the only place the Cypher lives — `api.py` adds HTTP, and nothing else keeps a
+copy, so a fix lands once.
+
+```python
+from flight_search import search_itineraries
+
+for it in search_itineraries("LGA", "BOI", "2025-07-18", depart_after="09:00"):
+    print(it.flights, it.route, it.total_minutes)
+# ['WN3613', 'WN1379'] ['LGA', 'DEN', 'BOI'] 430
+```
+
+```bash
+uvicorn api:app --port 8000
+curl 'localhost:8000/itineraries?origin=LGA&dest=BOI&date=2025-07-18&depart_after=09:00&limit=5'
+```
+
+| endpoint | |
+|---|---|
+| `GET /itineraries` | search — `origin`, `dest`, `date`, optional `depart_after`, `arrive_before`, `max_stops` (≤3), `min_stops`, `limit` (≤100) |
+| `GET /dates` | the dates search actually works on, i.e. those with `CONNECTS_TO` edges |
+| `GET /health` | 503 unless the graph is reachable **and** has routing edges |
+| `GET /docs` | OpenAPI, generated |
+
+Results are ranked by **total elapsed journey** — real BTS block time plus real
+layover minutes, never a difference of the two local timestamps. Each itinerary
+carries both frames: `departs`/`arrives` as local wall clock at their own airport,
+`departs_utc`/`arrives_utc` as the absolute instants.
+
+Four design decisions worth the words, each measured rather than assumed:
+
+- **One query, not iterative deepening.** Deepening (direct first, 1-stop only if
+  short of `limit`) was implemented and measured against the single `{0,2}` pass
+  over the same 40 pairs. With `depart_after=08:00` it wins the median and loses
+  the tail catastrophically — p50 26 ms but p95 **1,323** ms, against 39 ms / **63**
+  ms for the single pass; over a whole day, p50 103 ms / p95 249 ms against
+  96 ms / 204 ms. A route needing depth pays for the shallow queries *and* the deep
+  one, and the deep query is no cheaper for having run them. Tail latency is what a
+  serving budget is written against. Deepening also forfeits global ranking, since a
+  1-stop that beats every nonstop is unreachable once the nonstops fill `limit`;
+  nonstops still sort first in the single pass wherever they exist.
+- **`max_stops` defaults to 2 and is capped at 3.** `{0,3}` costs p95 595 ms
+  against 175 ms unfiltered and exceeds 200 ms on 34 of 40 pairs, so leaving it
+  unbounded would let one request degrade the service for everyone.
+- **One pooled driver per process**, opened at startup via FastAPI's `lifespan`, so
+  no request pays for connection or TLS setup and a bad `NEO4J_URI` fails at boot
+  instead of looking like a slow search. Pool size is `NEO4J_POOL_SIZE`
+  (default 50).
+- **An empty result reports whether the date was even built.** "No same-carrier
+  routing on this pair" and "nobody ran `--build-connections` for this date" are
+  both an empty list, so a zero-result response also carries
+  `date_is_searchable`. `/health` exists for the same reason — a static
+  `{"ok": true}` would hide a healthy service in front of an empty database.
+
+Bad input is 400 (or 422 from FastAPI's own bounds); an unreachable graph is 503.
+Getting those backwards is how a dashboard ends up blaming the wrong component.
+
+Tested from both sides: `tests/test_flight_search_service_unit.py` asserts the
+rendered Cypher and the status mapping with no database, and
+`tests/test_flight_search_integration.py` asserts results against the real loaded
+fixture. Both are in CI. The split is deliberate — a dropped acyclicity guard or a
+`localdatetime`/`datetime` slip produces *plausible wrong answers*, so one side
+checks the query text and the other checks real flights.
 
 ## 🏗️ Architecture
 
@@ -416,7 +552,9 @@ enforced by the `schedule_composite_unique` constraint. Minting a synthetic
 |---|---|---|
 | `flightdate` | `Date` | |
 | `scheduled_departure_time` | `LocalDateTime` | local wall-clock **at the origin** |
-| `scheduled_arrival_time` | `LocalDateTime` | local wall-clock **at the destination** |
+| `scheduled_arrival_time` | `LocalDateTime` | local wall-clock **at the destination**, on the destination's calendar day |
+| `scheduled_departure_utc` | `LocalDateTime` | the same instant in UTC — written by `--solve-offsets` |
+| `scheduled_arrival_utc` | `LocalDateTime` | the same instant in UTC — **compare across airports with these** |
 | `scheduled_duration_minutes` | `Integer` | BTS scheduled block time — **use this for duration** |
 | `actual_duration_minutes` | `Integer` | BTS actual elapsed time |
 | `origin`, `dest` | `String` | IATA codes (also reachable via relationships) |
@@ -425,14 +563,19 @@ enforced by the `schedule_composite_unique` constraint. Minting a synthetic
 
 Property names are BTS CSV column names, lowercased with spaces → underscores.
 
-> ⚠️ **Never compute a flight duration as arrival − departure.** The two
-> timestamps are local to *different* airports, so their difference is wrong
-> for every flight that crosses a timezone — roughly half the dataset. Use
-> `scheduled_duration_minutes`, which is BTS's own reported block time and is
-> both timezone- and DST-independent.
+> ⚠️ **There are two time frames, and mixing them is the one way to get a wrong
+> answer.** Subtracting the *local* pair (`scheduled_arrival_time −
+> scheduled_departure_time`) is wrong for every flight that crosses a timezone —
+> roughly half the dataset — because the two clocks belong to different airports.
+> Subtract the **UTC** pair instead, or just read `scheduled_duration_minutes`
+> (BTS's own block time, timezone- and DST-independent). Both agree exactly:
+> verified on all 21,376 flights of the CI fixture.
 >
-> Layover arithmetic at a connecting hub *is* sound, because both timestamps
-> there are local to the same airport.
+> Use the local pair only for questions a passenger asks in local terms —
+> "departs after 09:00", "arrives before 15:00". Those are sound, including for
+> red-eyes: `--solve-offsets` stamps each arrival on the **destination's**
+> calendar day, so no overnight guard is needed. Layovers at a hub are sound in
+> either frame, since both clocks there belong to the same airport.
 
 ## 🧪 Testing
 
@@ -450,10 +593,28 @@ These read the date under test out of the graph (`search_date` in
 `tests/conftest.py`) rather than hard-coding one, so they pass against any loaded
 year and skip cleanly when the database is empty or unreachable.
 
-Not all test files in `tests/` currently pass: `test_performance.py` and parts of
-`test_integration_heavy.py` query property names from an earlier version of the
-schema. Neither is in the CI gate; `.github/workflows/ci.yml` defines the gate
-that matters.
+**Every test file in `tests/` is now in one of the two gates**, and the two that
+were not have been deleted rather than carried as known-failing. `test_performance.py`
+asserted a wall-clock bound on queries matching nothing — 6.9M `Schedule` nodes
+loaded, **0** carrying the `date_of_operation` property it filtered on, and every
+result assertion was `count >= 0`, which cannot fail. `test_performance_baseline.py`
+had the same `>= 0` problem plus millisecond thresholds, which say nothing on a
+shared CI runner.
+
+**Being in a gate is not the same as gating something.** `test_integration_heavy.py`
+was in the integration gate the whole time, and 5 of its 6 tests queried 2024
+dates or European ICAO codes (`EGLL`, `LFPG`, `EHAM`, …, **0 of 8 present**)
+against a 2025 US-domestic graph. Each returned zero rows and each asserted
+`>= 0`, so they passed *because* they matched nothing. Removed, with the one
+repaired test kept, an anti-vacuity companion that asserts ATL/DFW/ORD really are
+loaded, and a check that fails if `assert … >= 0` ever comes back to that file.
+
+What replaced them is `tests/test_query_plan.py`, which gates the part of
+performance that *is* deterministic: the query plan. It asserts the search starts
+from an index seek rather than a `NodeByLabelScan`, and that `ORDER BY … LIMIT`
+plans as `Top` (bounded heap) rather than `Sort` (buffers all 11,488 LGA→DFW
+paths). `EXPLAIN` only compiles, so these hold at any graph size — including a
+one-day fixture, where a latency threshold would never notice a label scan.
 
 ## 🚀 Load Testing
 
@@ -469,35 +630,51 @@ locust -f neo4j_flight_load_test.py \
        --users 50 --spawn-rate 5 --run-time 300s --headless
 ```
 
-Each simulated user picks a random origin, destination, and date from values read
-out of your database, then runs one of two tasks:
+It drives **the same code path the service serves** —
+`flight_search.search_itineraries()` — rather than a private copy of the Cypher.
+Each simulated user picks a random origin, destination, and searchable date from
+values read out of your database, then runs one of two tasks:
 
-| Weight | Task |
-|---|---|
-| 70% | Count direct flights on a route and date |
-| 30% | Search 1-stop connections through a hub |
+| Weight | Locust stat name | Task |
+|---|---|---|
+| 70% | `nonstop lookup` | Nonstop itineraries on a route and date (`max_stops=0`) |
+| 30% | `itinerary search {0,2}` | Full search across 0-2 stops, ranked |
 
-### ⚠️ Read before trusting the numbers
+```bash
+python quick_load_test_analysis.py locust_stats.csv   # after a --csv run
+```
 
-This harness measures *something*, but it is not a realistic traffic model, and
-it has known sampling defects:
+### What it does and does not tell you
 
-- **`_load_airports()` samples the wrong airports.** It orders airports
-  lexicographically and takes the first 100, giving a universe of ABE…ELM. That
-  excludes most major hubs — ORD, LAX, JFK, LGA, SFO, EWR, MIA, SEA, PHX, LAS,
-  ATL and more cannot be sampled at all. Most randomly-drawn routes therefore
-  have no flights, and the majority of the 70%-weighted task returns zero rows.
-- **Per-route stats names.** Each airport pair is passed as Locust's request
-  `name`, so percentiles are computed over 1-2 samples per entry rather than
-  aggregated. `quick_load_test_analysis.py` does not match these names and labels
-  everything "Other".
-- **One driver per simulated user**, so results include driver and connection
-  setup, not pure query time.
-- **The routing task uses the arrival-minus-departure duration idiom**, which is
-  affected by the timezone issue described under *Architecture*.
+Sound, and previously not:
 
-Fixing these is a good first contribution. Until then, treat any figure it
-produces as a relative smoke test rather than a benchmark.
+- **Airports are sampled by flight volume** (the 60 busiest origins on a
+  searchable date), not lexicographically. The old `ORDER BY a.code` then `[:100]`
+  gave a universe of ABE…ELM that excluded ORD, LAX, JFK, LGA, SFO, EWR and most
+  other hubs, so ~95% of the weighted task returned zero rows — it was
+  benchmarking empty results.
+- **Dates come from `CONNECTS_TO` coverage**, so a sampled date is always
+  searchable. Searching an unbuilt date returns empty instantly, which is fast and
+  meaningless.
+- **One pooled driver for the whole process**, so driver and TLS setup are not
+  inside every measurement.
+- **Constant stat names**, so percentiles aggregate over all samples. Per-pair
+  names produced up to 29,700 single-sample rows — a "p95" over one observation.
+- **No duplicated query logic**, so the harness cannot drift from what the service
+  runs. It previously carried the broken `CASE` duration idiom (1439 minutes for a
+  59-minute flight) that the service never used. Gated by
+  `test_load_test_holds_no_cypher_of_its_own`.
+
+Still true, and worth stating:
+
+- **Throughput is not a capacity number.** It is bounded by `--users` and the
+  1-3s think time, not by the graph: 8 users cannot exceed ~4 req/s however fast
+  Neo4j answers. Read the response-time percentiles; raise `--users` until they
+  degrade if you want to find a ceiling. `quick_load_test_analysis.py` no longer
+  grades this, because grading it blamed the database for the load generator's
+  configuration.
+- **Uniform random route selection is not a real traffic model.** Real demand is
+  heavily concentrated; this samples hub pairs roughly evenly.
 
 > 📖 See `LOAD_TESTING_GUIDE.md` for more detail (note it describes some options
 > that are not implemented).
