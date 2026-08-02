@@ -31,52 +31,115 @@ class TestFileFormatIntegration:
     """Test file format compatibility between download and load phases"""
 
     def test_parquet_schema_compatibility(self):
-        """Test that download creates Parquet files that load can read"""
-        # Test the essential schema elements that both modules expect
-        expected_columns = [
-            "flightdate",
-            "reporting_airline",
-            "flight_number_reporting_airline",
-            "origin",
-            "dest",
-            "crs_dep_time",
-            "crs_arr_time",
-            "cancelled",
-            "distance",
-        ]
+        """The real fixture carries the columns and dtypes the loader expects.
 
-        # Create a sample dataframe matching BTS structure
-        sample_data = {
-            "flightdate": ["2024-03-01", "2024-03-01", "2024-03-01"],
-            "reporting_airline": ["AA", "UA", "DL"],
-            "flight_number_reporting_airline": ["100", "200", "300"],
-            "origin": ["LAX", "ORD", "ATL"],
-            "dest": ["JFK", "SFO", "MIA"],
-            "crs_dep_time": ["1430", "0800", "1600"],
-            "crs_arr_time": ["2300", "1200", "2100"],
-            "cancelled": [0, 0, 1],
-            "distance": [2475.0, 1846.0, 594.0],
+        This asserts against tests/fixtures/bts_flights_2025_07_18.parquet --
+        a file the download stage actually produced -- not against a DataFrame
+        built inside the test. The previous version did the latter, and so
+        could only ever confirm that pandas had honoured the literals on the
+        line above; it named `crs_dep_time`/`crs_arr_time`, which do not exist
+        in BTS data (the columns are `crsdeptime`/`crsarrtime`), and asserted
+        `flightdate` was `object` when download_bts_flight_data.py declares it
+        `datetime64[us]`. Both mistakes were invisible because the fabricated
+        frame was the only thing under test.
+
+        Kept DB-free deliberately: this is the download/load *file format*
+        contract, which is checkable from the Parquet file alone.
+        """
+        fixture = Path(__file__).parent / "fixtures" / "bts_flights_2025_07_18.parquet"
+        assert fixture.exists(), f"fixture missing: {fixture}"
+
+        # The five composite-key fields (schedule_composite_unique) plus the
+        # columns load_bts_data.py builds the four timestamps and filters from.
+        # Names are BTS's own, lowercased -- crsdeptime, not crs_dep_time.
+        required = {
+            "flightdate": "datetime64[us]",
+            "reporting_airline": "string",
+            "flight_number_reporting_airline": "int64",
+            "origin": "string",
+            "dest": "string",
+            "crsdeptime": "datetime64[us]",
+            "crsarrtime": "datetime64[us]",
+            "crselapsedtime": "Float64",
+            "cancelled": "Float64",
+            "distance": "Float64",
         }
 
-        df = pd.DataFrame(sample_data)
-
-        # Test that all expected columns are present
-        for col in expected_columns:
-            assert col in df.columns, f"Required column {col} missing from schema"
-
-        # Test data types compatibility
-        assert df["flightdate"].dtype == "object", "Flight date should be string type"
+        df = pd.read_parquet(fixture, columns=list(required))
+        # 21,495 rows as published; load_bts_data.py's `cancelled == 0` filter
+        # is what reduces this to the 21,376 Schedule nodes ci_verify_loaded.py
+        # counts. Both numbers are asserted so a resliced fixture cannot
+        # quietly change either one.
         assert (
-            df["reporting_airline"].dtype == "object"
-        ), "Airline should be string type"
-        assert df["cancelled"].dtype in [
-            "int64",
-            "object",
-        ], "Cancelled should be numeric or object"
-        assert df["distance"].dtype in [
-            "float64",
-            "object",
-        ], "Distance should be numeric or object"
+            len(df) == 21495
+        ), f"fixture should hold 21,495 published BTS rows, got {len(df)}"
+        assert (
+            int((df["cancelled"] == 0).sum()) == 21376
+        ), "21,376 rows should survive the loader's cancelled == 0 filter"
+
+        for col, expected_dtype in required.items():
+            assert str(df[col].dtype) == expected_dtype, (
+                f"{col} should read as {expected_dtype}, got {df[col].dtype}. "
+                "download_bts_flight_data.py's BTS_COLUMN_TYPES is authoritative; "
+                "a drift here is what the three-tier read fallback in "
+                "load_bts_data.py exists to survive."
+            )
+
+        # Every declared column must agree with what the file really holds --
+        # BTS's monthly CSVs are not dtype-stable, which is the whole reason
+        # BTS_COLUMN_TYPES and the PyArrow schema exist.
+        if download_bts_flight_data is not None:
+            declared = download_bts_flight_data.BTS_COLUMN_TYPES
+            for col, expected_dtype in required.items():
+                assert declared.get(col) == expected_dtype, (
+                    f"BTS_COLUMN_TYPES declares {col} as {declared.get(col)}, "
+                    f"but the written fixture reads back as {expected_dtype}"
+                )
+
+    def test_parquet_timestamps_are_not_utc_adjusted(self):
+        """BTS times are local wall clock, and the Parquet must say so.
+
+        `isAdjustedToUTC=false` is what makes TimestampNTZType the *correct*
+        reading of these columns rather than merely a configured one, so it is
+        the file-format half of the guarantee that
+        test_timezone_semantics_are_pinned_not_inherited covers on the Spark
+        side. If a future writer emits `isAdjustedToUTC=true`, Spark reads the
+        columns as instants and bakes the loader machine's offset into
+        `flightdate` -- one of the five composite-key fields -- relocating the
+        entire day. See the matrix in create_spark_session().
+        """
+        import pyarrow.parquet as pq
+
+        fixture = Path(__file__).parent / "fixtures" / "bts_flights_2025_07_18.parquet"
+        parquet_file = pq.ParquetFile(fixture)
+
+        for col in ("flightdate", "crsdeptime", "crsarrtime"):
+            # A tz-naive Arrow timestamp is precisely Parquet's
+            # isAdjustedToUTC=false; a tz-aware one would carry the offset that
+            # must never be baked in. Asserted via schema_arrow rather than
+            # ParquetLogicalType, whose only public attributes are `type` and
+            # `to_json` -- the isAdjustedToUTC flag is reachable there only by
+            # parsing repr(), which is not an API.
+            field = parquet_file.schema_arrow.field(col)
+            assert field.type.tz is None, (
+                f"{col} is written tz-aware ({field.type.tz}), i.e. Parquet "
+                "isAdjustedToUTC=true. BTS publishes local wall-clock times, "
+                "so this must stay naive or Spark reads them as instants and "
+                "shifts the whole day."
+            )
+            # Spark cannot read nanosecond Parquet timestamps.
+            assert (
+                field.type.unit == "us"
+            ), f"{col} must be microsecond-precision for Spark to read it, got {field.type.unit}"
+
+        # Belt and braces: confirm the on-disk logical type agrees, in case a
+        # future pyarrow makes schema_arrow lossy about the flag.
+        logical = str(
+            parquet_file.schema.column(
+                parquet_file.schema_arrow.names.index("crsdeptime")
+            ).logical_type
+        )
+        assert "isAdjustedToUTC=false" in logical, logical
 
     def test_parquet_file_creation_and_reading(self):
         """Test creating and reading Parquet files like the pipeline does"""
