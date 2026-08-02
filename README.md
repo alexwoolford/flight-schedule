@@ -541,10 +541,20 @@ These read the date under test out of the graph (`search_date` in
 `tests/conftest.py`) rather than hard-coding one, so they pass against any loaded
 year and skip cleanly when the database is empty or unreachable.
 
-Not all test files in `tests/` currently pass: `test_performance.py` and parts of
-`test_integration_heavy.py` query property names from an earlier version of the
-schema. Neither is in the CI gate; `.github/workflows/ci.yml` defines the gate
-that matters.
+**Every test file in `tests/` is now in one of the two gates**, and the two that
+were not have been deleted rather than carried as known-failing. `test_performance.py`
+asserted a wall-clock bound on queries matching nothing — 6.9M `Schedule` nodes
+loaded, **0** carrying the `date_of_operation` property it filtered on, and every
+result assertion was `count >= 0`, which cannot fail. `test_performance_baseline.py`
+had the same `>= 0` problem plus millisecond thresholds, which say nothing on a
+shared CI runner.
+
+What replaced them is `tests/test_query_plan.py`, which gates the part of
+performance that *is* deterministic: the query plan. It asserts the search starts
+from an index seek rather than a `NodeByLabelScan`, and that `ORDER BY … LIMIT`
+plans as `Top` (bounded heap) rather than `Sort` (buffers all 11,488 LGA→DFW
+paths). `EXPLAIN` only compiles, so these hold at any graph size — including a
+one-day fixture, where a latency threshold would never notice a label scan.
 
 ## 🚀 Load Testing
 

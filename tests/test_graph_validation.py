@@ -673,8 +673,8 @@ class TestDeadlineFilters:
                 pytest.skip("No CONNECTS_TO edges — see --build-connections")
             # Pick a real origin/dest/date triple out of the graph rather than
             # hard-coding one: a pair that needs a connection, on a date whose
-            # edges are built. Hard-coded routes are what made
-            # test_performance_baseline.py rot.
+            # edges are built. Hard-coded routes are what made the deleted
+            # test_performance_baseline.py rot (it pinned date('2024-03-01')).
             #
             # The nonstop pairs are collected ONCE for the chosen date and
             # compared with IN. The natural phrasing -- a NOT EXISTS subquery on

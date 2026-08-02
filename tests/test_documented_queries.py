@@ -51,9 +51,9 @@ _ROUTE_QUERY = """
 def query_bindings(neo4j_driver, neo4j_database, search_date):
     """Bindings for the documented placeholders, derived from the graph.
 
-    Deliberately not hard-coded. `test_performance_baseline.py` pinned
-    date('2024-03-01') and a specific route, and rotted the moment the loaded
-    data changed -- it now cannot pass at all.
+    Deliberately not hard-coded. The since-deleted test_performance_baseline.py
+    pinned date('2024-03-01') and a specific route, and rotted the moment the
+    loaded data changed -- it could not pass at all by the end.
     """
     routes = {}
     with neo4j_driver.session(database=neo4j_database) as session:

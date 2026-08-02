@@ -82,7 +82,48 @@ jobs:
     - name: Run unit tests with coverage
       shell: bash -l {0}
       run: |
-        pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_flight_search_service_unit.py -v --cov=. --cov-report=xml --cov-report=term-missing
+        # Every DB-free test file in tests/, listed explicitly rather than by
+        # directory: `pytest tests/` would pull in the files that need a loaded
+        # graph, and conftest.py *skips* those rather than failing, so they would
+        # report green here having asserted nothing. The integration-test job
+        # below is where those run, against a real load.
+        #
+        # The six files after test_flight_search_service_unit.py (+113 tests, all
+        # sub-second) were passing but ungated for no reason. Confirmed DB-free by
+        # running them against a dead port: 113 passed pointing at 127.0.0.1:1.
+        pytest tests/test_ci_unit.py \
+               tests/test_flight_search_unit.py \
+               tests/test_download_bts_unit.py \
+               tests/test_load_bts_unit.py \
+               tests/test_system_validation_unit.py \
+               tests/test_flight_search_service_unit.py \
+               tests/test_business_rules.py \
+               tests/test_data_quality_checks.py \
+               tests/test_data_transformations.py \
+               tests/test_environment_scenarios.py \
+               tests/test_error_scenarios.py \
+               tests/test_performance_boundaries.py \
+               tests/test_pipeline_integration.py \
+               -v --cov=. --cov-report=xml --cov-report=term-missing
+
+    - name: Run load-test framework tests (separate process — gevent)
+      shell: bash -l {0}
+      run: |
+        # A SEPARATE pytest process, deliberately, and not merely for tidiness.
+        # Importing this file imports locust, which monkey-patches threading via
+        # gevent for the rest of the interpreter's life. FastAPI's TestClient
+        # drives the app through an anyio blocking-portal *thread*, and once that
+        # thread is a greenlet the two deadlock: the process parks in
+        # gevent/hub.py and never returns.
+        #
+        # Reproduced: TestApiStatusMapping passes alone in 0.42s and hangs
+        # forever after `import neo4j_flight_load_test` in the same process.
+        # It would hang, not fail — burning the runner's full timeout instead of
+        # reporting red — so this must not be folded back into the step above.
+        # Appending the file there happened to pass only because pytest imports
+        # in file order and locust came last; that is ordering luck, not safety.
+        pytest tests/test_load_testing_framework.py -v \
+               --cov=. --cov-append --cov-report=xml
       env:
         # Mock environment for tests that don't need real Neo4j
         NEO4J_URI: bolt://localhost:7687
@@ -220,12 +261,14 @@ jobs:
     - name: Run graph and routing assertions
       shell: bash -l {0}
       run: |
-        # -p no:randomly is not in play; order is file order. All six files pass
-        # against a single real BTS day. Deliberately excluded:
-        # test_performance.py and test_performance_baseline.py, which query the
-        # legacy property names and hard-code date('2024-03-01') (see "Known
-        # documentation drift" in CLAUDE.md) — they fail for reasons that
-        # predate this job.
+        # -p no:randomly is not in play; order is file order. All seven files
+        # pass against a single real BTS day. Nothing is excluded any more:
+        # test_performance.py and test_performance_baseline.py used to be, and
+        # have been deleted rather than carried as known-failing — the first was
+        # vacuous (6.9M schedules loaded, 0 carrying the date_of_operation it
+        # queried, and every assertion `>= 0`), the second asserted wall-clock
+        # thresholds that say nothing on a shared runner. test_query_plan.py
+        # replaces the part worth gating.
         #
         # test_flight_search_integration.py covers flight_search.py and api.py
         # against real flights. Its acyclicity checks deliberately request
@@ -236,7 +279,8 @@ jobs:
                tests/test_integration_heavy.py \
                tests/test_documented_queries.py \
                tests/test_timezone_offsets.py \
-               tests/test_flight_search_integration.py -v
+               tests/test_flight_search_integration.py \
+               tests/test_query_plan.py -v
 
   docker-build:
     runs-on: ubuntu-latest

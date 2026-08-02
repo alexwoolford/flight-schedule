@@ -324,8 +324,8 @@ safety check
 # Connection logic tests (critical for temporal validation)
 python -m pytest tests/test_connection_logic.py -v
 
-# Performance baseline tests
-python -m pytest tests/test_performance_baseline.py -v
+# Query plan tests (index seeks and bounded Top, not wall-clock)
+python -m pytest tests/test_query_plan.py -v
 
 # Integration tests (require loaded database)
 python -m pytest tests/test_integration_heavy.py -v

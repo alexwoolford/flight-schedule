@@ -37,11 +37,27 @@ loads a real one-day fixture into a Neo4j service container and runs the routing
 assertions against it.
 
 ```bash
-# Gate 1 — what the `test` job runs (no database needed); must pass before committing
+# Gate 1 — what the `test` job runs (no database needed); must pass before committing.
+# Files are listed explicitly, NOT as `pytest tests/`: conftest.py skips the
+# DB-requiring files rather than failing, so a directory run would report green
+# having asserted nothing.
 pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
        tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
        tests/test_system_validation_unit.py \
-       tests/test_flight_search_service_unit.py -v --cov=. --cov-report=term-missing
+       tests/test_flight_search_service_unit.py \
+       tests/test_business_rules.py tests/test_data_quality_checks.py \
+       tests/test_data_transformations.py tests/test_environment_scenarios.py \
+       tests/test_error_scenarios.py tests/test_performance_boundaries.py \
+       tests/test_pipeline_integration.py \
+       -v --cov=. --cov-report=term-missing
+
+# Gate 1b — a SEPARATE process, and it must stay separate. Importing this file
+# imports locust, which gevent-patches `threading` for the rest of the
+# interpreter; FastAPI's TestClient drives the app through an anyio blocking-portal
+# thread, and the two deadlock. Folded into the run above it HANGS rather than
+# fails, so CI burns its timeout instead of reporting red. Gated by
+# TestGeventIsolation.
+pytest tests/test_load_testing_framework.py -v
 
 # Gate 2 — what the `integration-test` job runs, reproducible locally against an
 # EMPTY database (the loader is not idempotent for Schedule). Takes ~35s.
@@ -53,7 +69,8 @@ python tests/ci_verify_loaded.py 2025-07-18   # guards against a false green fro
 pytest tests/test_graph_validation.py tests/test_connection_logic.py \
        tests/test_integration_heavy.py tests/test_documented_queries.py \
        tests/test_timezone_offsets.py \
-       tests/test_flight_search_integration.py -v
+       tests/test_flight_search_integration.py \
+       tests/test_query_plan.py -v
 
 # Single file / class / test
 pytest tests/test_load_bts_unit.py -v
@@ -64,7 +81,9 @@ pytest tests/test_load_bts_unit.py::TestSparkConfiguration::test_default_spark_c
 pytest tests/ -m "not slow" -v
 ```
 
-**Tests that require a loaded Neo4j database**: `test_connection_logic.py`, `test_graph_validation.py`, `test_integration_heavy.py`, `test_flight_search_integration.py`, `test_performance.py`, `test_performance_baseline.py`. The first four are in the `integration-test` gate and pass against the one-day fixture; the last two are not, because they hard-code `date('2024-03-01')` and legacy property names (see "Known documentation drift"). Everything else is pure-Python and DB-free. `test_flight_search_unit.py` is mixed — one test reaches for the DB but skips cleanly if it can't connect.
+**Tests that require a loaded Neo4j database**: `test_connection_logic.py`, `test_graph_validation.py`, `test_integration_heavy.py`, `test_documented_queries.py`, `test_timezone_offsets.py`, `test_flight_search_integration.py`, `test_query_plan.py`. **All seven are in the `integration-test` gate** and pass against the one-day fixture. Everything else is pure-Python and DB-free and is in the `test` gate. `test_flight_search_unit.py` is mixed — one test reaches for the DB but skips cleanly if it can't connect. `test_query_plan.py` needs only a *reachable* database, not a loaded one: `EXPLAIN` compiles without executing.
+
+No test file is ungated any more. The two that used to be — `test_performance.py` and `test_performance_baseline.py` — were **deleted**, not fixed: see "Deleted tests" below.
 
 **The service layer is tested from both sides on purpose.** `test_flight_search_service_unit.py` (DB-free) asserts the *rendered Cypher text* and the HTTP status mapping; `test_flight_search_integration.py` asserts *results* against real flights. The split exists because the failures that matter here are silent — a dropped acyclicity guard or `localdatetime`→`datetime` slip returns plausible wrong answers rather than an error, so one side checks the query is written correctly and the other that it answers correctly. Mutation-verified: dropping the guard, swapping `localdatetime` for `datetime`, and computing `total_minutes` from local timestamps each fail 3, 8 and 5 tests respectively.
 
@@ -167,7 +186,7 @@ Property names are the BTS CSV column names lowercased with spaces → underscor
 
 Rules: **durations, sequencing, and cross-airport ordering use the UTC pair or `scheduled_duration_minutes`. "Arrives before 3pm where I land" uses `scheduled_arrival_time`.** Never subtract one local timestamp from the other — they are in different zones.
 
-**Do not reintroduce the `CASE`-based duration idiom** (deleted from `neo4j_flight_load_test.py` in the load-test rewrite; it survives only in `tests/test_performance_baseline.py`, which is ungated and slated for deletion). It assumes `arrival < departure` means a midnight crossing; usually it means a westbound timezone offset. Correct for only ~50% of flights. Worst verified case: **9E 4853 ATL→HSV, 2024-01-08**, CRSDep 08:25, CRSArr 08:24, true elapsed **59 minutes** — the idiom returns **1439 minutes**, and a `> 0 AND < 1440` guard does not catch it.
+**Do not reintroduce the `CASE`-based duration idiom.** It no longer exists anywhere in the repo — deleted from `neo4j_flight_load_test.py` in the load-test rewrite, and its last home, `tests/test_performance_baseline.py`, has been deleted. It assumes `arrival < departure` means a midnight crossing; usually it means a westbound timezone offset. Correct for only ~50% of flights. Worst verified case: **9E 4853 ATL→HSV, 2024-01-08**, CRSDep 08:25, CRSArr 08:24, true elapsed **59 minutes** — the idiom returns **1439 minutes**, and a `> 0 AND < 1440` guard does not catch it.
 
 **How the offsets are recovered — no timezone database, no external source.** For any flight, `(arrival_local − departure_local) − block` is exactly `offset(dest) − offset(origin)`. Each directed airport pair therefore reveals the *difference* between its endpoints' offsets; BFS over the pair graph propagates relative offsets, and one absolute anchor places them all on UTC. `solve_airport_offsets()` does this per date. `OFFSET_ANCHOR = ("PHX", -420)` — Phoenix because Arizona doesn't observe DST, so the constant needs no seasonal branch.
 
@@ -254,8 +273,10 @@ If asked to build something new on this graph, delay propagation over `NEXT_LEG`
 ## Known documentation drift
 
 - **`AGENTS.md` documents an older graph schema.** It refers to `schedule_id`, `date_of_operation`, `first_seen_time`, and `last_seen_time`. None of those exist in the current graph — the current names are the composite key plus `flightdate` / `scheduled_departure_time` / `scheduled_arrival_time`. Its "Critical Indexes" and "Sample Query" sections are stale for the same reason; `load_bts_data.py` is authoritative.
-- **`tests/test_performance.py` and `tests/test_performance_baseline.py` cannot pass against current data** — the former asserts `>1M schedules` and the latter hard-codes `date('2024-03-01')` and uses the broken `CASE` duration idiom. Deliberately excluded from the `integration-test` gate; treat failures there as pre-existing. (`test_integration_heavy.py` was in this list but does pass, and is now in the gate.)
-- **`AGENTS.md`'s pre-commit checklist lists 8 test files; CI runs 5.** The three extras (`test_data_transformations.py`, `test_business_rules.py`, `test_error_scenarios.py`) are DB-free and fast, so running them too is harmless — but `.github/workflows/ci.yml` defines the actual gate.
+- **Deleted tests — `tests/test_performance.py` and `tests/test_performance_baseline.py` are gone.** Both were ungated, and neither was worth fixing. `test_performance.py` was **vacuous, not merely stale**: measured against the dev graph, 6,898,743 `Schedule` nodes are loaded and **0** carry the `date_of_operation` / `first_seen_time` properties it filtered on, and **0** `Airport` nodes match the European ICAO codes (`EGPH`, `LFMN`, `EGLL`, `LFPG`, `EDDF`, `EHAM`, `LIRF`) it queried in US-domestic BTS data. Every result assertion was `count >= 0`, so it passed on empty results by construction; its only live assertion was a wall-clock bound on a query matching nothing. `test_performance_baseline.py` had the same `assert count >= 0` pattern, hard-coded `date('2024-03-01')`, carried the broken `CASE` duration idiom, and compared a `LOCAL DATETIME` against `datetime()` — the NULL trap — so those rows were empty too. **Do not restore either from history.**
+
+  `tests/test_query_plan.py` replaces the part that was worth gating. It asserts on `EXPLAIN` output rather than elapsed time, because the plan is deterministic and latency on a shared runner is not: an index seek versus a `NodeByLabelScan` is visible at any graph size, whereas a millisecond threshold on a one-day fixture cannot tell them apart. It also gates `Top` over `Sort` — `ORDER BY total_minutes LIMIT $limit` must keep a bounded heap, not buffer all 11,488 LGA→DFW paths. Scope worth knowing: the assertion is "an indexed entry point exists", not "this particular index is used" — dropping the `flightdate` seek still planned a `NodeUniqueIndexSeek` off `airport_code_unique`. Verified to fail on a query that genuinely cannot seek (`Schedule` filtered on the unindexed `tail_number` → `NodeByLabelScan`), and mutation-checked: removing `LIMIT $limit` turns `Top` into `Sort` and fails.
+- **`AGENTS.md`'s pre-commit checklist no longer diverges from CI.** It used to list 8 test files against CI's 5; the three extras it named (`test_data_transformations.py`, `test_business_rules.py`, `test_error_scenarios.py`) are now in the `test` gate along with the rest of the DB-free suite. `.github/workflows/ci.yml` still defines the actual gate — check there, not here, if the two ever drift again.
 - **`REAL_DATA_SETUP.md` references `setup_real_data.py` and `pip install -r requirements.txt`.** Neither exists, and the latter violates rule 4. Use `setup-and-run.sh` and `environment.yml`.
 - **A credential was committed and has been removed from this repo's history, but is still exposed on GitHub.** Fixed in `fbfac4a`: `.env.backup` is gone, `.env.example` now holds `changeme`, and `AGENTS.md` no longer quotes the value. The three commits that contained it (81edc69, a28b421, aaa4fc8) survive locally as unreachable objects but are **not** ancestors of `HEAD`, so pushing does not transmit them. **However** — this repo is public, and GitHub serves unreachable objects by SHA indefinitely, so the value remains fetchable from the hosted copy via those commit URLs. A history rewrite does not close that; only rotating the credential (or asking GitHub Support to purge the objects) does. The owner has been told and declined rotation, so treat the password as **disclosed**: never reuse it, and don't copy it or the RFC-1918 host into code.
 - **`README.md:234-245`'s showcase results block does not come from the query above it.** `DL308 → UA1071 via ATL` (`:244`) is impossible in the data: DL308's 55 March-2024 legs are only DFW↔LGA, UA1071's 31 legs are only ORD→DFW, and UA operated zero ATL→DFW legs that month. Every quoted departure time is also shifted exactly +7h from real BTS (`:238` says DL308 departs 13:00; the real CRSDep is 06:00), consistent with a run on an MST machine — which is the `TimestampType`/UTC issue described above. The "27 routes" count at `:236` is also unsupported; the query as written returns 17 nonstops + 1,092 one-stops before `LIMIT`. Do not cite this block or reuse its numbers.
