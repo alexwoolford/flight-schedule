@@ -8,24 +8,29 @@ repos:
       - id: check-added-large-files
       - id: check-toml
 
-  # Blocks the exact mechanism that leaked a live Neo4j password into this
-  # public repo's history: a stray `.env.backup`. .gitignore already covers
-  # `.env.*`, but `git add -f` overrides it and that is how the original
-  # commit happened. This hook does not care about -f. See CLAUDE.md.
+  # Refuses any `.env` variant except the template. `.gitignore` covers `.env.*`,
+  # but `git add -f` overrides it and a stray backup filename (`.env.backup`,
+  # `.env.local`, `.env.old`) is the usual way a secret reaches a commit. This
+  # hook does not care about -f, which is the point.
   #
   # `files` is deliberately broad and the negative lookahead narrow: only
   # `.env.example` (the committed template, which must hold placeholders) is
   # allowed through. Add nothing else to it.
+  #
+  # Worth knowing why this is worth blocking rather than fixing after the fact:
+  # on a public repo a secret cannot be un-published. Removing it from reachable
+  # history does not help, because the objects stay fetchable by commit SHA, so
+  # the only real remedy is rotating whatever leaked. Cheaper to never stage it.
   - repo: local
     hooks:
       - id: no-env-files
         name: refuse to commit .env files (except .env.example)
         entry: >-
           A .env file is staged. These hold real credentials and must never be
-          committed -- this repo already leaked a live password this way, and
-          because it is public the value stayed fetchable by SHA even after the
-          history rewrite. Unstage it (git rm --cached <file>) and keep secrets
-          in your local .env only.
+          committed -- on a public repo the value stays fetchable by SHA even
+          after a history rewrite, so the only remedy is rotating the secret.
+          Unstage it (git rm --cached <file>) and keep secrets in your local
+          .env only.
         language: fail
         files: '(^|/)\.env($|\.(?!example$))'
 
