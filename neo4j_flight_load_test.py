@@ -57,7 +57,7 @@ import flight_search
 TOP_ORIGINS = 60
 
 # Depth served by default. See the latency table in flight_search.py: {0,3} exceeds
-# 200 ms on 34 of 40 pairs unfiltered, so load-testing it would measure a
+# 200 ms on 25-27 of 40 pairs unfiltered, so load-testing it would measure a
 # configuration the service does not serve.
 MAX_STOPS = flight_search.DEFAULT_MAX_STOPS
 

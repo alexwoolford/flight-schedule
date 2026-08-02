@@ -439,24 +439,38 @@ The tables above are hand-picked routes. Across **40 origin/destination pairs
 drawn from the graph's 60 busiest origins**, top-20 sorted, acyclicity guard on,
 repeat-warm cache.
 
-**The departure-time filter is not a detail — it dominates the cost**, so both
-conditions are reported. An earlier revision of this table gave only the
-`depart_after 08:00` row and did not carry the condition into README.md or
-CLAUDE.md, where it was read as the unfiltered cost and understated `{0,3}` by
-roughly 2.7x:
+**Two conditions dominate the cost — the departure-time filter and how hub-heavy
+the sample is — so both are varied here rather than chosen.** An earlier revision
+gave only the `depart_after 08:00` row and did not carry the condition into
+README.md or CLAUDE.md, where it was read as the unfiltered cost and understated
+`{0,3}` by roughly 2.7x. The revision after that fixed the filter but reported a
+single sample, which is how whole-day `{0,2}` came to be published as "0 / 40".
+Ranges below are the spread over three runs:
 
-| depth | filter | p50 | p95 | max | over 200 ms | empty results |
-|---|---|---|---|---|---|---|
-| `{0,2}` | `depart_after 08:00` | **35 ms** | **64 ms** | 67 ms | **0 / 40** | 0 |
-| `{0,2}` | none (whole day) | **85 ms** | **175 ms** | 199 ms | **0 / 40** | 0 |
-| `{0,3}` | `depart_after 08:00` | 116 ms | 243 ms | 267 ms | 5 / 40 | 0 |
-| `{0,3}` | none (whole day) | 395 ms | 595 ms | 624 ms | **34 / 40** | 0 |
+| depth | filter | sample | p50 | p95 | over 200 ms |
+|---|---|---|---|---|---|
+| `{0,2}` | `depart_after 08:00` | top 60 origins | **23–28 ms** | **54–66 ms** | **0 / 40** |
+| `{0,2}` | `depart_after 08:00` | top 20 origins | **41–44 ms** | **61–67 ms** | **0 / 40** |
+| `{0,2}` | none (whole day) | top 60 origins | 45–48 ms | 171–220 ms | 0–2 / 40 |
+| `{0,2}` | none (whole day) | top 20 origins | 118–125 ms | 194–253 ms | 1–3 / 40 |
+| `{0,3}` | `depart_after 08:00` | top 60 origins | 70–81 ms | 212–223 ms | 2–3 / 40 |
+| `{0,3}` | `depart_after 08:00` | top 20 origins | 140–154 ms | 232–243 ms | 12–14 / 40 |
+| `{0,3}` | none (whole day) | top 60 origins | 251–280 ms | 573–672 ms | 25–27 / 40 |
+| `{0,3}` | none (whole day) | top 20 origins | 492–506 ms | 635–657 ms | **39 / 40** |
 
-**Two stops holds a 200 ms budget under both conditions. Three stops does not** —
-it misses on about 12% of pairs with a morning filter and on **85%** without one,
-worst on dense hub-to-hub routes where the candidate set is largest (LGA→DFW
-enumerates 11,488 itineraries to return 20). If you need a hard 200 ms ceiling,
-serve `{0,2}` and treat `{0,3}` as a widen-on-demand second request.
+**`{0,2}` with a departure-time filter is the only configuration that clears 200 ms
+unconditionally.** Whole-day `{0,2}` sits *on* the budget rather than under it — p95
+landed at 171, 192, 205 and 229 ms across four runs, with 0 to 3 pairs over — so it
+must be quoted as a range. `{0,3}` misses on most pairs unfiltered and on up to a
+third with a morning filter. If you need a hard 200 ms ceiling, serve `{0,2}`
+filtered and treat `{0,3}` as a widen-on-demand second request.
+
+**The sample is part of the result.** Concentrating the same 40 pairs on the top 20
+origins instead of the top 60 roughly triples whole-day `{0,2}` p50 and takes
+filtered `{0,3}` from 2 of 40 over budget to 13, with identical query, graph and
+date. Dense hub-to-hub routes have the largest candidate sets (LGA→DFW enumerates
+11,488 itineraries to return 20), so a benchmark that draws pairs from a wider
+origin pool reports a faster system. State the pool.
 
 These are repeat-warm, not first-hit: re-running `{0,3}` LGA→DFW twelve times in a
 row converges to ~440 ms, consistent with the 436 ms in the guard-cost table above,

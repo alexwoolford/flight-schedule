@@ -234,7 +234,25 @@ The `integration-test` job therefore runs with **`TZ: America/Denver`**, not UTC
 
 **Itineraries revisit airports unless the query forbids it.** `CONNECTS_TO`'s backtrack guard is *pairwise* (`s2.dest <> s1.origin`) and does not compose over 3+ legs. Measured 2025-07-18 LGA→DFW at `{0,3}`: **2,115 of 11,488 paths (18.41%)** revisit an airport and **385 return to the origin** (`LGA→MIA→CLT→LGA`). Cypher's `ACYCLIC`/`TRAIL` path modes **do not fix this** — they dedupe path *nodes*, which here are `Schedule` nodes and always distinct; the repeating entity is an `Airport` reached off-path via `DEPARTS_FROM`/`ARRIVES_AT` (verified: identical 2,115 under all three modes). The guard must compare airport codes; it is in every routing query in the docs and gated by `TestItineraryShape`. Cost is within run-to-run noise (±5% over six routes).
 
-**Latency: `{0,2}` meets a 200 ms budget, `{0,3}` does not — and a departure-time filter dominates the cost, so never quote a figure without its filter.** Over 40 origin/destination pairs from the 60 busiest origins, top-20 sorted, guard on, repeat-warm. With `depart_after 08:00`: `{0,2}` p50 35 ms / p95 64 ms / **0 of 40 over 200 ms**; `{0,3}` p50 116 ms / p95 243 ms / 5 of 40 over. Unfiltered, whole day: `{0,2}` p50 85 ms / p95 175 ms / **0 of 40 over**; `{0,3}` p50 395 ms / p95 595 ms / **34 of 40 over**. Serve `{0,2}` by default. The older "p50 36 ms / p95 56 ms" and "p95 218 ms" figures were the *filtered* case published without that condition; they understate `{0,3}` by ~2.7x.
+**Latency: only *filtered* `{0,2}` clears a 200 ms budget unconditionally. Two things dominate the number — the departure-time filter and the route mix of the sample — so a figure quoted without both conditions is not reproducible.** 40 pairs, top-20 sorted, guard on, repeat-warm, limit=20; ranges are the spread over three runs, and the two samples differ only in how hub-heavy they are:
+
+| depth | filter | p50 | p95 | over 200 ms |
+|---|---|---|---|---|
+| `{0,2}` | `08:00`, top 60 origins | 23–28 ms | 54–66 ms | **0 / 40** |
+| `{0,2}` | `08:00`, top 20 origins | 41–44 ms | 61–67 ms | **0 / 40** |
+| `{0,2}` | whole day, top 60 | 45–48 ms | 171–220 ms | 0–2 / 40 |
+| `{0,2}` | whole day, top 20 | 118–125 ms | 194–253 ms | 1–3 / 40 |
+| `{0,3}` | `08:00`, top 60 | 70–81 ms | 212–223 ms | 2–3 / 40 |
+| `{0,3}` | `08:00`, top 20 | 140–154 ms | 232–243 ms | 12–14 / 40 |
+| `{0,3}` | whole day, top 60 | 251–280 ms | 573–672 ms | 25–27 / 40 |
+| `{0,3}` | whole day, top 20 | 492–506 ms | 635–657 ms | **39 / 40** |
+
+Serve `{0,2}`, and prefer a departure-time filter. Two corrections to figures this file used to carry, both of which flattered the system:
+
+- **Whole-day `{0,2}` was published as "p50 85 ms / p95 175 ms / 0 of 40 over".** It is not reliably under budget — p95 landed at 171, 192, 205 and 229 ms across four runs, with 0, 1, 2 and 3 pairs over. The claim was one sample's luck reported as a property. It sits *on* the budget; say so rather than quoting a zero.
+- **Every figure is sample-dependent**, which no earlier version of this table admitted. Concentrating the same 40 pairs on the top 20 origins instead of the top 60 roughly triples whole-day `{0,2}` p50 (48→121 ms) and takes filtered `{0,3}` from 2 of 40 over budget to 13 — same query, same graph, same date. Denser hubs enumerate more paths. Quote the sample or the number means nothing.
+
+The older "p50 36 ms / p95 56 ms" and "p95 218 ms" figures were the *filtered* case published without that condition; they understate `{0,3}` by ~2.7x.
 
 **One silent trap remains in any deadline filter**, gated by `TestDeadlineFilters` in `tests/test_graph_validation.py`: `scheduled_arrival_time` is a `LOCAL DATETIME`, and comparing it to `datetime('...')` (zoned) yields **NULL**, not false, so `WHERE` drops every row and a route with 40 valid itineraries returns zero with no error. Use `localdatetime()`. The overnight trap that used to sit alongside it is fixed at load time (above).
 
@@ -244,7 +262,11 @@ Multi-hop queries admit `s2.flightdate IN [date($d), date($d) + duration('P1D')]
 
 **Three scope limits to state rather than discover.** They are not fixable by better queries and they belong in any demo:
 
-- **`CONNECTS_TO` covers 7 dates of 365** — `2025-07-14 … 2025-07-20`, 4,028,572 edges. A full year of `Schedule` nodes is loaded; routing on any other date returns zero rows, correctly and silently. `GET /dates` reports the real coverage. A full year would be ~211M edges.
+- **`CONNECTS_TO` covers 7 dates of 365** — `2025-07-14 … 2025-07-20`, 4,028,572 edges. A full year of `Schedule` nodes is loaded. `GET /dates` reports the real coverage. A full year would be ~211M edges.
+
+  **A connecting search on an unbuilt date now raises `CoverageError` (HTTP 409); it does not return zero rows.** The claim that used to sit here — "routing on any other date returns zero rows, correctly and silently" — was wrong on all three counts, and the truth was worse than the claim. The nonstop leg of the query (`MATCH p = (first)`) reads `Schedule` directly and never traverses `CONNECTS_TO`, so a `{0,2}` search on a date with flights but no edges returned **nonstops only**: well-formed, plausible, and silently incomplete. Measured on the dev graph, LGA→DFW on `2025-03-14` returned **18 itineraries, all 0-stop**, against 22 nonstops among 500 results on `2025-07-18` — and **358 of the 365 loaded dates** behaved that way. `search_itineraries()` now probes coverage when `max_stops > 0` and refuses; `max_stops=0` is unaffected, because a nonstop search is exactly as correct without edges as with them. Gated by `TestUnbuiltDateCoverage` (integration) and six service-unit tests.
+
+  Two details worth keeping. `CoverageError` **subclasses `SearchError`**, so `api.py`'s `except CoverageError` must stay *above* `except SearchError` or it is silently swallowed and reported as 400 — mutation-checked, reordering fails 3 tests. And the probe is `RETURN true AS built ... LIMIT 1`, **not** `count(*) > 0`: an aggregation cannot short-circuit, so the count form drained all 623,508 edges of the date before there was anything to compare, costing 33.6 ms against **0.39 ms** (86×). At the count form's cost the per-search probe would have roughly doubled `{0,2}` p50; as written it is inside run-to-run noise (p50 35 ms with the guard, 34 ms before).
 - **No price, seat availability, booking class, or per-airport minimum connection time.** A flat [45, 300] stands in for MCT. The system answers "is this flyable as scheduled", not "is this purchasable".
 - **8.64% of edges (348,000) are `OO`→`OO` (283,368) or `YX`→`YX` (64,632)** and their marketing carrier is **not derivable from BTS at all** — On-Time Performance publishes only the operating carrier. SkyWest and Republic each fly for several mainlines, so an `OO` leg sold as Delta Connection connecting to an `OO` leg sold as United Express passes the carrier check and is still unsellable. That is why both are excluded from `CARRIER_FAMILY` — strict is the honest answer, not a complete one. Closing it needs a source with marketing carriers (OAG, ATPCO, a GDS), which is out of scope.
 

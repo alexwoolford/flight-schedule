@@ -358,22 +358,34 @@ changes. Add `AND first.scheduled_departure_time >= localdatetime($after)` to
 search by departure time, or filter on the last leg's arrival for a deadline —
 both forms, with their traps, are in the reference doc.
 
-**Latency, across 40 origin/destination pairs drawn from the graph's 60 busiest
-origins** — top-20 sorted, acyclicity guard on, warm cache. **A departure-time
-filter dominates the cost, so both cases are given**; quoting one without saying
-which is how a 36 ms claim ends up next to a 400 ms reality:
+**Latency, across 40 origin/destination pairs** — top-20 sorted, acyclicity guard
+on, warm cache, `limit=20`. **Two conditions dominate the number: the
+departure-time filter and how hub-heavy the sample is.** Both are varied below
+rather than picked, because quoting one figure without them is how a 36 ms claim
+ends up next to a 400 ms reality. Ranges are the spread over three runs:
 
-| depth | filter | p50 | p95 | max | over 200 ms |
+| depth | filter | sample | p50 | p95 | over 200 ms |
 |---|---|---|---|---|---|
-| `{0,2}` | `depart_after 08:00` | **35 ms** | **64 ms** | 67 ms | **0 / 40** |
-| `{0,2}` | none (whole day) | **85 ms** | **175 ms** | 199 ms | **0 / 40** |
-| `{0,3}` | `depart_after 08:00` | 116 ms | 243 ms | 267 ms | 5 / 40 |
-| `{0,3}` | none (whole day) | 395 ms | 595 ms | 624 ms | **34 / 40** |
+| `{0,2}` | `depart_after 08:00` | top 60 origins | **23–28 ms** | **54–66 ms** | **0 / 40** |
+| `{0,2}` | `depart_after 08:00` | top 20 origins | **41–44 ms** | **61–67 ms** | **0 / 40** |
+| `{0,2}` | none (whole day) | top 60 origins | 45–48 ms | 171–220 ms | 0–2 / 40 |
+| `{0,2}` | none (whole day) | top 20 origins | 118–125 ms | 194–253 ms | 1–3 / 40 |
+| `{0,3}` | `depart_after 08:00` | top 60 origins | 70–81 ms | 212–223 ms | 2–3 / 40 |
+| `{0,3}` | `depart_after 08:00` | top 20 origins | 140–154 ms | 232–243 ms | 12–14 / 40 |
+| `{0,3}` | none (whole day) | top 60 origins | 251–280 ms | 573–672 ms | 25–27 / 40 |
+| `{0,3}` | none (whole day) | top 20 origins | 492–506 ms | 635–657 ms | **39 / 40** |
 
-Two stops holds a 200 ms budget either way. Three stops misses on ~12% of pairs
-with a morning filter and on **85%** without one, worst on dense hub-to-hub routes
-(LGA→DFW enumerates 11,488 itineraries to return 20). Serve `{0,2}` by default and
-widen on demand.
+Read it this way: **`{0,2}` with a departure-time filter is the only configuration
+that clears 200 ms unconditionally.** Whole-day `{0,2}` sits *on* the budget — p95
+landed at 171, 192, 205 and 229 ms across four runs — so it is quoted as a range,
+not as the "0 / 40" an earlier version of this table claimed from a single sample.
+`{0,3}` misses on most pairs without a filter and on up to a third with one.
+
+Concentrating the same 40 pairs on the top 20 origins rather than the top 60 roughly
+triples whole-day `{0,2}` p50 and takes filtered `{0,3}` from 2 of 40 over budget to
+13 — identical query, graph and date. Dense hub-to-hub routes enumerate far more
+paths (LGA→DFW walks 11,488 itineraries to return 20), so a benchmark's route mix is
+part of its result. Serve `{0,2}` by default and widen on demand.
 
 Measured against the full-year graph (6,898,743 `Schedule` nodes; the searched date
 carries 623,508 `CONNECTS_TO` edges, matching the CI fixture), stable across three
@@ -408,10 +420,14 @@ answer and no amount of query work changes that.
 
 - **Routing covers only the dates you build, currently 7 of 365.** The loaded
   graph holds a full year of `Schedule` nodes, but `CONNECTS_TO` exists for
-  **2025-07-14 … 2025-07-20** and nothing else. Itinerary search on any other date
-  returns zero results, correctly and silently. Build more with `--solve-offsets`
-  then `--build-connections`; a full year would be ~211M edges, ~10x the rest of
-  the graph. `GET /dates` reports what is actually available.
+  **2025-07-14 … 2025-07-20** and nothing else. A search allowing stops on any
+  other date is a **409**, not an empty result: the nonstop leg of the query never
+  traverses `CONNECTS_TO`, so it would otherwise return nonstops only and look like
+  a complete answer (measured: LGA→DFW on `2025-03-14`, 18 results, every one of
+  them 0-stop). Ask for `max_stops=0` to request nonstops deliberately. Build more
+  with `--solve-offsets` then `--build-connections`; a full year would be ~211M
+  edges, ~10x the rest of the graph. `GET /dates` reports what is actually
+  available.
 - **No price, no seat availability, no booking class, no per-airport minimum
   connection time** (a flat 45-300 minutes stands in for all of them). It answers
   "is this flyable as scheduled", not "is this purchasable".
@@ -478,21 +494,25 @@ Four design decisions worth the words, each measured rather than assumed:
   serving budget is written against. Deepening also forfeits global ranking, since a
   1-stop that beats every nonstop is unreachable once the nonstops fill `limit`;
   nonstops still sort first in the single pass wherever they exist.
-- **`max_stops` defaults to 2 and is capped at 3.** `{0,3}` costs p95 595 ms
-  against 175 ms unfiltered and exceeds 200 ms on 34 of 40 pairs, so leaving it
-  unbounded would let one request degrade the service for everyone.
+- **`max_stops` defaults to 2 and is capped at 3.** Unfiltered, `{0,3}` costs p95
+  573–672 ms against 171–220 ms at `{0,2}` and exceeds 200 ms on 25–27 of 40 pairs,
+  so leaving it unbounded would let one request degrade the service for everyone.
 - **One pooled driver per process**, opened at startup via FastAPI's `lifespan`, so
   no request pays for connection or TLS setup and a bad `NEO4J_URI` fails at boot
   instead of looking like a slow search. Pool size is `NEO4J_POOL_SIZE`
   (default 50).
-- **An empty result reports whether the date was even built.** "No same-carrier
-  routing on this pair" and "nobody ran `--build-connections` for this date" are
-  both an empty list, so a zero-result response also carries
-  `date_is_searchable`. `/health` exists for the same reason — a static
-  `{"ok": true}` would hide a healthy service in front of an empty database.
+- **A date with no connections is refused rather than under-answered.** Asking for
+  stops on an unbuilt date is the one silently-wrong result this service could
+  produce, so it raises `CoverageError` → **409**, echoing the searchable dates.
+  Where the answer really is empty — a built date with no same-carrier routing on
+  that pair — it stays a 200 and carries `date_is_searchable`, so "no routes here"
+  and "this date was never built" remain distinguishable. `/health` exists for the
+  same reason: a static `{"ok": true}` would hide a healthy service in front of an
+  empty database.
 
-Bad input is 400 (or 422 from FastAPI's own bounds); an unreachable graph is 503.
-Getting those backwards is how a dashboard ends up blaming the wrong component.
+Bad input is 400 (or 422 from FastAPI's own bounds); a well-formed request against
+an unbuilt date is 409; an unreachable graph is 503. Getting those backwards is how
+a dashboard ends up blaming the wrong component.
 
 Tested from both sides: `tests/test_flight_search_service_unit.py` asserts the
 rendered Cypher and the status mapping with no database, and
