@@ -34,12 +34,11 @@ class TestLoadTestScriptValidation:
         """
         import neo4j_flight_load_test
 
-        assert hasattr(neo4j_flight_load_test, "Neo4jUser")
-        user_class = neo4j_flight_load_test.Neo4jUser
+        user_class = neo4j_flight_load_test.ItinerarySearchUser
 
-        # Should have required Locust methods
+        # Note: no on_stop. The driver is process-wide (flight_search.get_driver()),
+        # so a per-user teardown would close a pool other users are still using.
         assert hasattr(user_class, "on_start")
-        assert hasattr(user_class, "on_stop")
         assert hasattr(user_class, "wait_time")
 
         # Should have task methods
@@ -49,7 +48,35 @@ class TestLoadTestScriptValidation:
         ]
         assert (
             len(task_methods) >= 2
-        )  # Should have multiple task types (direct + connection)
+        )  # Should have multiple task types (nonstop + full search)
+
+    def test_load_test_holds_no_cypher_of_its_own(self):
+        """The load test must drive the served code path, not a private copy.
+
+        This is the defect the rewrite fixed: the old file carried its own query
+        with a CASE-based duration that read a westbound timezone offset as a
+        midnight crossing (1439 minutes for a 59-minute flight), so it was
+        measuring a query the service would never run. One airport-sampling query
+        is legitimate -- itinerary Cypher is not.
+
+        Matches on Cypher syntax rather than words like "CONNECTS_TO", which appear
+        legitimately in the file's own prose explaining why the Cypher is gone.
+        """
+        source = (
+            Path(__file__).parent.parent / "neo4j_flight_load_test.py"
+        ).read_text()
+
+        assert "flight_search" in source, "load test must call flight_search"
+
+        # Traversal syntax, which prose never contains. The one permitted query
+        # samples airports and uses -[:DEPARTS_FROM]-> exactly once.
+        assert "-[:CONNECTS_TO]->" not in source
+        assert "-[:ARRIVES_AT]->" not in source
+        assert "duration.between" not in source
+        assert source.count("-[:DEPARTS_FROM]->") == 1, (
+            "expected exactly one DEPARTS_FROM, in the airport-volume sampling "
+            "query; more than that means itinerary Cypher came back"
+        )
 
     def test_query_construction_logic(self):
         """Test that queries can be constructed without syntax errors"""

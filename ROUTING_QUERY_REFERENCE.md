@@ -437,18 +437,33 @@ never going to rank):
 
 The tables above are hand-picked routes. Across **40 origin/destination pairs
 drawn from the graph's 60 busiest origins**, top-20 sorted, acyclicity guard on,
-departing after 08:00, warm cache:
+repeat-warm cache.
 
-| depth | p50 | p95 | max | over 200 ms | empty results |
-|---|---|---|---|---|---|
-| `{0,2}` | **36 ms** | **56 ms** | 124 ms | **0 / 40** | 0 |
-| `{0,3}` | **114 ms** | **218 ms** | 279 ms | **5 / 40** | 0 |
+**The departure-time filter is not a detail — it dominates the cost**, so both
+conditions are reported. An earlier revision of this table gave only the
+`depart_after 08:00` row and did not carry the condition into README.md or
+CLAUDE.md, where it was read as the unfiltered cost and understated `{0,3}` by
+roughly 2.7x:
 
-**Two stops holds a 200 ms budget with room to spare. Three stops does not** — it
-misses on about 12% of pairs, worst on dense hub-to-hub routes where the
-candidate set is largest (LGA→DFW enumerates 11,488 itineraries to return 20).
-If you need a hard 200 ms ceiling, serve `{0,2}` and treat `{0,3}` as a
-widen-on-demand second request rather than the default.
+| depth | filter | p50 | p95 | max | over 200 ms | empty results |
+|---|---|---|---|---|---|---|
+| `{0,2}` | `depart_after 08:00` | **35 ms** | **64 ms** | 67 ms | **0 / 40** | 0 |
+| `{0,2}` | none (whole day) | **85 ms** | **175 ms** | 199 ms | **0 / 40** | 0 |
+| `{0,3}` | `depart_after 08:00` | 116 ms | 243 ms | 267 ms | 5 / 40 | 0 |
+| `{0,3}` | none (whole day) | 395 ms | 595 ms | 624 ms | **34 / 40** | 0 |
+
+**Two stops holds a 200 ms budget under both conditions. Three stops does not** —
+it misses on about 12% of pairs with a morning filter and on **85%** without one,
+worst on dense hub-to-hub routes where the candidate set is largest (LGA→DFW
+enumerates 11,488 itineraries to return 20). If you need a hard 200 ms ceiling,
+serve `{0,2}` and treat `{0,3}` as a widen-on-demand second request.
+
+These are repeat-warm, not first-hit: re-running `{0,3}` LGA→DFW twelve times in a
+row converges to ~440 ms, consistent with the 436 ms in the guard-cost table above,
+so the cost is path expansion rather than a cold page cache. Measured against the
+full-year graph (6,898,743 `Schedule` nodes) on a date carrying 623,508
+`CONNECTS_TO` edges — the same edge count as the CI fixture, so route density is
+not what separates the two conditions.
 
 ### Measured
 

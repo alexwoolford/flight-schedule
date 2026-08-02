@@ -82,7 +82,7 @@ jobs:
     - name: Run unit tests with coverage
       shell: bash -l {0}
       run: |
-        pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py -v --cov=. --cov-report=xml --cov-report=term-missing
+        pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_flight_search_service_unit.py -v --cov=. --cov-report=xml --cov-report=term-missing
       env:
         # Mock environment for tests that don't need real Neo4j
         NEO4J_URI: bolt://localhost:7687
@@ -220,17 +220,23 @@ jobs:
     - name: Run graph and routing assertions
       shell: bash -l {0}
       run: |
-        # -p no:randomly is not in play; order is file order. These three files
-        # all pass against a single real BTS day. Deliberately excluded:
+        # -p no:randomly is not in play; order is file order. All six files pass
+        # against a single real BTS day. Deliberately excluded:
         # test_performance.py and test_performance_baseline.py, which query the
         # legacy property names and hard-code date('2024-03-01') (see "Known
         # documentation drift" in CLAUDE.md) — they fail for reasons that
         # predate this job.
+        #
+        # test_flight_search_integration.py covers flight_search.py and api.py
+        # against real flights. Its acyclicity checks deliberately request
+        # limit=3000: revisits rank below 1,038 on LGA->DFW, so a serving-sized
+        # limit cannot see the defect they guard.
         pytest tests/test_graph_validation.py \
                tests/test_connection_logic.py \
                tests/test_integration_heavy.py \
                tests/test_documented_queries.py \
-               tests/test_timezone_offsets.py -v
+               tests/test_timezone_offsets.py \
+               tests/test_flight_search_integration.py -v
 
   docker-build:
     runs-on: ubuntu-latest

@@ -43,6 +43,13 @@ dependencies:
     # spark.jars.packages in load_bts_data.py (pinned to 5.5.0_for_spark_3).
     # 5.4.0+ is required for timestamp_ntz -> LocalDateTime support.
 
+    # Service layer for api.py (pip-only)
+    - fastapi==0.116.1
+    - uvicorn==0.35.0
+    # httpx is what fastapi.testclient.TestClient is built on, so the API tests
+    # need it even though nothing imports it directly.
+    - httpx==0.28.1
+
     # Load Testing Framework (pip-only)
     - locust==2.37.14
     - faker>=30.0.0
