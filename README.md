@@ -136,6 +136,39 @@ NEO4J_DATABASE=flights      # use "neo4j" on Aura or Community Edition
 
 Every script reads these via `load_dotenv()`; nothing is hard-coded.
 
+<details>
+<summary><strong>Connection not working?</strong></summary>
+
+```bash
+python -c "
+import os
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
+load_dotenv(override=True)
+GraphDatabase.driver(
+    os.getenv('NEO4J_URI'),
+    auth=(os.getenv('NEO4J_USERNAME'), os.getenv('NEO4J_PASSWORD')),
+).verify_connectivity()
+print('✅ Connected')
+"
+```
+
+`override=True` matters: without it an exported `NEO4J_PASSWORD` left over from
+another project beats the one in `.env`, and the loader then authenticates
+against the wrong database. That is the most common cause of a "successful" run
+that loads nothing.
+
+If you are using a database other than `neo4j`, create it first — the loader does
+not create databases:
+
+```cypher
+CREATE DATABASE flights IF NOT EXISTS;   // run against the `system` database
+```
+
+Setup and loader logs are in `logs/` (gitignored): `tail -f logs/setup_*.log`.
+
+</details>
+
 ### 3. Download Flight Data
 
 ```bash
@@ -368,10 +401,29 @@ supernode with no date property: reaching a hub forces the next hop to bind
 that juncture and puts the connection rules in the edge, so no query can
 accidentally splice two unrelated carriers into an unsellable itinerary.
 
-**What this does *not* model.** No price, no seat availability, no per-airport
-minimum connection time (a flat 45-300 minutes stands in), and no interline
-between unrelated carriers. It answers "is this flyable as scheduled", not "is
-this purchasable".
+### What this does *not* model
+
+Three limits, stated plainly because each one is a question the graph cannot
+answer and no amount of query work changes that.
+
+- **Routing covers only the dates you build, currently 7 of 365.** The loaded
+  graph holds a full year of `Schedule` nodes, but `CONNECTS_TO` exists for
+  **2025-07-14 … 2025-07-20** and nothing else. Itinerary search on any other date
+  returns zero results, correctly and silently. Build more with `--solve-offsets`
+  then `--build-connections`; a full year would be ~211M edges, ~10x the rest of
+  the graph. `GET /dates` reports what is actually available.
+- **No price, no seat availability, no booking class, no per-airport minimum
+  connection time** (a flat 45-300 minutes stands in for all of them). It answers
+  "is this flyable as scheduled", not "is this purchasable".
+- **8.64% of edges splice regional flights whose marketing carrier is unknowable
+  from BTS.** 348,000 of 4,028,572 are `OO`→`OO` (SkyWest, 283,368) or `YX`→`YX`
+  (Republic, 64,632). Both fly for several mainlines under different brands, and
+  BTS On-Time Performance publishes only the *operating* carrier — so an `OO` leg
+  sold as Delta Connection connecting to an `OO` leg sold as United Express passes
+  the carrier check and is still unsellable. That is a **source** limitation, not a
+  modelling one: it needs a feed with marketing carriers (OAG, ATPCO, a GDS).
+  Wholly-owned regionals with exactly one parent (`MQ`, `OH`, …) *are* resolved —
+  see `CARRIER_FAMILY`.
 
 > 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the
 > depart-after and arrive-before queries in full, the two silent traps in any
@@ -548,6 +600,14 @@ loaded, **0** carrying the `date_of_operation` property it filtered on, and ever
 result assertion was `count >= 0`, which cannot fail. `test_performance_baseline.py`
 had the same `>= 0` problem plus millisecond thresholds, which say nothing on a
 shared CI runner.
+
+**Being in a gate is not the same as gating something.** `test_integration_heavy.py`
+was in the integration gate the whole time, and 5 of its 6 tests queried 2024
+dates or European ICAO codes (`EGLL`, `LFPG`, `EHAM`, …, **0 of 8 present**)
+against a 2025 US-domestic graph. Each returned zero rows and each asserted
+`>= 0`, so they passed *because* they matched nothing. Removed, with the one
+repaired test kept, an anti-vacuity companion that asserts ATL/DFW/ORD really are
+loaded, and a check that fails if `assert … >= 0` ever comes back to that file.
 
 What replaced them is `tests/test_query_plan.py`, which gates the part of
 performance that *is* deterministic: the query plan. It asserts the search starts

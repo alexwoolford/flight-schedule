@@ -65,20 +65,29 @@ Our load test simulates realistic user behavior:
 
 What the harness actually runs — two Locust tasks:
 
-| Weight | Task | Query |
-|---|---|---|
-| 70% | `direct_flight_search` | Counts direct flights on a random route and date |
-| 30% | `comprehensive_routing_search` | Direct + 1-stop connections via a hub |
+| Weight | Task | Locust stat name | What it calls |
+|---|---|---|---|
+| 70% | `nonstop_lookup` | `nonstop lookup` | `search_itineraries(max_stops=0, limit=10)` |
+| 30% | `itinerary_search` | `itinerary search {0,2}` | `search_itineraries(max_stops=2, limit=20)` |
+
+Both go through `flight_search.py`, the same code path `api.py` serves. The
+harness holds no Cypher of its own beyond one airport-sampling query, which is
+gated by `test_load_test_holds_no_cypher_of_its_own`.
 
 > ⚠️ There is **no** "popular / medium / niche" tiering in the code, and no
-> 2-stop search. Earlier versions of this table described a distribution that
-> summed to 130% and does not exist.
+> 2-stop-only task. Earlier versions of this table described a distribution that
+> summed to 130% and does not exist, and named two functions
+> (`direct_flight_search`, `comprehensive_routing_search`) that no longer do.
 >
-> ⚠️ **Route sampling is skewed.** `_load_airports()` orders airports
-> lexicographically and keeps the first 100, so the sampling universe runs
-> ABE…ELM and excludes most major hubs (ORD, LAX, JFK, LGA, SFO, EWR, MIA, SEA,
-> PHX, LAS, ATL, …). Most random routes have no flights, so the majority of the
-> 70%-weighted task returns zero rows. Treat throughput figures accordingly.
+> ✅ **Sampling is by flight volume**, from the `TOP_ORIGINS = 60` busiest origins
+> on the sampled date. It used to order airports lexicographically and keep the
+> first 100 — a universe of ABE…ELM that excluded ORD, LAX, JFK, LGA, SFO, EWR
+> and most other hubs, so ~95% of the 70%-weighted task returned zero rows.
+> Throughput figures published before that fix measured empty results.
+>
+> ⚠️ **Dates are sampled from `CONNECTS_TO` coverage**, not from all `Schedule`
+> dates, so a sampled date always has routing edges. With 7 dates built, the
+> harness only ever exercises those.
 
 ## 📈 Key Metrics to Monitor
 
@@ -134,29 +143,34 @@ locust -f neo4j_flight_load_test.py --worker --master-host=<master-ip>
 
 ## 🔍 Performance Expectations by Query Type
 
-### Direct Flight Queries (70% of load)
-```cypher
-MATCH (o:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(d:Airport {code: $dest})
-WHERE s.flightdate = date($flight_date)
-```
-> ⚠️ Do **not** add `AND s.cancelled = 0`. Cancelled flights are filtered out
-> during loading and `cancelled` is never stored as a property, so that
-> predicate matches nothing and the query returns zero rows.
-- **Expected**: 20-50ms
-- **Bottlenecks**: Airport code lookups, date filtering
-- **Optimization**: Ensure indexes on `Airport.code`, `Schedule.flightdate`
+Both tasks issue the **same** quantified-path query from `flight_search.py`,
+differing only in `max_stops` and `limit`. The Cypher is not restated here — see
+`flight_search.build_search_query()` and `ROUTING_QUERY_REFERENCE.md`. The two
+hand-rolled `MATCH` patterns that used to sit in this section described a
+`Schedule → Airport → Schedule` traversal the harness no longer performs, and
+which is **200-400x slower** than traversing `CONNECTS_TO` because `Airport` is a
+supernode with no date property.
 
-### Connection Queries (30% of load)
-```cypher
-MATCH (dep:Airport)<-[:DEPARTS_FROM]-(s1:Schedule)-[:ARRIVES_AT]->(hub:Airport)
-      <-[:DEPARTS_FROM]-(s2:Schedule)-[:ARRIVES_AT]->(arr:Airport)
-```
-- **Expected**: 50-150ms
-- **Bottlenecks**: Complex join patterns, time calculations
-- **Optimization**: Composite indexes on `(flightdate, scheduled_departure_time)`
+### Nonstop lookup (70% of load) — `max_stops=0`, `limit=10`
+- **Bottlenecks**: airport code lookup, date filtering
+- **Optimization**: the `flightdate` index plus the `Airport.code` constraint's
+  backing index; `test_query_plan.py` gates that the plan starts from a seek
+  rather than a `NodeByLabelScan`
 
-> The 2-stop and analytics query types previously listed here are **not in the
-> harness**. The two tasks above are all it runs.
+### Itinerary search (30% of load) — `max_stops=2`, `limit=20`
+- **Bottlenecks**: quantifier expansion, the per-path acyclicity guard, ranking
+- **Optimization**: `ORDER BY total_minutes LIMIT $limit` must plan as `Top`, not
+  `Sort` — a bounded heap rather than buffering every path. Also gated.
+- **Serve `{0,2}`, not `{0,3}`**: measured over 40 pairs, `{0,2}` holds a 200 ms
+  p95 filtered or unfiltered; `{0,3}` is p95 595 ms unfiltered with 34 of 40 pairs
+  over 200 ms.
+
+> ⚠️ Do **not** add `AND s.cancelled = 0` to any of these. Cancelled flights are
+> filtered out during loading and `cancelled` is never stored as a property, so
+> that predicate matches nothing and the query returns zero rows.
+>
+> The 2-stop-only and analytics query types previously listed here are **not in
+> the harness**. The two tasks above are all it runs.
 
 ## 🚨 Warning Signs
 
@@ -203,16 +217,23 @@ throughput rising roughly linearly with concurrency.
 **Saturated:** latency climbing while throughput plateaus or falls, error rate
 rising, timeouts appearing on the routing task first.
 
-### Two things that distort the reported numbers
+### One thing that still distorts the reported numbers
 
-- **Per-route stats names.** Each airport pair is passed as Locust's request
-  `name`, producing thousands of near-single-sample entries. Percentiles per
-  entry are therefore meaningless, and `quick_load_test_analysis.py` matches
-  none of these names — it labels every row "Other". Read the aggregate row.
 - **Throughput ceiling is built in.** With `wait_time = between(1, 3)` and about
   1.3 requests per iteration, 100 users cannot exceed roughly 65 req/s no matter
   how fast the database is. If you want to find the database's limit, lower
   `wait_time`.
+
+**Fixed, but worth knowing if you compare against old runs:** each airport pair
+used to be passed as Locust's request `name`, producing up to 29,700
+near-single-sample stat entries whose percentiles were computed over 1-2 samples
+each — and `quick_load_test_analysis.py` matched none of those names, labelling
+every row "Other". The two task names are now constants (`NONSTOP_TASK`,
+`SEARCH_TASK`), so percentiles aggregate properly and the analysis script matches.
+A driver was also constructed **per simulated user**, putting driver and TLS setup
+inside every measurement; there is now one pooled process-wide driver from
+`flight_search.get_driver()`. Numbers published before those two fixes are not
+comparable to numbers after them.
 
 ## 🎯 Setting Performance Goals
 

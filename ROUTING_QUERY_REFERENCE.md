@@ -571,6 +571,18 @@ guessed. True interline between unrelated carriers (AA↔AS) is also not derivab
 here — and matters, since allowing arbitrary cross-carrier connections would add
 1.1M pairs a day, most unsellable.
 
+**Being strict does not make those two safe, and the residual is not small.**
+Measured over the seven built dates: **348,000 of 4,028,572 edges (8.64%)** are
+`OO`→`OO` (283,368) or `YX`→`YX` (64,632). Every one passes the carrier predicate,
+because the operating codes match — but SkyWest sells the same aircraft as Delta
+Connection, United Express, American Eagle and Alaska SkyWest depending on the
+route, so an `OO` arrival sold under one mainline connecting to an `OO` departure
+sold under another is **not** a sellable itinerary. Which mainline applies is
+**not recoverable from this feed at all**: it needs the marketing carrier, and BTS
+On-Time Performance does not publish one. Treat that 8.64% as an upper bound on
+edges the strict rule cannot vouch for — closing it requires a schedule source
+with marketing carriers (OAG, ATPCO, a GDS feed), not a better query.
+
 **Known and accepted:** 142 airports act as a connecting point for fewer than 100
 connections each (TTN, WYS, MGW…), which no airline would sell. That is **0.49%**
 of edges — too small to affect a ranked result, so it is measured rather than
@@ -745,17 +757,38 @@ and the UTC pair both give 257.
 
 ## Notes and caveats
 
-- **The shipped load test does not use these queries.**
-  `neo4j_flight_load_test.py` still uses the older `UNION ALL` form with the
-  `CASE` duration idiom and no carrier predicate. Migrating it is an open task.
-- **Layover bounds are inconsistent across this repo** (300, 720, and 1200
-  minutes appear in different files). Pick a value deliberately.
+- **The load test drives the served query.** `neo4j_flight_load_test.py` calls
+  `flight_search.py` and holds no Cypher of its own beyond one airport-sampling
+  query, gated by `test_load_test_holds_no_cypher_of_its_own`. The older
+  `UNION ALL` form with the `CASE` duration idiom is deleted, not migrated. (This
+  bullet used to say the opposite; it was stale.)
+- **Layover bounds have one authority: the `CONNECTS_TO` edge**, built at
+  [45, 300] minutes in `create_connects_to()`. Since `flight_search.py` traverses
+  that edge and the load test calls `flight_search.py`, no client restates it —
+  the old 300/720/1200 spread across this repo is gone. The hand-rolled explicit
+  join above still takes `$min_layover`/`$max_layover`, because it does the join
+  itself.
 - **Without a carrier predicate, most returned itineraries are unsellable.**
   A 1-stop query with no carrier condition freely splices any airline to any
-  other — including carriers that interline with nobody. But note the predicate
-  cuts both ways: a *strict* `s1.reporting_airline = s2.reporting_airline` is too
+  other — including carriers that interline with nobody. But the predicate cuts
+  both ways: a *strict* `s1.reporting_airline = s2.reporting_airline` is too
   tight, because BTS reports operating carriers and so separates mainlines from
-  their own wholly-owned regional feeders. `CONNECTS_TO` compares marketing
-  carriers via `CARRIER_FAMILY` instead; the explicit join above still uses the
+  their own wholly-owned regional feeders. `CONNECTS_TO` compares
+  `CARRIER_FAMILY`-mapped codes instead; the explicit join above still uses the
   strict form and will miss American Eagle connections.
 - **No APOC.** Everything here is plain Cypher, for Aura compatibility.
+
+### Scope: three things this cannot answer
+
+Stated plainly because none of them is a query problem.
+
+- **Routing covers the 7 dates whose edges are built** — `2025-07-14 … 2025-07-20`,
+  4,028,572 edges — out of 365 dates of loaded `Schedule` nodes. Every other date
+  returns zero itineraries, correctly and with no error. `GET /dates` reports the
+  real coverage; a full year would be ~211M edges.
+- **No price, seat availability, booking class, or per-airport minimum connection
+  time.** The flat [45, 300] window stands in for MCT everywhere. These queries
+  answer "is this flyable as scheduled", not "is this purchasable".
+- **8.64% of edges carry an unresolvable marketing carrier** — the `OO`/`YX`
+  measurement above. Not a modelling gap; BTS On-Time Performance simply has no
+  marketing-carrier column.

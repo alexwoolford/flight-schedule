@@ -1,106 +1,48 @@
 #!/usr/bin/env python3
 """
-Heavy Integration Tests - NOT FOR CI
-===================================
+Hub connection timing against a loaded graph.
+=============================================
 
-These tests require:
-- A loaded Neo4j database with 19M+ records
-- Long execution times (5+ minutes each)
-- Significant memory and CPU resources
+**One real test.** This file used to hold six, and five of them asserted nothing.
+Measured against the dev graph (6,898,743 Schedule nodes, 2025-01-01…2025-12-31),
+every one of those five queries returned **0 rows**, behind `assert count >= 0`:
 
-Use for local testing only, not in CI/CD pipelines.
-Run with: pytest tests/test_integration_heavy.py -v --tb=short
+- `test_popular_routes` — JFK→LAX on `date('2024-03-01')` (0; the graph holds
+  2025), then EGPH→hub→LFMN, Edinburgh to Nice, in US-domestic BTS data (0).
+- `test_time_filtering` — half on `date('2024-03-01')` (0), half on
+  `s.date_of_operation` / `s.first_seen_time`, properties this graph has never
+  had (0, plus an `UnknownPropertyKeyWarning` from the server).
+- `test_airport_coverage` — EGLL, LFPG, EHAM, EDDF, EGPH, LFMN, EIDW, EGCC.
+  **Zero of those eight `Airport` nodes exist.**
+- `test_traveler_scenarios` — 2024 dates, Dublin→Amsterdam, and the banned
+  `duration.between(...).minutes` idiom.
+- `test_query_performance` — a 2-second wall-clock bound on the
+  `date_of_operation` query above, i.e. on zero rows.
+
+They were not merely stale. `assert n >= 0` cannot fail for a count, so each one
+passed *because* it matched nothing, and the file reported green while checking
+the schema of a different dataset. This is the same defect that got
+`test_performance.py` and `test_performance_baseline.py` deleted; see CLAUDE.md.
+
+Nothing was lost by removing them. The equivalent coverage is elsewhere in the
+same CI gate and is falsifiable: nonstop and 1-stop route finding, morning-hour
+filtering, hub identification and multi-constraint queries in
+`test_graph_validation.py`; ranked itineraries, filters and journey arithmetic in
+`test_flight_search_integration.py`; query *plans* rather than wall clock in
+`test_query_plan.py`, which holds at any graph size.
+
+The docstring here also used to say "NOT FOR CI", "requires 19M+ records" and
+"5+ minutes each" — all three untrue: it is in the `integration-test` gate, it
+passes against a one-day 21,376-flight fixture, and it runs in about a second.
+The two session fixtures it declared privately are gone too; `conftest.py`'s
+skip cleanly when Neo4j is unreachable, and these did not.
 """
 
-import os
-
-import pytest
-from dotenv import load_dotenv
-from neo4j import GraphDatabase
+from pathlib import Path
 
 
-@pytest.fixture(scope="session")
-def neo4j_driver():
-    """Neo4j database connection for tests"""
-    load_dotenv(override=True)
-    driver = GraphDatabase.driver(
-        os.getenv("NEO4J_URI"),
-        auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD")),
-    )
-    yield driver
-    driver.close()
-
-
-@pytest.fixture(scope="session")
-def neo4j_database():
-    """Neo4j database name"""
-    load_dotenv(override=True)
-    return os.getenv("NEO4J_DATABASE")
-
-
-class TestFlightSearch:
-    """Test flight search functionality"""
-
-    def test_popular_routes(self, neo4j_driver, neo4j_database):
-        """Test flight search on popular routes"""
-        with neo4j_driver.session(database=neo4j_database) as session:
-            # First check if there's any data at all
-            data_check = session.run(
-                "MATCH (s:Schedule) RETURN count(s) AS total_schedules"
-            )
-            total_schedules = data_check.single()["total_schedules"]
-
-            if total_schedules == 0:
-                pytest.skip(
-                    "No flight data loaded in database - skipping integration test"
-                )
-
-            test_date = "2024-03-01"  # Use March data which we have
-
-            # Test 1: JFK to LAX (realistic US route)
-            result = session.run(
-                """
-                MATCH (s:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: 'JFK'})
-                MATCH (s)-[:ARRIVES_AT]->(arr:Airport {code: 'LAX'})
-                WHERE s.flightdate = date($date)
-                RETURN count(s) AS direct_flights
-            """,
-                date=test_date,
-            )
-
-            jfk_lax = result.single()["direct_flights"]
-            # Lower expectation - just verify query structure works
-            assert jfk_lax >= 0, f"Query should return valid count, got {jfk_lax}"
-
-            # Test 2: Find Edinburgh to Nice connections
-            result = session.run(
-                """
-                MATCH (s1:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: 'EGPH'})
-                MATCH (s1)-[:ARRIVES_AT]->(hub:Airport)
-                MATCH (s2:Schedule)-[:DEPARTS_FROM]->(hub)
-                MATCH (s2)-[:ARRIVES_AT]->(arr:Airport {code: 'LFMN'})
-                WHERE toString(s1.date_of_operation) STARTS WITH $date
-                  AND toString(s2.date_of_operation) STARTS WITH $date
-                  AND hub.code <> 'EGPH' AND hub.code <> 'LFMN'
-
-                WITH s1, s2, hub,
-                     datetime(replace(toString(s1.last_seen_time), 'Z', '')) AS arrival,
-                     datetime(replace(toString(s2.first_seen_time), 'Z', '')) AS departure
-
-                WITH s1, s2, hub, duration.between(arrival, departure).minutes AS connection_time
-                WHERE connection_time >= 45 AND connection_time <= 480
-
-                RETURN count(*) AS connections
-            """,
-                date=test_date,
-            )
-
-            connections = result.single()["connections"]
-            # Just verify the query structure works
-            assert (
-                connections >= 0
-            ), f"Connection query should return valid count, got {connections}"
-            print(f"ℹ️  Found {connections} connections")
+class TestConnectionTiming:
+    """Layover arithmetic through the three biggest US hubs."""
 
     def test_connection_timing(self, neo4j_driver, neo4j_database, search_date):
         """Test connection timing validation
@@ -177,142 +119,62 @@ class TestFlightSearch:
             f"min={min_conn} max={max_conn} on {search_date}"
         )
 
-    def test_time_filtering(self, neo4j_driver, neo4j_database):
-        """Test departure time filtering"""
+    def test_the_hubs_this_asserts_on_are_actually_loaded(
+        self, neo4j_driver, neo4j_database, search_date
+    ):
+        """Anti-vacuity: ATL/DFW/ORD must exist, or the test above proves nothing.
+
+        The deleted tests in this file failed exactly here -- they filtered on
+        eight European ICAO codes, none of which is an `Airport` node in
+        US-domestic BTS data, so their queries could only ever return zero. The
+        `> 1000` bound above is already safe from that, but a future edit to a
+        smaller or differently-scoped fixture could reintroduce it, so state the
+        precondition rather than relying on it.
+        """
         with neo4j_driver.session(database=neo4j_database) as session:
-            # Test morning flights (6-12)
-            result = session.run(
-                """
-                MATCH (s:Schedule)
-                WHERE s.flightdate = date('2024-03-01')
-                  AND s.scheduled_departure_time.hour >= 6
-                  AND s.scheduled_departure_time.hour < 12
-                RETURN count(s) AS morning_flights
-            """
-            )
-
-            morning = result.single()["morning_flights"]
-            assert morning >= 0, f"Query should return valid count, got {morning:,}"
-
-            # Test specific hour filtering (around 10am)
-            result = session.run(
-                """
-                MATCH (s:Schedule)
-                WHERE toString(s.date_of_operation) STARTS WITH '2024-06-18'
-                  AND substring(toString(s.first_seen_time), 11, 2) = '10'
-                RETURN count(s) AS ten_am_flights
-            """
-            )
-
-            ten_am = result.single()["ten_am_flights"]
-            assert ten_am >= 0, f"Query should return valid count, got {ten_am:,}"
-
-    def test_airport_coverage(self, neo4j_driver, neo4j_database):
-        """Test coverage of major airports"""
-        major_airports = [
-            "EGLL",
-            "LFPG",
-            "EHAM",
-            "EDDF",
-            "EGPH",
-            "LFMN",
-            "EIDW",
-            "EGCC",
-        ]
-
-        with neo4j_driver.session(database=neo4j_database) as session:
-            for airport in major_airports:
-                result = session.run(
+            departures = {
+                record["code"]: record["flights"]
+                for record in session.run(
                     """
-                    MATCH (s:Schedule)-[:DEPARTS_FROM]->(a:Airport {code: $code})
-                    WHERE s.flightdate >= date('2024-06-01') AND s.flightdate < date('2024-07-01')
-                    RETURN count(s) AS departures
-                """,
-                    code=airport,
+                    UNWIND ['ATL', 'DFW', 'ORD'] AS code
+                    MATCH (s:Schedule)-[:DEPARTS_FROM]->(:Airport {code: code})
+                    WHERE s.flightdate = date($search_date)
+                    RETURN code, count(s) AS flights
+                    """,
+                    search_date=search_date,
                 )
+            }
 
-                departures = result.single()["departures"]
-                assert (
-                    departures >= 0
-                ), f"Airport {airport} should have valid departure count, got {departures:,}"
-
-    @pytest.mark.integration
-    def test_traveler_scenarios(self, neo4j_driver, neo4j_database):
-        """Test realistic traveler scenarios"""
-        scenarios = [
-            ("Business: JFK → ORD, Tuesday 8am", "JFK", "ORD", "08"),
-            ("Leisure: LAX → DFW, Tuesday 10am", "LAX", "DFW", "10"),
-            ("Weekend: Dublin → Amsterdam, Tuesday 9am", "EIDW", "EHAM", "09"),
-        ]
-
-        with neo4j_driver.session(database=neo4j_database) as session:
-            for scenario_name, origin, destination, hour in scenarios:
-                # Check for options (direct + connections)
-                result = session.run(
-                    """
-                    // Direct flights
-                    MATCH (s:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: $origin})
-                    MATCH (s)-[:ARRIVES_AT]->(arr:Airport {code: $destination})
-                    WHERE s.flightdate = date('2024-03-01')
-                      AND s.scheduled_departure_time.hour >= toInteger($start_hour)
-                      AND s.scheduled_departure_time.hour <= toInteger($end_hour)
-                    RETURN count(s) AS direct_options
-
-                    UNION ALL
-
-                    // Connection flights
-                    MATCH (s1:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: $origin})
-                    MATCH (s1)-[:ARRIVES_AT]->(hub:Airport)
-                    MATCH (s2:Schedule)-[:DEPARTS_FROM]->(hub)
-                    MATCH (s2)-[:ARRIVES_AT]->(arr:Airport {code: $destination})
-                                        WHERE s1.flightdate = date('2024-06-18')
-                      AND s2.flightdate = date('2024-06-18')
-                      AND s1.scheduled_departure_time.hour >= toInteger($start_hour)
-                      AND s1.scheduled_departure_time.hour <= toInteger($end_hour)
-                      AND hub.code <> $origin AND hub.code <> $destination
-
-                                        WITH s1, s2, duration.between(
-                        s1.scheduled_arrival_time,
-                        s2.scheduled_departure_time
-                    ).minutes AS connection_time
-                    WHERE connection_time >= 45 AND connection_time <= 300
-                    RETURN count(*) AS direct_options
-                """,
-                    origin=origin,
-                    destination=destination,
-                    start_hour=f"{max(0, int(hour)-2):02d}",
-                    end_hour=f"{min(23, int(hour)+4):02d}",
-                )
-
-                options = sum(record["direct_options"] for record in result)
-                assert (
-                    options >= 0
-                ), f"{scenario_name}: Query should return valid count, got {options}"
+        missing = {"ATL", "DFW", "ORD"} - departures.keys()
+        assert not missing, (
+            f"{sorted(missing)} have no departures on {search_date}, so the "
+            "connection-timing assertion above would be filtering on airports "
+            "that are not in the graph -- the defect that made five tests in "
+            "this file vacuous. Check the loaded data, not the query."
+        )
+        thin = {code: n for code, n in departures.items() if n < 100}
+        assert not thin, (
+            f"Hub departure counts are implausibly low: {thin} on {search_date}. "
+            "Measured on the one-day fixture: ORD 1,035, ATL 980, DFW 965."
+        )
 
 
-class TestFlightSearchPerformance:
-    """Performance tests for flight search"""
+def test_no_vacuous_count_assertions_return():
+    """`assert count >= 0` must not come back into this file.
 
-    @pytest.mark.slow
-    def test_query_performance(self, neo4j_driver, neo4j_database):
-        """Test that queries perform within acceptable time limits"""
-        import time
-
-        with neo4j_driver.session(database=neo4j_database) as session:
-            # Test direct flight query performance
-            start_time = time.time()
-            result = session.run(
-                """
-                MATCH (s:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: 'JFK'})
-                MATCH (s)-[:ARRIVES_AT]->(arr:Airport {code: 'LAX'})
-                WHERE toString(s.date_of_operation) STARTS WITH '2024-06-18'
-                RETURN count(s) AS flights
-            """
-            )
-            flights = result.single()["flights"]
-            direct_time = time.time() - start_time
-
-            assert (
-                direct_time < 2.0
-            ), f"Direct query took {direct_time:.2f}s, should be <2s"
-            assert flights >= 0, "Query should return valid count"
+    Five tests here passed for years on zero rows, because that is what a count
+    assertion does. Guard the file against its own history rather than trusting
+    a reviewer to notice. Needs no database.
+    """
+    # Skip the module docstring, which quotes the offending pattern deliberately.
+    body = Path(__file__).read_text().split('"""', 2)[-1]
+    offenders = [
+        line.strip()
+        for line in body.splitlines()
+        if ">= 0" in line and line.strip().startswith("assert")
+    ]
+    assert not offenders, (
+        f"vacuous count assertions are back: {offenders}. A count is never "
+        "negative, so this passes on an empty result and hides a broken query. "
+        "Assert a measured lower bound instead."
+    )

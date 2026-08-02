@@ -157,22 +157,43 @@ python download_bts_flight_data.py --year 2024 --month 3
 - **Database**: Use `flights` by default (configurable via .env)
 
 #### 2. Data Loading Errors
-- **Temporal data**: DateTime properties stored as native Neo4j DateTime objects, use directly (e.g., `s.date_of_operation`, `s.first_seen_time.hour`)
-- **Column names**: Use actual column names from parquet files (`icao_operator`, `adep`, `ades`, etc.)
+- **Temporal data**: native Neo4j temporal types, not strings or integers — use
+  them directly (e.g. `s.scheduled_departure_time.hour`). See the schema section
+  below for which properties exist and which two frames they are in.
+- **Column names**: the BTS CSV column names, lowercased with spaces →
+  underscores (`reporting_airline`, `origin`, `dest`, `tail_number`, …). The
+  `icao_operator` / `adep` / `ades` names this line used to give are from a
+  different dataset and appear nowhere in this repo.
 - **File paths**: Flight data is in `data/bts_flight_data/` folder
 
 #### 3. File Organization
 - **Customer docs**: PDFs, implementation details → `private_data/`
 - **Server reports**: Neo4j admin output → `private_data/`
 - **Flight data**: Web-scraped, reproducible → `data/` (gitignored)
-- **Code**: Our optimization work → `src/` (commits)
+- **Code**: repo root, committed. There is no `src/` directory and no package —
+  the three pipeline scripts, `flight_search.py` and `api.py` sit at the top level,
+  and the tests import them from there via `sys.path.insert`.
 
 ### 🔧 Key Technical Details
 
 #### Graph Schema:
 - **Nodes**: `Schedule`, `Airport`, `Carrier`
-- **Relationships**: `DEPARTS_FROM`, `ARRIVES_AT`, `OPERATED_BY`
-- **Schedule Properties**: Contains temporal data (`first_seen_time`, `last_seen_time`, `date_of_operation`)
+- **Relationships**: `DEPARTS_FROM`, `ARRIVES_AT`, `OPERATED_BY`, `CONNECTS_TO`
+  (`Schedule`→`Schedule`, the precomputed routing edge)
+- **`Airport` and `Carrier` carry only `code`.** `Schedule` holds everything else.
+- **`Schedule` has no surrogate ID.** Its identity is the 5-part composite key
+  `(flightdate, reporting_airline, flight_number_reporting_airline, origin, dest)`,
+  enforced by `schedule_composite_unique`. Inventing a `schedule_id` would be
+  fabricating data (rule 1).
+- **Schedule temporal properties**: `flightdate` (`Date`);
+  `scheduled_departure_time` / `scheduled_arrival_time` (`LOCAL DATETIME`, local
+  wall clock at their *own* airport); `scheduled_departure_utc` /
+  `scheduled_arrival_utc` (absolute instants); `scheduled_duration_minutes` (int,
+  BTS block time). **Never subtract the two local timestamps** — they are clocks
+  at different airports. Use the UTC pair or `scheduled_duration_minutes`.
+
+Property names are the BTS CSV column names lowercased with spaces → underscores.
+`load_bts_data.py` is authoritative; `CLAUDE.md` has the full detail.
 
 #### 🚀 Spark Loading Best Practice:
 **CRITICAL**: Schema (constraints and indexes) are automatically managed by the Python loading scripts:
@@ -182,19 +203,16 @@ python download_bts_flight_data.py --year 2024 --month 3
    - Schema is defined in Python code for consistency
    - No need for separate .cypher files or manual schema creation
 
-2. **Use Neo4j Parallel Spark Loader** (prevents deadlocks):
-   ```python
-   # REQUIRED for bulk loading - install first:
-   pip install neo4j-parallel-spark-loader
+2. **Use Neo4j Parallel Spark Loader** (prevents deadlocks). It is already a
+   dependency — `neo4j-parallel-spark-loader==0.5.2` in the `pip:` section of
+   `environment.yml`. Do **not** `pip install` it (rule 4); recreate the conda env.
 
-   # Import and use for relationships:
-   from neo4j_parallel_spark_loader.bipartite import group_and_batch_spark_dataframe
-
-   # Group data to avoid deadlocks
-   grouped_df = group_and_batch_spark_dataframe(
-       df, source_col="schedule_id", target_col="airport_code", num_groups=10
-   )
-   ```
+   The three relationship writes in `create_relationships_fast()` already call
+   `group_and_batch_spark_dataframe`, grouping on the columns that actually exist
+   (`source_col="flightdate"`, `target_col="origin"` / `"dest"` / `"reporting_airline"`)
+   — there is no `schedule_id` or `airport_code` column, and an earlier version of
+   this section invented both. Copy the call shape from `load_bts_data.py:1012`,
+   not from here. `--no-parallel-loader` bypasses the grouping, for debugging only.
 
 **Why**:
 - Constraints create implicit indexes that speed up `MERGE` operations by 3-5x during bulk loading
@@ -202,28 +220,43 @@ python download_bts_flight_data.py --year 2024 --month 3
 - Without constraints: slow loading + potential duplicates
 - Without parallel loader: deadlocks + failed loads
 
-#### Critical Indexes:
-```cypher
-CREATE CONSTRAINT airport_code_unique FOR (a:Airport) REQUIRE a.code IS UNIQUE;
-CREATE CONSTRAINT carrier_code_unique FOR (c:Carrier) REQUIRE c.code IS UNIQUE;
-CREATE CONSTRAINT schedule_id_unique FOR (s:Schedule) REQUIRE s.schedule_id IS UNIQUE;
-CREATE INDEX schedule_date_operations FOR (s:Schedule) ON (s.date_of_operation);
-CREATE INDEX schedule_temporal FOR (s:Schedule) ON (s.first_seen_time, s.last_seen_time);
+#### Indexes and constraints
+
+**Do not copy a Cypher block from here.** `setup_database_schema()` in
+`load_bts_data.py` is the single source of truth for all 6 indexes and 3
+constraints, and it runs as a pre-flight step before every load. Add or change
+them there and nowhere else. `SHOW CONSTRAINTS` / `SHOW INDEXES` against a loaded
+graph tells you what is actually present.
+
+Two things worth knowing before you touch it:
+
+- **Do not add a plain index on `(:Airport {code})` or `(:Carrier {code})`.** The
+  uniqueness constraints create their own backing indexes, and Neo4j rejects a
+  constraint with `IndexAlreadyExists` when a plain index on the identical
+  label+property exists — `IF NOT EXISTS` does **not** suppress it. This repo
+  shipped that collision for a long time behind a bare `except Exception`, so all
+  three constraints were silently absent.
+- A failed index or constraint now returns `False` and **aborts the load**, and
+  the function asserts against `SHOW CONSTRAINTS` rather than trusting that
+  creation didn't raise.
+
+#### Sample Query
+
+Don't hand-write one — call the service. `flight_search.search_itineraries()` is
+the single reviewed query (one quantified path pattern, 0..`max_stops`, ranked by
+real block time plus real layovers, with the acyclicity guard that `CONNECTS_TO`
+cannot express):
+
+```python
+from flight_search import search_itineraries
+
+for it in search_itineraries("LGA", "BOI", "2025-07-18", depart_after="09:00"):
+    print(it.flights, it.route, it.total_minutes)
 ```
 
-#### Sample Query:
-```cypher
-MATCH (s:Schedule)-[:DEPARTS_FROM]->(dep:Airport {code: $origin})
-MATCH (s)-[:ARRIVES_AT]->(arr:Airport {code: $destination})
-MATCH (s)-[:OPERATED_BY]->(carrier:Carrier)
-WHERE date(s.date_of_operation) = date($date)
-  AND s.first_seen_time.hour >= $start_hour
-  AND s.first_seen_time.hour <= $end_hour
-RETURN s.flight_id, carrier.code,
-       s.first_seen_time AS departure,
-       s.last_seen_time AS arrival
-ORDER BY s.first_seen_time
-```
+`ROUTING_QUERY_REFERENCE.md` has the Cypher and the reasoning behind each clause.
+The previous sample query in this slot filtered on `date_of_operation` and
+`first_seen_time`, properties this graph has never had — it could not return a row.
 
 ## 📋 Logging Requirements
 
@@ -264,16 +297,39 @@ logging.basicConfig(
 - **Never**: Drop databases in production environments
 
 ### 📊 Performance Results
-- **Direct flights**: 73-431ms per query
-- **Connection searches**: 143-612ms per query
-- **Average search time**: ~655ms for complete scenarios
-- **Dataset scale**: 4.8M+ flight schedules, 991 airports, 14.4M+ relationships
 
-### 🎯 Success Metrics
-- ✅ Score-based flight ranking with business logic
-- ✅ Sub-second query times on large datasets
-- ✅ Deadlock-free parallel data loading
-- ✅ Customer data protected
+**The figures that used to sit here were wrong and are deleted.** They claimed
+"991 airports", which cannot exist in US-domestic BTS data — measured, the full
+2025 load has **352**, and a single day has ~341. They also gave "4.8M+ flight
+schedules" and "14.4M+ relationships" against a measured 6,898,743 and 24,731,734,
+and quoted 73-431ms latencies with no stated query, depth, filter, or graph size.
+Do not reinstate them or cite them from anywhere.
+
+Measured on the full 2025 load:
+
+| | count |
+|---|---|
+| `Schedule` | 6,898,743 |
+| `Airport` | 352 |
+| `Carrier` | 14 |
+| relationships (all types) | 24,731,734 |
+| of which `CONNECTS_TO` | 4,028,572 (7 dates built) |
+
+Latency belongs with its conditions, and **a departure-time filter dominates the
+cost**, so quoting one number without saying which is how this repo previously
+published 36 ms next to a 400 ms reality. The conditioned table lives in
+`README.md` and `flight_search.py`; the short version is that `{0,2}` holds a
+200 ms p95 with or without a time filter and `{0,3}` does not. Serve `{0,2}`.
+
+### 🎯 What is actually verified
+- ✅ Real BTS data only — no synthetic records anywhere (rule 1)
+- ✅ Timezones solved from block times alone: 341/341 airports on the fixture day,
+  1 component, 0 conflicts, 100% local-arrival round-trip
+- ✅ Itinerary acyclicity gated, with mutation coverage
+- ✅ Deadlock-free parallel relationship loading
+- ✅ Two CI gates, one of which loads a real BTS day into a container
+- ❌ **Not** verified: "score-based flight ranking with business logic" — there is
+  no scoring code in this repo. Ranking is by total elapsed journey.
 
 ## 🛡️ Code Quality & Pre-Commit Workflow
 
@@ -286,12 +342,36 @@ logging.basicConfig(
 ### 📋 Complete Pre-Commit Checklist
 
 **1. Run Complete CI Test Suite (MANDATORY)**
+
+`.github/workflows/ci.yml` is the authority — read the pytest invocations there
+rather than trusting the copy below, which has drifted before (it claimed to be
+"the EXACT same tests" while listing 8 of the 14 files). `CLAUDE.md` keeps a
+maintained copy of both gates.
+
 ```bash
-# Run the EXACT same tests that CI.yml runs
-pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_data_transformations.py tests/test_business_rules.py tests/test_error_scenarios.py -v --cov=. --cov-report=xml --cov-report=term-missing
+# Gate 1 — DB-free. Listed explicitly, NOT `pytest tests/`: conftest.py skips the
+# DB-requiring files rather than failing, so a directory run reports green having
+# asserted nothing.
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
+       tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
+       tests/test_system_validation_unit.py \
+       tests/test_flight_search_service_unit.py \
+       tests/test_business_rules.py tests/test_data_quality_checks.py \
+       tests/test_data_transformations.py tests/test_environment_scenarios.py \
+       tests/test_error_scenarios.py tests/test_performance_boundaries.py \
+       tests/test_pipeline_integration.py \
+       -v --cov=. --cov-report=xml --cov-report=term-missing
+
+# Gate 1b — MUST be a separate process. Importing this file imports locust, which
+# gevent-patches threading process-wide, and that deadlocks FastAPI's TestClient:
+# folded into the run above it HANGS rather than fails.
+pytest tests/test_load_testing_framework.py -v
 
 # ALL tests must pass - no exceptions!
 ```
+
+Gate 2 (`integration-test`) needs a loaded graph; see `CLAUDE.md` for the load
+sequence and the seven files it runs.
 
 **2. Run ALL CI.yml Quality Checks (MANDATORY)**
 ```bash
@@ -327,12 +407,14 @@ python -m pytest tests/test_connection_logic.py -v
 # Query plan tests (index seeks and bounded Top, not wall-clock)
 python -m pytest tests/test_query_plan.py -v
 
-# Integration tests (require loaded database)
+# Hub connection timing (requires a loaded database, ~2s despite the file name)
 python -m pytest tests/test_integration_heavy.py -v
-
-# Full test suite (comprehensive verification)
-python -m pytest tests/ -v
 ```
+
+Do **not** run `pytest tests/` and read a pass as a full verification: the
+DB-backed files *skip* rather than fail when Neo4j is unreachable, so an
+all-skipped run looks green. Use the two gate commands above, and see
+`tests/ci_verify_loaded.py`, which exists to close that hole in CI.
 
 **4. Pre-Commit Hooks (After Manual Checks)**
 ```bash
