@@ -87,7 +87,6 @@ flight-schedule-system/
 **CRITICAL**: Some files are generated from source data and should NOT be committed:
 
 **✅ GENERATE (don't commit):**
-- `flight_test_scenarios.json` - Generated from actual loaded flight data
 - `data/*.parquet` - Downloaded BTS flight data files
 - `logs/*.log` - Runtime log files
 - Neo4j server reports
@@ -100,9 +99,6 @@ flight-schedule-system/
 
 **🔧 Regeneration Commands:**
 ```bash
-# Regenerate flight scenarios from loaded data
-python generate_flight_scenarios.py
-
 # Regenerate flight data from BTS
 python download_bts_flight_data.py --year 2024 --month 3
 ```

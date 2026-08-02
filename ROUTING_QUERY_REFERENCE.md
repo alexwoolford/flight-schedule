@@ -180,10 +180,16 @@ MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
 WHERE first.flightdate = date($date)
 MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
 MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
-WITH p, nodes(p) AS legs, relationships(p) AS conns
+WITH nodes(p) AS legs, relationships(p) AS conns
+// No airport twice. The edge's backtrack guard is pairwise and does not compose
+// over 3+ legs; without this, 18% of {0,3} paths revisit an airport and some
+// return to the origin. See "Itineraries revisit airports" below.
+WITH legs, conns, [legs[0].origin] + [x IN legs | x.dest] AS airports
+WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                             WHERE NOT airports[i] IN airports[0..i]])
 RETURN size(legs) - 1 AS stops,
        [f IN legs | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
-       [f IN legs | f.origin + '-' + f.dest] AS route,
+       airports AS route,
        // Sum of real block times. Do NOT compute arrives - departs.
        reduce(t = 0, f IN legs | t + f.scheduled_duration_minutes) AS air_minutes,
        reduce(t = 0, c IN conns | t + c.layover_minutes) AS layover_minutes
@@ -196,7 +202,8 @@ LIMIT $limit
 
 Because the connection rules live in the edge, there are no inter-repetition
 predicates left to write, and no way to accidentally splice two carriers into an
-unsellable itinerary.
+unsellable itinerary. The one thing the edge *cannot* enforce is a property of the
+whole path — that no airport repeats — so that guard stays in the query.
 
 ### Arrive-before-a-deadline
 
@@ -211,10 +218,14 @@ WHERE first.flightdate = date($date)
 MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
 MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
 WITH nodes(p) AS legs, relationships(p) AS conns, last AS f
+WITH legs, conns, f, [legs[0].origin] + [x IN legs | x.dest] AS airports
+// No airport twice — see "Itineraries revisit airports" below.
+WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                             WHERE NOT airports[i] IN airports[0..i]])
 // localdatetime, NOT datetime: scheduled_arrival_time is a LOCAL DATETIME, and
 // comparing it against a ZONED DATETIME yields NULL rather than false, which
 // silently discards every row. See "Deadline filters" above.
-WHERE f.scheduled_arrival_time < localdatetime($deadline)
+  AND f.scheduled_arrival_time < localdatetime($deadline)
 // The stored time-of-day is the correct destination-local wall clock, but the
 // DATE comes from the origin's flightdate, so a leg crossing local midnight is
 // stamped a day early and would falsely satisfy the deadline. CONNECTS_TO
@@ -227,7 +238,7 @@ WHERE f.scheduled_arrival_time < localdatetime($deadline)
 RETURN size(legs) - 1 AS stops,
        [x IN legs | x.reporting_airline +
                     toString(x.flight_number_reporting_airline)] AS flights,
-       [x IN legs | x.origin + '-' + x.dest] AS route,
+       airports AS route,
        f.scheduled_arrival_time AS arrives,
        // Elapsed journey from real block times plus real layovers. Never
        // subtract the endpoints: they are in different timezones.
@@ -256,6 +267,121 @@ The remaining honest limitation is **cross-airport comparison**. Ranking by
 "which of these arrives earliest in absolute time" is not answerable for
 destinations in different timezones — nothing in the graph carries a UTC offset.
 Within a single `$dest`, as here, that does not arise.
+
+### Depart-after-a-time
+
+The mirror image of the deadline query, and the more common one on a travel site:
+"leave after 08:00." It needs **neither** guard above — it constrains the *first*
+leg's departure, which is local at the origin and is the one timestamp with no
+date ambiguity at all. It does still need `localdatetime()`, for the same
+type-mismatch reason.
+
+```cypher
+MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
+WHERE first.flightdate = date($date)
+  // localdatetime, NOT datetime: comparing a LOCAL DATETIME against a ZONED one
+  // yields NULL, so WHERE would discard every row. Same trap as the deadline
+  // query; see "Deadline filters" above.
+  AND first.scheduled_departure_time >= localdatetime($after)
+MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
+MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WITH nodes(p) AS legs, relationships(p) AS conns
+// Acyclicity — see below. Not optional.
+WITH legs, conns, [legs[0].origin] + [x IN legs | x.dest] AS airports
+WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                             WHERE NOT airports[i] IN airports[0..i]])
+RETURN size(legs) - 1 AS stops,
+       [x IN legs | x.reporting_airline +
+                    toString(x.flight_number_reporting_airline)] AS flights,
+       airports AS route,
+       legs[0].scheduled_departure_time AS departs,
+       reduce(t = 0, x IN legs | t + x.scheduled_duration_minutes) +
+       reduce(t = 0, c IN conns | t + c.layover_minutes) AS total_minutes
+ORDER BY total_minutes
+LIMIT $limit
+```
+
+`$after` is a local wall-clock string at the **origin**, e.g.
+`"2025-07-18T08:00:00"`. Measured, `{0,3}`, `LIMIT 8`, warm, departing after
+08:00 on 2025-07-18:
+
+| route | wall clock | best itinerary |
+|---|---|---|
+| BOI→ALB | **22 ms** | `WN1382+WN3900` via MDW, dep 14:50, 375 min |
+| PVD→BOI | **45 ms** | `OO5422+OO5290` via ORD, dep 16:29, 503 min |
+| FCA→SAV | **11 ms** | `AA2939+AA2327` via DFW, dep 11:46, 533 min |
+| LGA→DFW | **180 ms** | `AA3289` nonstop, dep 08:30, 227 min |
+
+### Itineraries revisit airports unless you say otherwise
+
+`CONNECTS_TO` carries a backtrack guard, but it is **pairwise** — it forbids
+`s2.dest = s1.origin` on a single edge. That does not compose over three legs, so
+a quantified path can leave an airport and come back to it. Measured on
+2025-07-18, LGA→DFW at `{0,3}`: **2,115 of 11,488 paths (18.41%)** revisit an
+airport, and **385 return to the origin outright**:
+
+```
+LGA -> MIA -> CLT -> LGA    AA970, AA985, AA1060
+LGA -> MIA -> DFW -> LGA    AA970, AA1199, AA2708
+```
+
+Each of those is a legal chain of connections that no airline would sell. Over a
+broader sample of 3-leg paths the rate is **1.74%**; it climbs with hop count and
+with hub density, which is why it is invisible at `{0,1}` and material at `{0,3}`.
+
+The fix is the projection-and-compare in the query above:
+
+```cypher
+WITH legs, conns, [legs[0].origin] + [x IN legs | x.dest] AS airports
+WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                             WHERE NOT airports[i] IN airports[0..i]])
+```
+
+**Cypher's `ACYCLIC` and `TRAIL` path modes do not help here**, which is the
+non-obvious part. They deduplicate the nodes and relationships *on the path*, and
+the path's nodes are `Schedule` (flight) nodes — always distinct, since a given
+flight appears once. The entity that repeats is an `Airport`, which is not on the
+path at all; it is reached through `DEPARTS_FROM`/`ARRIVES_AT`. Verified on the
+same route and date:
+
+| path mode | paths | airport revisits |
+|---|---|---|
+| default (`WALK`) | 11,488 | 2,115 |
+| `ACYCLIC` | 11,488 | 2,115 |
+| `TRAIL` | 11,488 | 2,115 |
+
+Identical. The guard has to be written against airport codes.
+
+**Cost: none worth measuring.** A/B over six routes at `{0,3}`, three runs each,
+minimum taken — the guard is within ±5%, i.e. inside run-to-run noise, and the
+top-ranked itinerary is unchanged on every route (it prunes only paths that were
+never going to rank):
+
+| route | unguarded | guarded |
+|---|---|---|
+| LGA→DFW | 413 ms | 436 ms |
+| ATL→SEA | 487 ms | 509 ms |
+| ORD→LAX | 612 ms | 584 ms |
+| BOI→ALB | 81 ms | 88 ms |
+| PVD→BOI | 140 ms | 146 ms |
+| FCA→SAV | 18 ms | 20 ms |
+
+### Latency across real routes
+
+The tables above are hand-picked routes. Across **40 origin/destination pairs
+drawn from the graph's 60 busiest origins**, top-20 sorted, acyclicity guard on,
+departing after 08:00, warm cache:
+
+| depth | p50 | p95 | max | over 200 ms | empty results |
+|---|---|---|---|---|---|
+| `{0,2}` | **36 ms** | **56 ms** | 124 ms | **0 / 40** | 0 |
+| `{0,3}` | **114 ms** | **218 ms** | 279 ms | **5 / 40** | 0 |
+
+**Two stops holds a 200 ms budget with room to spare. Three stops does not** — it
+misses on about 12% of pairs, worst on dense hub-to-hub routes where the
+candidate set is largest (LGA→DFW enumerates 11,488 itineraries to return 20).
+If you need a hard 200 ms ceiling, serve `{0,2}` and treat `{0,3}` as a
+widen-on-demand second request rather than the default.
 
 ### Measured
 
@@ -481,6 +607,10 @@ LIMIT 10;
 ```
 
 37 ms for LGA→DFW.
+
+Note these modes work **here** because the path's nodes *are* the airports. Over
+`CONNECTS_TO` the path's nodes are flights, so neither mode prevents an airport
+from repeating — see "Itineraries revisit airports" above.
 
 **What `ROUTE` does not answer.** It has no date and no times, so it cannot tell
 you whether a connection is *bookable* — only whether the route pairs exist. Treat

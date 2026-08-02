@@ -12,12 +12,6 @@ conda env update -f environment.yml
 # conda install -c conda-forge locust faker psutil
 ```
 
-### 1.5. Flight scenarios — not required
-
-`generate_flight_scenarios.py` writes `flight_test_scenarios.json`, but
-**nothing reads that file.** `neo4j_flight_load_test.py` queries your database
-directly for airports and dates at startup. You can skip this step.
-
 ### 2. Configure Database Connection
 The load test automatically loads credentials from your `.env` file using `python-dotenv`:
 ```bash

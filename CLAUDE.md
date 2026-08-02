@@ -64,8 +64,6 @@ pytest tests/ -m "not slow" -v
 
 The `conftest.py` fixtures **skip** rather than fail when Neo4j is unreachable, which is right for a laptop and dangerous for a gate — an all-skipped run reports success. `tests/ci_verify_loaded.py` exists to close that hole and runs before the assertions in CI. For the same reason, the `CONNECTS_TO` regression tests assert both that the defect is absent *and* that the fixture could have exposed it (893 overnight legs, 110,642 cross-family edges, asserted non-zero); swapping in a fixture that lacks either property fails loudly instead of silently gating nothing. Pinning matters too: the service container is `neo4j:2026.05.0-community` because the loader uses the variable-scope `CALL (r) { ... } IN TRANSACTIONS` form that 5.x parsers reject.
 
-`test_load_testing_framework.py` skips most of its body unless `flight_test_scenarios.json` exists (a generated, gitignored file — see below).
-
 ### Quality checks
 
 ```bash
@@ -98,7 +96,6 @@ python load_bts_data.py --no-parallel-loader                       # bypass dead
 ### Load testing
 
 ```bash
-python generate_flight_scenarios.py          # writes flight_test_scenarios.json — but NOTHING reads it
 locust -f neo4j_flight_load_test.py          # web UI at :8089
 locust -f neo4j_flight_load_test.py --headless --users 50 --spawn-rate 5 --run-time 300s
 python quick_load_test_analysis.py locust_stats.csv
@@ -106,14 +103,14 @@ python quick_load_test_analysis.py locust_stats.csv
 
 **The load test does not measure realistic traffic, and its published numbers are unsupportable.**
 
-- `generate_flight_scenarios.py` is **dead code**. `neo4j_flight_load_test.py` never reads `flight_test_scenarios.json` — it imports only os/random/time/typing/dotenv/locust/neo4j. The documented "70% Popular / 20% Medium / 10% Niche" distribution does not exist; the reality is two tasks, `@task(70)` direct-count and `@task(30)` routing. `setup-and-run.sh:431` still runs the generator and logs success.
+- The documented "70% Popular / 20% Medium / 10% Niche" distribution does not exist; the reality is two tasks, `@task(70)` direct-count and `@task(30)` routing. (`generate_flight_scenarios.py` and `flight_test_scenarios.json` were dead code — nothing ever read the file — and have been **deleted**, along with the `TestFlightScenarioGeneration` class that only ever skipped.)
 - `_load_airports()` at `:67-81` sorts **lexicographically** (`ORDER BY a.code`) then slices `[:100]`, so the sampling universe is ABE…ELM — overlapping the 100 busiest airports by only 28/100 and excluding 19 of the top 30 (ORD, LAX, JFK, LGA, SFO, EWR, MIA, SEA, PHX, LAS, MCO, SLC, MSP, IAH, FLL, PHL, SAN, TPA, MDW). LGA, the origin in the README's own showcase, cannot be sampled at all. Measured: **~95% of the 70%-weighted direct search returns zero rows.**
 - The `if total_routes < 5` short-circuit at `:200` fires on only ~1.5% of sampled cells, so the expensive 6-hop query runs on ~98% of the 30% task while traversing far less than a real hub set would demand. The two errors point in opposite directions and cancel unpredictably.
 - `:166/:249/:291` pass a per-airport-pair string as Locust's `name`, producing up to 29,700 single-sample stats entries, so reported percentiles are computed over 1-2 samples each. `quick_load_test_analysis.py:74-83` matches substrings present in none of them and labels every row "Other".
 - `_load_dates()` at `:82-101` runs an unbounded `DISTINCT` over every Schedule node, once per simulated user.
-- `README.md:323`'s "Connection Pooling: enabled" is false as written: no pool parameter is set anywhere, and `:40` constructs one driver **per simulated user**.
+- No connection pool parameter is set anywhere, and `:40` constructs one driver **per simulated user**, so any measurement includes driver setup.
 
-Do not quote the existing latency figures. `AGENTS.md:271-274` attributes 73-431ms to a "991 airports" dataset that cannot exist in US-domestic BTS (measured: 334 Jan, 331 Mar, 342 Jul). `README.md:229`'s "~140ms" is attached to a UNION ALL query present in no code path. `README.md:321`'s "200+ QPS" is arithmetically unreachable at ≤100 users given `wait_time = between(1, 3)` and ~1.3 requests per iteration — the ceiling is ~65 req/s.
+Do not quote the existing latency figures. `AGENTS.md:271-274` attributes 73-431ms to a "991 airports" dataset that cannot exist in US-domestic BTS (measured: 334 Jan, 331 Mar, 342 Jul). The README's unsupportable claims ("200+ QPS", "~140ms", "Connection Pooling: enabled", the fabricated `DL308 → UA1071 via ATL` showcase block) were **removed in `f20f20c`** — if you see them cited as present anywhere, that citation is stale.
 
 ## Architecture
 
@@ -158,6 +155,10 @@ The `CASE` idiom assumes `arrival < departure` means a midnight crossing. Usuall
 
 **But read the 49.56% correctly — it is about subtraction, not about the stored times.** Measured 2025-07-18: `(arrival − departure − block) mod 1440` is a *single* value for **2,737 of 2,737 (100.00%)** directed airport pairs with ≥3 flights, and every value is a whole hour. That can only hold if each stored time-of-day is the correct **local wall clock at its own airport** — which a spot check confirms (`DL304 DTW→SNA` stores 08:45→10:25 with a 280-min block; 08:45 ET = 05:45 PT, +280 = 10:25 PT ✓). So a "arrives before 3pm local" filter **is** sound on time-of-day; what is wrong is the **date**, because both timestamps are composed onto the origin's `flightdate`. 893 of 21,376 flights that day (4.18%) cross local midnight and are stamped a day early. See `ROUTING_QUERY_REFERENCE.md` "What that 49% does and does not mean".
 
+**Itineraries revisit airports unless the query forbids it.** `CONNECTS_TO`'s backtrack guard is *pairwise* (`s2.dest <> s1.origin`) and does not compose over 3+ legs. Measured 2025-07-18 LGA→DFW at `{0,3}`: **2,115 of 11,488 paths (18.41%)** revisit an airport and **385 return to the origin** (`LGA→MIA→CLT→LGA`). Cypher's `ACYCLIC`/`TRAIL` path modes **do not fix this** — they dedupe path *nodes*, which here are `Schedule` nodes and always distinct; the repeating entity is an `Airport` reached off-path via `DEPARTS_FROM`/`ARRIVES_AT` (verified: identical 2,115 under all three modes). The guard must compare airport codes; it is in every routing query in the docs and gated by `TestItineraryShape`. Cost is within run-to-run noise (±5% over six routes).
+
+**Latency: `{0,2}` meets a 200 ms budget, `{0,3}` does not.** Over 40 origin/destination pairs drawn from the 60 busiest origins, top-20 sorted, guard on, warm: `{0,2}` p50 36 ms / p95 56 ms / **0 of 40 over 200 ms**; `{0,3}` p50 114 ms / p95 218 ms / **5 of 40 over**. Serve `{0,2}` by default.
+
 **Two silent traps in any deadline filter**, both now gated by `TestDeadlineFilters` in `tests/test_graph_validation.py`:
 - `scheduled_arrival_time` is a `LOCAL DATETIME`; comparing it to `datetime('...')` (zoned) yields **NULL**, not false, so `WHERE` drops every row and a route with 40 valid itineraries returns zero with no error. Use `localdatetime()`.
 - Overnight legs pass a deadline they miss (stored a day early). `CONNECTS_TO` excludes overnight *inbound* legs, but the **final** leg of an itinerary is nobody's inbound, so a deadline query must re-apply the block-time guard itself.
@@ -198,7 +199,6 @@ Both loader scripts log to `logs/{script}_{timestamp}.log` (gitignored). `load_b
 | File | Regenerate with |
 |---|---|
 | `data/bts_flight_data/*.parquet` | `python download_bts_flight_data.py` |
-| `flight_test_scenarios.json` | `python generate_flight_scenarios.py` (needs a loaded DB) |
 | `logs/*.log` | produced on every run |
 
 ## Unused data worth knowing about

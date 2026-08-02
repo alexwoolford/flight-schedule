@@ -839,6 +839,321 @@ class TestDeadlineFilters:
             )
 
 
+class TestItineraryShape:
+    """
+    Guard properties of the itinerary as a whole, which no single edge can carry.
+
+    CONNECTS_TO enforces everything local to one connection -- carrier, layover
+    window, contiguity, no immediate backtrack. A path property like "no airport
+    twice" is invisible to it, and that gap is real: 18% of LGA->DFW {0,3} paths
+    revisit an airport. See "Itineraries revisit airports" in
+    ROUTING_QUERY_REFERENCE.md.
+    """
+
+    # The documented guard, kept in one place so the tests below and the docs
+    # cannot drift apart. Operates on airport CODES, not on path nodes.
+    ACYCLIC_GUARD = """
+        WITH legs, conns, [legs[0].origin] + [x IN legs | x.dest] AS airports
+        WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                                     WHERE NOT airports[i] IN airports[0..i]])
+    """
+
+    def _busiest_date(self, session):
+        record = session.run(
+            """
+            MATCH (s:Schedule)-[:CONNECTS_TO]->()
+            WITH s.flightdate AS d, count(*) AS n ORDER BY n DESC LIMIT 1
+            RETURN toString(d) AS date
+            """
+        ).single()
+        return record["date"] if record else None
+
+    def _densest_route(self, session, date):
+        """A route with enough 3-leg paths to actually contain a cycle.
+
+        Chosen from the graph rather than hard-coded: a thin route may have no
+        cyclic path at all, which would make the assertions below vacuous.
+        """
+        record = session.run(
+            """
+            MATCH (s1:Schedule)-[:CONNECTS_TO]->(:Schedule)-[:CONNECTS_TO]->(s3)
+            WHERE s1.flightdate = date($date)
+            WITH s1.origin AS origin, s3.dest AS dest, count(*) AS paths
+            WHERE origin <> dest
+            RETURN origin, dest ORDER BY paths DESC LIMIT 1
+            """,
+            date=date,
+        ).single()
+        return (record["origin"], record["dest"]) if record else (None, None)
+
+    def test_unguarded_qpp_does_revisit_airports(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """Anti-vacuity: the hazard the guard exists for is present in the graph
+
+        Without this, test_guarded_qpp_never_revisits_an_airport could pass on a
+        dataset where no cyclic path exists, gating nothing. Assert the graph can
+        expose the bug before asserting the guard suppresses it.
+        """
+        with neo4j_driver.session(database=neo4j_database) as session:
+            if (
+                session.run(
+                    "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+                ).single()["count"]
+                == 0
+            ):
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            date = self._busiest_date(session)
+            origin, dest = self._densest_route(session, date)
+            if origin is None:
+                pytest.skip("No 2-stop route found in the graph")
+
+            record = session.run(
+                """
+                MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
+                WHERE first.flightdate = date($date)
+                MATCH p = (first)-[:CONNECTS_TO]->{0,3}(last:Schedule)
+                MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
+                WITH nodes(p) AS legs
+                WITH [legs[0].origin] + [x IN legs | x.dest] AS ap
+                WITH ap, size(ap) AS n,
+                     size([i IN range(0, size(ap) - 1)
+                           WHERE NOT ap[i] IN ap[0..i]]) AS uniq
+                RETURN count(*) AS total,
+                       sum(CASE WHEN n <> uniq THEN 1 ELSE 0 END) AS cyclic,
+                       sum(CASE WHEN ap[0] IN ap[1..] THEN 1 ELSE 0 END)
+                           AS back_to_origin
+                """,
+                origin=origin,
+                dest=dest,
+                date=date,
+            ).single()
+
+        where = f"{origin}->{dest} on {date}"
+        assert record["total"] > 0, f"{where}: {{0,3}} returned no paths at all"
+        assert record["cyclic"] > 0, (
+            f"{where}: none of {record['total']:,} unguarded {{0,3}} paths "
+            "revisits an airport, so this dataset cannot detect a routing query "
+            "that omits the acyclicity guard. Pick a denser route or date."
+        )
+
+    def test_guarded_qpp_never_revisits_an_airport(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """The documented guard removes every airport revisit, and only those
+
+        Mutation-tested: deleting the guard fails on the revisit assertion, and
+        replacing it with Cypher's ACYCLIC or TRAIL path mode ALSO fails --
+        those modes deduplicate path nodes, which here are Schedule nodes and are
+        always distinct. The repeating entity is an Airport reached off-path.
+        """
+        with neo4j_driver.session(database=neo4j_database) as session:
+            if (
+                session.run(
+                    "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+                ).single()["count"]
+                == 0
+            ):
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            date = self._busiest_date(session)
+            origin, dest = self._densest_route(session, date)
+            if origin is None:
+                pytest.skip("No 2-stop route found in the graph")
+
+            rows = list(
+                session.run(
+                    f"""
+                    MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {{code: $origin}})
+                    WHERE first.flightdate = date($date)
+                    MATCH p = (first)-[:CONNECTS_TO]->{{0,3}}(last:Schedule)
+                    MATCH (last)-[:ARRIVES_AT]->(:Airport {{code: $dest}})
+                    WITH nodes(p) AS legs, relationships(p) AS conns
+                    {self.ACYCLIC_GUARD}
+                    // Raw airport list so the assertion recomputes uniqueness
+                    // itself rather than trusting the guard's own arithmetic.
+                    RETURN airports, size(legs) - 1 AS stops
+                    """,
+                    origin=origin,
+                    dest=dest,
+                    date=date,
+                )
+            )
+
+        where = f"{origin}->{dest} on {date}"
+        assert rows, (
+            f"{where}: the guarded {{0,3}} query returned nothing. The guard "
+            "should prune cyclic paths, not all of them."
+        )
+        for row in rows:
+            airports = row["airports"]
+            assert len(airports) == len(set(airports)), (
+                f"{where}: returned itinerary {' -> '.join(airports)} visits an "
+                "airport twice. No airline sells this. The acyclicity guard is "
+                "missing or ineffective — note that Cypher's ACYCLIC/TRAIL path "
+                "modes do NOT work here, because the path's nodes are flights."
+            )
+            assert airports[0] == origin, f"{where}: wrong origin {airports[0]}"
+            assert airports[-1] == dest, f"{where}: wrong dest {airports[-1]}"
+            assert row["stops"] == len(airports) - 2, (
+                f"{where}: {row['stops']} stops but {len(airports)} airports in "
+                f"{' -> '.join(airports)}"
+            )
+
+    def test_depart_after_query_is_correct(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """The depart-after query in ROUTING_QUERY_REFERENCE.md is sound
+
+        The mirror of the deadline query. It needs no overnight guard: it
+        constrains the FIRST leg's departure, which is local at the origin and
+        is the one timestamp carrying no date ambiguity. It does still need
+        localdatetime() -- comparing a LOCAL DATETIME to a ZONED one yields NULL
+        and silently drops every row.
+
+        Mutation-tested: swapping localdatetime() for datetime() returns zero
+        rows and fails; deleting the acyclicity guard fails; computing the
+        journey total by endpoint subtraction fails.
+        """
+        with neo4j_driver.session(database=neo4j_database) as session:
+            if (
+                session.run(
+                    "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+                ).single()["count"]
+                == 0
+            ):
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            date = self._busiest_date(session)
+            origin, dest = self._densest_route(session, date)
+            if origin is None:
+                pytest.skip("No 2-stop route found in the graph")
+            after = f"{date}T08:00:00"
+
+            rows = list(
+                session.run(
+                    f"""
+                    MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {{code: $origin}})
+                    WHERE first.flightdate = date($date)
+                      AND first.scheduled_departure_time >= localdatetime($after)
+                    MATCH p = (first)-[:CONNECTS_TO]->{{0,2}}(last:Schedule)
+                    MATCH (last)-[:ARRIVES_AT]->(:Airport {{code: $dest}})
+                    WITH nodes(p) AS legs, relationships(p) AS conns
+                    {self.ACYCLIC_GUARD}
+                    RETURN airports,
+                           size(legs) - 1 AS stops,
+                           toString(legs[0].scheduled_departure_time) AS departs,
+                           // Raw ingredients: the assertions recompute every
+                           // derived value instead of trusting the query.
+                           [x IN legs | x.scheduled_duration_minutes] AS blocks,
+                           [c IN conns | c.layover_minutes] AS layovers,
+                           reduce(t = 0, x IN legs |
+                                  t + x.scheduled_duration_minutes) +
+                           reduce(t = 0, c IN conns |
+                                  t + c.layover_minutes) AS total_minutes
+                    // No LIMIT: assert every row the predicates admit. Under a
+                    // LIMIT the sound itineraries sort to the top and defective
+                    // ones hide beneath it.
+                    ORDER BY total_minutes
+                    """,
+                    origin=origin,
+                    dest=dest,
+                    date=date,
+                    after=after,
+                )
+            )
+
+        where = f"{origin}->{dest} on {date} departing after 08:00"
+        assert rows, (
+            f"The depart-after query returned nothing for {where}. This is the "
+            "symptom of the localdatetime/datetime NULL trap — a ZONED "
+            "comparison evaluates NULL and WHERE discards every row."
+        )
+        for row in rows:
+            assert row["departs"] >= after, (
+                f"{where}: returned an itinerary departing {row['departs']}, "
+                "before the requested time"
+            )
+            airports = row["airports"]
+            assert len(airports) == len(set(airports)), (
+                f"{where}: itinerary {' -> '.join(airports)} visits an airport " "twice"
+            )
+            expected = sum(row["blocks"]) + sum(row["layovers"])
+            assert row["total_minutes"] == expected, (
+                f"{where}: journey reported as {row['total_minutes']} min but "
+                f"its block times and layovers sum to {expected} min. "
+                "Subtracting the endpoint timestamps is wrong — they are in "
+                "different timezones."
+            )
+            assert all(45 <= lay <= 300 for lay in row["layovers"]), (
+                f"{where}: layovers {row['layovers']} fall outside the 45-300 "
+                "minute window the edges were built with"
+            )
+
+    def test_results_are_ordered_by_journey_time(
+        self, neo4j_driver, neo4j_database, loaded_graph
+    ):
+        """Ranked output is monotonic in total journey minutes
+
+        A travel-site backend has to return options in a defensible order. The
+        sound ranking key is sum(block times) + sum(layovers); endpoint
+        subtraction is not, because the endpoints sit in different timezones.
+        """
+        with neo4j_driver.session(database=neo4j_database) as session:
+            if (
+                session.run(
+                    "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
+                ).single()["count"]
+                == 0
+            ):
+                pytest.skip("No CONNECTS_TO edges — see --build-connections")
+            date = self._busiest_date(session)
+            origin, dest = self._densest_route(session, date)
+            if origin is None:
+                pytest.skip("No 2-stop route found in the graph")
+
+            rows = list(
+                session.run(
+                    f"""
+                    MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {{code: $origin}})
+                    WHERE first.flightdate = date($date)
+                    MATCH p = (first)-[:CONNECTS_TO]->{{0,2}}(last:Schedule)
+                    MATCH (last)-[:ARRIVES_AT]->(:Airport {{code: $dest}})
+                    WITH nodes(p) AS legs, relationships(p) AS conns
+                    {self.ACYCLIC_GUARD}
+                    WITH [x IN legs | x.scheduled_duration_minutes] AS blocks,
+                         [c IN conns | c.layover_minutes] AS layovers,
+                         reduce(t = 0, x IN legs |
+                                t + x.scheduled_duration_minutes) +
+                         reduce(t = 0, c IN conns |
+                                t + c.layover_minutes) AS total_minutes
+                    RETURN blocks, layovers, total_minutes
+                    ORDER BY total_minutes
+                    LIMIT 25
+                    """,
+                    origin=origin,
+                    dest=dest,
+                    date=date,
+                )
+            )
+
+        where = f"{origin}->{dest} on {date}"
+        assert len(rows) >= 2, f"{where}: need 2+ itineraries to check ordering"
+        totals = [r["total_minutes"] for r in rows]
+        assert totals == sorted(
+            totals
+        ), f"{where}: results are not ordered by journey time: {totals}"
+        # And the key itself is the sound one, recomputed here.
+        for row in rows:
+            expected = sum(row["blocks"]) + sum(row["layovers"])
+            assert row["total_minutes"] == expected, (
+                f"{where}: ranking key {row['total_minutes']} != "
+                f"sum(blocks) + sum(layovers) = {expected}"
+            )
+        assert totals[-1] > totals[0], (
+            f"{where}: every itinerary has an identical {totals[0]}-minute "
+            "journey, so this cannot demonstrate that ordering works"
+        )
+
+
 class TestBusinessLogic:
     """Test business logic patterns"""
 

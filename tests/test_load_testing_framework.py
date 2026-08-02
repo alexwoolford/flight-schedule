@@ -8,85 +8,9 @@ running database queries. These are lightweight validation tests to ensure
 the framework is correctly configured before running real load tests.
 """
 
-import json
-import tempfile
-from datetime import date
 from pathlib import Path
 
 import pytest
-
-
-class TestFlightScenarioGeneration:
-    """Test flight scenario file structure and validity"""
-
-    def test_scenario_file_exists_and_loads(self):
-        """Test that flight_test_scenarios.json can be loaded when it exists"""
-        scenario_file = Path("flight_test_scenarios.json")
-        if not scenario_file.exists():
-            pytest.skip(
-                "flight_test_scenarios.json not found - this is expected since it's a "
-                "generated file. Run generate_flight_scenarios.py after loading "
-                "flight data."
-            )
-
-        with open(scenario_file, "r") as f:
-            scenarios = json.load(f)
-
-        assert isinstance(scenarios, dict)
-        assert "airport_pairs" in scenarios
-        assert "popular_routes" in scenarios
-        assert "hub_airports" in scenarios
-        assert "available_dates" in scenarios
-
-    def test_scenario_data_structure_validity(self):
-        """Test that loaded scenarios have the expected structure"""
-        scenario_file = Path("flight_test_scenarios.json")
-        if not scenario_file.exists():
-            pytest.skip("flight_test_scenarios.json not found")
-
-        with open(scenario_file, "r") as f:
-            scenarios = json.load(f)
-
-        # Test airport pairs structure
-        airport_pairs = scenarios.get("airport_pairs", [])
-        if airport_pairs:
-            sample_pair = airport_pairs[0]
-            assert "origin" in sample_pair
-            assert "dest" in sample_pair
-            assert "pattern" in sample_pair
-            assert len(sample_pair["origin"]) == 3  # IATA code
-            assert len(sample_pair["dest"]) == 3  # IATA code
-
-        # Test popular routes structure
-        popular_routes = scenarios.get("popular_routes", [])
-        assert isinstance(popular_routes, list)
-
-        # Test hub airports structure
-        hub_airports = scenarios.get("hub_airports", [])
-        assert isinstance(hub_airports, list)
-        if hub_airports:
-            assert len(hub_airports[0]) == 3  # IATA code
-
-        # Test available dates structure
-        available_dates = scenarios.get("available_dates", [])
-        assert isinstance(available_dates, list)
-        if available_dates:
-            # Should be ISO date strings
-            date.fromisoformat(available_dates[0])
-
-    def test_scenario_data_completeness(self):
-        """Test that scenarios contain reasonable amounts of data"""
-        scenario_file = Path("flight_test_scenarios.json")
-        if not scenario_file.exists():
-            pytest.skip("flight_test_scenarios.json not found")
-
-        with open(scenario_file, "r") as f:
-            scenarios = json.load(f)
-
-        # Should have meaningful amounts of data
-        assert len(scenarios.get("airport_pairs", [])) >= 10
-        assert len(scenarios.get("hub_airports", [])) >= 5
-        assert len(scenarios.get("available_dates", [])) >= 5
 
 
 class TestLoadTestScriptValidation:
@@ -98,83 +22,34 @@ class TestLoadTestScriptValidation:
             import neo4j_flight_load_test  # noqa: F401
         except ImportError as e:
             pytest.fail(f"Failed to import neo4j_flight_load_test: {e}")
-        except Exception as e:
-            # If it fails due to missing scenarios file, that's OK for this test
-            if "flight_test_scenarios.json" in str(e):
-                pytest.skip("Scenarios file missing - this is an import structure test")
-            else:
-                pytest.fail(f"Unexpected error importing neo4j_flight_load_test: {e}")
 
     def test_locust_user_class_structure(self):
-        """Test that the load test defines proper Locust user class"""
-        # Import with temporary mock scenarios to avoid file dependency
-        temp_scenarios = {
-            "airport_pairs": [
-                {"origin": "LAX", "dest": "JFK", "pattern": "hub_to_hub"}
-            ],
-            "popular_routes": [
-                {"origin": "LAX", "dest": "JFK", "pattern": "hub_to_hub"}
-            ],
-            "hub_airports": ["LAX", "JFK"],
-            "available_dates": ["2024-03-01"],
-        }
+        """Test that the load test defines proper Locust user class
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(temp_scenarios, f)
-            temp_file = f.name
+        This used to write a fake flight_test_scenarios.json into the repo root
+        (moving any real one aside and back) to satisfy an import dependency that
+        never existed -- neo4j_flight_load_test.py reads airports and dates from
+        the database in on_start, not from a file. A plain import is enough, and
+        it no longer creates or deletes files in the working tree.
+        """
+        import neo4j_flight_load_test
 
-        # Mock the scenarios file
-        import sys
+        assert hasattr(neo4j_flight_load_test, "Neo4jUser")
+        user_class = neo4j_flight_load_test.Neo4jUser
 
-        original_file = Path("flight_test_scenarios.json")
-        backup_exists = original_file.exists()
+        # Should have required Locust methods
+        assert hasattr(user_class, "on_start")
+        assert hasattr(user_class, "on_stop")
+        assert hasattr(user_class, "wait_time")
 
-        if backup_exists:
-            # Temporarily move original
-            backup_file = Path("flight_test_scenarios.json.backup")
-            original_file.rename(backup_file)
-
-        try:
-            # Create temporary scenarios file
-            Path(temp_file).rename("flight_test_scenarios.json")
-
-            # Now import should work
-            import neo4j_flight_load_test
-
-            # Test class structure
-            assert hasattr(neo4j_flight_load_test, "Neo4jUser")
-            user_class = neo4j_flight_load_test.Neo4jUser
-
-            # Should have required Locust methods
-            assert hasattr(user_class, "on_start")
-            assert hasattr(user_class, "on_stop")
-            assert hasattr(user_class, "wait_time")
-
-            # Should have task methods
-            methods = [name for name in dir(user_class) if not name.startswith("_")]
-            task_methods = [
-                m
-                for m in methods
-                if hasattr(getattr(user_class, m), "locust_task_weight")
-            ]
-            assert (
-                len(task_methods) >= 2
-            )  # Should have multiple task types (direct + connection)
-
-        finally:
-            # Cleanup: restore original scenarios file if it existed
-            temp_scenarios_file = Path("flight_test_scenarios.json")
-            if temp_scenarios_file.exists():
-                temp_scenarios_file.unlink()
-
-            if backup_exists:
-                backup_file = Path("flight_test_scenarios.json.backup")
-                if backup_file.exists():
-                    backup_file.rename("flight_test_scenarios.json")
-
-            # Clear import cache
-            if "neo4j_flight_load_test" in sys.modules:
-                del sys.modules["neo4j_flight_load_test"]
+        # Should have task methods
+        methods = [name for name in dir(user_class) if not name.startswith("_")]
+        task_methods = [
+            m for m in methods if hasattr(getattr(user_class, m), "locust_task_weight")
+        ]
+        assert (
+            len(task_methods) >= 2
+        )  # Should have multiple task types (direct + connection)
 
     def test_query_construction_logic(self):
         """Test that queries can be constructed without syntax errors"""

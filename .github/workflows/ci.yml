@@ -216,7 +216,8 @@ jobs:
         # predate this job.
         pytest tests/test_graph_validation.py \
                tests/test_connection_logic.py \
-               tests/test_integration_heavy.py -v
+               tests/test_integration_heavy.py \
+               tests/test_documented_queries.py -v
 
   docker-build:
     runs-on: ubuntu-latest

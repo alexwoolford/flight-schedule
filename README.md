@@ -198,6 +198,9 @@ Then confirm the graph itself, in Neo4j Browser or `cypher-shell`:
 
 ```cypher
 MATCH (s:Schedule) RETURN count(s) AS schedules;
+```
+
+```cypher
 SHOW CONSTRAINTS;
 ```
 
@@ -283,10 +286,18 @@ MATCH (first:Schedule)-[:DEPARTS_FROM]->(:Airport {code: $origin})
 WHERE first.flightdate = date($date)
 MATCH p = (first)-[:CONNECTS_TO]->{0,2}(last:Schedule)
 MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dest})
-WITH p, nodes(p) AS legs, relationships(p) AS conns
+WITH nodes(p) AS legs, relationships(p) AS conns
+// No airport twice. The edge's backtrack guard is pairwise, so it does not
+// compose over 3+ legs: unguarded, 18% of {0,3} paths revisit an airport and
+// some fly back to the origin. Cypher's ACYCLIC path mode does NOT fix this —
+// the path's nodes are flights, always distinct; the repeat is an Airport
+// reached off-path.
+WITH legs, conns, [legs[0].origin] + [x IN legs | x.dest] AS airports
+WHERE size(airports) = size([i IN range(0, size(airports) - 1)
+                             WHERE NOT airports[i] IN airports[0..i]])
 RETURN size(legs) - 1 AS stops,
        [f IN legs | f.reporting_airline + toString(f.flight_number_reporting_airline)] AS flights,
-       [f IN legs | f.origin + '-' + f.dest] AS route,
+       airports AS route,
        reduce(t = 0, f IN legs | t + f.scheduled_duration_minutes) AS air_minutes,
        reduce(t = 0, c IN conns | t + c.layover_minutes) AS layover_minutes
 ORDER BY stops, air_minutes + layover_minutes
@@ -294,28 +305,35 @@ LIMIT 5
 ```
 
 `{0,2}` is direct + 1-stop + 2-stop. `{0,3}` adds another leg. Nothing else
-changes.
+changes. Add `AND first.scheduled_departure_time >= localdatetime($after)` to
+search by departure time, or filter on the last leg's arrival for a deadline —
+both forms, with their traps, are in the reference doc.
 
-Measured, LGA→DFW on 2025-07-18:
+**Latency, across 40 origin/destination pairs drawn from the graph's 60 busiest
+origins** — top-20 sorted, acyclicity guard on, warm cache:
 
-| query | wall clock | itineraries |
-|---|---|---|
-| QPP `{1,1}` (1-stop) | **185 ms** | 135 |
-| explicit 1-stop join | **182 ms** | 135 |
-| QPP `{0,2}` | **102 ms** | 1,736 |
-| QPP `{0,3}` | **492 ms** | 13,625 |
+| depth | p50 | p95 | max | over 200 ms |
+|---|---|---|---|---|
+| `{0,2}` | **36 ms** | **56 ms** | 124 ms | **0 / 40** |
+| `{0,3}` | **114 ms** | **218 ms** | 279 ms | **5 / 40** |
 
-At 1-stop it matches the hand-written join exactly — same 135 itineraries, same
-latency. Beyond 1-stop there is no join to compare against without hand-writing a
-new `MATCH` block per hop count. Across 12 routes at `{0,2}`: median **113 ms**.
+Two stops holds a 200 ms budget comfortably; three stops misses on ~12% of pairs,
+worst on dense hub-to-hub routes (LGA→DFW enumerates 11,488 itineraries to return
+20). Serve `{0,2}` by default and widen on demand.
 
-Where it earns its keep — routes with no nonstop at all:
+At 1-stop the QPP matches a hand-written explicit join exactly — same 135
+itineraries for LGA→DFW, same latency. Beyond 1-stop there is no join to compare
+against without hand-writing a new `MATCH` block per hop count, which is the whole
+point of the quantifier.
 
-| route | wall clock | best itinerary |
-|---|---|---|
-| GUM→BOS | **1.2 ms** | GUM-HNL, HNL-DEN, DEN-BOS |
-| FCA→SAV | **7.6 ms** | FCA-DEN, DEN-SAV |
-| BOI→ALB | **28.5 ms** | BOI-MDW, MDW-ALB |
+Where it earns its keep — routes with no nonstop at all, so multi-hop is the only
+answer:
+
+| route | best itinerary |
+|---|---|
+| GUM→BOS | GUM-HNL, HNL-DEN, DEN-BOS |
+| FCA→SAV | FCA-DEN, DEN-SAV |
+| BOI→ALB | BOI-MDW, MDW-ALB |
 
 **The `CONNECTS_TO` edge is what makes this work.** Writing the same QPP over
 `Schedule → Airport → Schedule` is 200-400x slower, because `Airport` is a
@@ -324,9 +342,15 @@ supernode with no date property: reaching a hub forces the next hop to bind
 that juncture and puts the connection rules in the edge, so no query can
 accidentally splice two unrelated carriers into an unsellable itinerary.
 
-> 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the full
-> measurements, the cost/scope tradeoff (a full year would be ~228M edges), how
-> the edges were validated against published airline route data, and why moving
+**What this does *not* model.** No price, no seat availability, no per-airport
+minimum connection time (a flat 45-300 minutes stands in), and no interline
+between unrelated carriers. It answers "is this flyable as scheduled", not "is
+this purchasable".
+
+> 📖 [ROUTING_QUERY_REFERENCE.md](ROUTING_QUERY_REFERENCE.md) has the
+> depart-after and arrive-before queries in full, the two silent traps in any
+> time filter, the acyclicity measurements, the cost/scope tradeoff, how the
+> edges were validated against published airline route data, and why moving
 > predicates inside the quantifier does *not* fix the supernode problem.
 >
 > The shipped load test (`neo4j_flight_load_test.py`) still uses an older
@@ -467,9 +491,6 @@ it has known sampling defects:
 Fixing these is a good first contribution. Until then, treat any figure it
 produces as a relative smoke test rather than a benchmark.
 
-`generate_flight_scenarios.py` writes `flight_test_scenarios.json`, but nothing
-reads that file — the load test queries the database directly.
-
 > 📖 See `LOAD_TESTING_GUIDE.md` for more detail (note it describes some options
 > that are not implemented).
 
@@ -516,7 +537,6 @@ Python.
 | `load_bts_data.py` | Loads Parquet into Neo4j via Spark; owns all schema setup |
 | `neo4j_flight_load_test.py` | Locust load test (see caveats above) |
 | `quick_load_test_analysis.py` | CLI summary of a Locust stats CSV |
-| `generate_flight_scenarios.py` | Writes `flight_test_scenarios.json` — currently unused by any script |
 
 There is no package or `src/` directory; the three pipeline scripts sit at the
 repo root and tests import them as modules.
