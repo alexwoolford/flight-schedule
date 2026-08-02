@@ -206,11 +206,19 @@ SHOW CONSTRAINTS;
 
 ## 🔍 Example Queries
 
+These are parameterised (`$origin`, `$dest`, `$date`, …) rather than written
+against a fixed route and date, because the loaded graph is whatever you loaded —
+a hard-coded `date('2025-01-15')` returns nothing on any other slice. In
+`cypher-shell`, set them with `:param origin => 'LGA'` first. Every block below
+is executed against the loaded fixture in CI by
+`tests/test_documented_queries.py`, so a copy-paste from this file parses, runs,
+and returns rows.
+
 ### Direct flights on a route and date
 
 ```cypher
-MATCH (:Airport {code: 'LGA'})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(:Airport {code: 'DFW'})
-WHERE s.flightdate = date('2025-01-15')
+MATCH (:Airport {code: $origin})<-[:DEPARTS_FROM]-(s:Schedule)-[:ARRIVES_AT]->(:Airport {code: $dest})
+WHERE s.flightdate = date($date)
 RETURN s.reporting_airline + toString(s.flight_number_reporting_airline) AS flight,
        s.scheduled_departure_time AS departs,
        s.scheduled_arrival_time AS arrives,
