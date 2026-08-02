@@ -7,6 +7,7 @@ Tests the core functionality of load_bts_data.py without requiring
 actual Spark or Neo4j connections.
 """
 
+import ast
 import os
 import sys
 import tempfile
@@ -21,8 +22,65 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import load_bts_data  # noqa: E402
 
 
+def _default_spark_config():
+    """The literal `default_config` dict from create_spark_session().
+
+    Parsed out of the source rather than obtained by calling the function,
+    because calling it starts a real JVM -- too slow and too heavy for the
+    DB-free gate, which must stay sub-second. `ast.literal_eval` also means a
+    typo that makes the dict non-literal fails here loudly instead of being
+    silently skipped.
+    """
+    source = (Path(__file__).parent.parent / "load_bts_data.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == "create_spark_session":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Assign) and any(
+                    getattr(target, "id", None) == "default_config"
+                    for target in sub.targets
+                ):
+                    return ast.literal_eval(sub.value)
+    raise AssertionError(
+        "could not find `default_config` in create_spark_session() -- if it was "
+        "renamed or made non-literal, update this helper rather than deleting "
+        "the timezone assertions it feeds."
+    )
+
+
 class TestSparkConfiguration:
     """Test Spark configuration building and validation"""
+
+    def test_timezone_semantics_are_pinned_not_inherited(self):
+        """The two keys that decide whether timestamps are zone-less.
+
+        BTS times are local wall clock at their own airport, and the Parquet
+        files carry `isAdjustedToUTC=false`, so reading them as TimestampNTZType
+        is the correct interpretation. Spark 3.5's default for
+        `inferTimestampNTZ.enabled` happens to be "true", which means the graph
+        is presently correct *by inheritance* -- exactly the kind of unchosen
+        dependency this asserts away.
+
+        Measured cost of losing it, on tests/fixtures/ with TZ=America/Denver:
+        crsdeptime reads as TimestampType, the loader machine's offset is baked
+        in, and `flightdate` moves for all 21,495 rows (2025-07-18 ->
+        2025-07-17). Since `flightdate` is one of the five composite-key fields,
+        the whole day shifts and --solve-offsets finds nothing.
+
+        Mutation-checked: flipping either value in load_bts_data.py fails this.
+        """
+        config = _default_spark_config()
+
+        assert config.get("spark.sql.parquet.inferTimestampNTZ.enabled") == "true", (
+            "spark.sql.parquet.inferTimestampNTZ.enabled must be pinned to "
+            "'true'. Without it BTS local times read as TimestampType and the "
+            "loader machine's UTC offset is baked into every timestamp -- "
+            "including flightdate, which is part of the composite key."
+        )
+        assert config.get("spark.sql.session.timeZone") == "UTC", (
+            "spark.sql.session.timeZone must be pinned to 'UTC' so the loader "
+            "cannot produce a machine-dependent graph. CI runs in UTC already, "
+            "so an unpinned value is invisible there and only bites on a laptop."
+        )
 
     def test_default_spark_config_structure(self):
         """Test default Spark configuration contains required keys"""

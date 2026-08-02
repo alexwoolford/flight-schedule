@@ -26,6 +26,10 @@ dependencies:
   - flake8=7.1.2
   - mypy=1.17.0
   - bandit=1.8.6
+  # CLAUDE.md documents `pre-commit run --all-files` as a project command, and
+  # .pre-commit-config.yaml gates the no-env-files secret check, so the tool
+  # belongs in the env rather than relying on a system-wide install.
+  - pre-commit=4.2.0
 
   # Optional: Development tools
   - jupyter

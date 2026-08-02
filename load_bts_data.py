@@ -197,6 +197,48 @@ def create_spark_session(app_name: str = "BTSFlightLoader", custom_config: dict 
         # === PARQUET OPTIMIZATION (Handle BTS timestamp issues) ===
         "spark.sql.parquet.enableVectorizedReader": "false",  # Disable for timestamp compatibility
         "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",  # Use microseconds
+        # === TIMEZONE SEMANTICS: both keys are load-bearing, not tuning ===
+        #
+        # BTS times are LOCAL wall clock at their own airport, and
+        # download_bts_flight_data.py writes them as `pa.timestamp("us")` with
+        # isAdjustedToUTC=false -- i.e. genuinely zone-less. Reading them as
+        # TimestampNTZType is therefore the *correct* interpretation, not a
+        # convenience.
+        #
+        # This is pinned rather than inherited because Spark 3.5's default
+        # happens to be "true": relying on it means the graph silently depends
+        # on a default we never chose.
+        #
+        # THE TWO KEYS BELOW ARE EACH INDEPENDENTLY SUFFICIENT. Measured on
+        # tests/fixtures/bts_flights_2025_07_18.parquet, TZ=America/Denver,
+        # hashing all 21,376 rows x 4 timestamps after the real transform:
+        #
+        #   inferTimestampNTZ | session.timeZone | result
+        #   ------------------+------------------+----------------------------
+        #   true              | UTC              | correct (44ee57ce...)
+        #   false             | UTC              | correct (44ee57ce...)
+        #   true              | <unset>          | correct (44ee57ce...)
+        #   false             | <unset>          | CORRUPT  (f2d10acd...)
+        #
+        # So this is genuine defence in depth, not redundancy: either key alone
+        # holds the line, and only losing both bakes the loader machine's offset
+        # into every timestamp. In that state:
+        #
+        #   DL31 ATL scheduled_departure_time  2025-07-18 20:30 -> 2025-07-17 13:30
+        #   flightdate for all 21,376 rows     2025-07-18       -> 2025-07-17
+        #
+        # The second line is the damaging one: `flightdate` is part of the
+        # 5-field composite key, so the whole day moves and --solve-offsets
+        # 2025-07-18 then finds nothing. That +7h shift is the same signature as
+        # the fabricated README block removed in f20f20c.
+        #
+        # Because either key masks the other, no end-to-end test can catch the
+        # removal of just one -- that is what
+        # test_timezone_semantics_are_pinned_not_inherited asserts on the config
+        # dict directly. The TZ-varied load step in ci.yml is the backstop for
+        # the both-gone case and for mechanisms we have not thought of.
+        "spark.sql.parquet.inferTimestampNTZ.enabled": "true",
+        "spark.sql.session.timeZone": "UTC",
         "spark.sql.parquet.int96TimestampConversion": "true",
         "spark.sql.parquet.writeLegacyFormat": "false",
         "spark.sql.parquet.mergeSchema": "false",  # Faster reads
@@ -1345,6 +1387,15 @@ def load_bts_data(
                 )
 
                 # Enhanced Fallback: Use aggressive compatibility settings for schema inference problems
+                #
+                # NOTE: the `spark.sql.*` keys below are passed as *reader*
+                # options, where they are inert -- DataFrameReader.option() sets
+                # per-source options, not session config. They are left in place
+                # because removing them would change nothing and this fallback
+                # only runs on already-broken input. What actually governs this
+                # path is the session config in create_spark_session(), which is
+                # the argument for pinning the timezone keys there rather than
+                # per-read: the fallback inherits them for free.
                 parquet_reader_fallback = (
                     spark.read.option(
                         "mergeSchema", "true"
@@ -1459,6 +1510,11 @@ def load_bts_data(
             # UTC ZonedDateTime — silently baking in the *loader machine's*
             # timezone and producing a different graph on a laptop than in a
             # container.
+            #
+            # to_timestamp_ntz secures the *write* side. The matching read side
+            # is `spark.sql.parquet.inferTimestampNTZ.enabled` in
+            # create_spark_session() — both are required, and that comment
+            # carries the measured cost of losing either.
             #
             # Do NOT subtract these two to get a flight duration: they are in
             # different timezones, so the result is wrong for ~50% of flights.

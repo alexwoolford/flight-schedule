@@ -8,6 +8,27 @@ repos:
       - id: check-added-large-files
       - id: check-toml
 
+  # Blocks the exact mechanism that leaked a live Neo4j password into this
+  # public repo's history: a stray `.env.backup`. .gitignore already covers
+  # `.env.*`, but `git add -f` overrides it and that is how the original
+  # commit happened. This hook does not care about -f. See CLAUDE.md.
+  #
+  # `files` is deliberately broad and the negative lookahead narrow: only
+  # `.env.example` (the committed template, which must hold placeholders) is
+  # allowed through. Add nothing else to it.
+  - repo: local
+    hooks:
+      - id: no-env-files
+        name: refuse to commit .env files (except .env.example)
+        entry: >-
+          A .env file is staged. These hold real credentials and must never be
+          committed -- this repo already leaked a live password this way, and
+          because it is public the value stayed fetchable by SHA even after the
+          history rewrite. Unstage it (git rm --cached <file>) and keep secrets
+          in your local .env only.
+        language: fail
+        files: '(^|/)\.env($|\.(?!example$))'
+
   - repo: https://github.com/psf/black
     rev: 25.1.0
     hooks:
