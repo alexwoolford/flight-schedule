@@ -279,6 +279,48 @@ class TestSearchableDates:
         assert not flight_search.is_searchable(far_off)
 
 
+class TestUnbuiltDateCoverage:
+    """A connecting search on an unbuilt date must refuse, not under-answer.
+
+    The nonstop leg of the query reads `Schedule` directly and never traverses
+    `CONNECTS_TO`, so before the coverage check a `{0,2}` search on a date with
+    flights but no connections returned *nonstops only* -- a well-formed,
+    plausible, silently incomplete answer. On the dev graph (a full year of
+    Schedule nodes, 7 dates of edges) that was 358 of 365 dates; measured
+    LGA->DFW on 2025-03-14, 18 results, all 0-stop.
+    """
+
+    def test_connecting_search_raises_on_an_unbuilt_date(self, graph):
+        unbuilt = (date.fromisoformat(FIXTURE_DATE) - timedelta(days=4000)).isoformat()
+        assert not flight_search.is_searchable(unbuilt)
+        with pytest.raises(flight_search.CoverageError, match="no CONNECTS_TO edges"):
+            search_itineraries(*CONNECTING_ROUTE, unbuilt, max_stops=2)
+
+    def test_nonstop_search_still_works_on_an_unbuilt_date(self, graph):
+        # The other half of the contract: max_stops=0 must keep working, because
+        # it is exactly as correct without connections as with them. Asserted on
+        # the one date this fixture has flights for, since a one-day fixture has
+        # no date that is unbuilt *and* has flights.
+        unbuilt = (date.fromisoformat(FIXTURE_DATE) - timedelta(days=4000)).isoformat()
+        assert search_itineraries(*NONSTOP_ROUTE, unbuilt, max_stops=0) == []
+
+    def test_the_fixture_date_itself_is_unaffected(self, graph):
+        # Anti-vacuity: proves the guard is scoped to unbuilt dates rather than
+        # refusing everything. A guard that rejected all dates would pass the
+        # test above and break the product.
+        results = search_itineraries(*CONNECTING_ROUTE, FIXTURE_DATE, max_stops=2)
+        assert results, "LGA->BOI must still route on the built fixture date"
+        assert any(
+            it.stops > 0 for it in results
+        ), "LGA->BOI has no nonstops, so connections must be reachable here"
+
+    def test_a_built_date_with_flights_is_not_refused_for_any_depth(self, graph):
+        # The probe is per-search, so a bug making it consult the wrong date or
+        # the wrong direction would show up as a refusal at some depth.
+        for max_stops in (0, 1, 2):
+            search_itineraries(*NONSTOP_ROUTE, FIXTURE_DATE, max_stops=max_stops)
+
+
 class TestApiAgainstRealData:
     @pytest.fixture(scope="class")
     def client(self, graph):
@@ -315,15 +357,62 @@ class TestApiAgainstRealData:
             assert isinstance(it["arrives_utc"], str)
             assert it["total_minutes"] == it["air_minutes"] + sum(it["layover_minutes"])
 
-    def test_unbuilt_date_is_distinguishable_from_no_routes(self, client):
+    def test_unbuilt_date_with_stops_is_409(self, client):
+        # Was an empty 200 carrying `date_is_searchable: false`. That was only
+        # ever adequate when the result really was empty -- on a date that has
+        # flights but no CONNECTS_TO edges the same request returned nonstops and
+        # a 200, i.e. a silently incomplete answer. The default max_stops is 2, so
+        # this is the shape a caller hits by picking a date off a calendar.
         far_off = (date.fromisoformat(FIXTURE_DATE) - timedelta(days=4000)).isoformat()
-        body = client.get(
+        response = client.get(
             "/itineraries",
             params={
                 "origin": CONNECTING_ROUTE[0],
                 "dest": CONNECTING_ROUTE[1],
                 "date": far_off,
             },
-        ).json()
+        )
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "CONNECTS_TO" in detail["error"]
+        # Actionable: the dates that would have worked, from the live graph.
+        assert FIXTURE_DATE in detail["searchable_dates"]
+
+    def test_nonstop_request_on_an_unbuilt_date_is_still_200(self, client):
+        # max_stops=0 needs no connections, so it must not be caught by the 409.
+        far_off = (date.fromisoformat(FIXTURE_DATE) - timedelta(days=4000)).isoformat()
+        response = client.get(
+            "/itineraries",
+            params={
+                "origin": NONSTOP_ROUTE[0],
+                "dest": NONSTOP_ROUTE[1],
+                "date": far_off,
+                "max_stops": 0,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
         assert body["count"] == 0
+        # The empty-result diagnostic still applies on this path.
         assert body["date_is_searchable"] is False
+
+    def test_empty_result_on_a_built_date_is_still_200_with_the_diagnostic(
+        self, client
+    ):
+        # Anti-vacuity for the pair above: a genuinely empty answer on a *built*
+        # date must stay a 200, so the 409 cannot be masking ordinary no-route
+        # results. LGA->LGA is rejected as 400, so use a real pair with no
+        # same-carrier routing rather than a degenerate one.
+        response = client.get(
+            "/itineraries",
+            params={
+                "origin": CONNECTING_ROUTE[0],
+                "dest": CONNECTING_ROUTE[1],
+                "date": FIXTURE_DATE,
+                "arrive_before": "00:01",
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 0
+        assert body["date_is_searchable"] is True

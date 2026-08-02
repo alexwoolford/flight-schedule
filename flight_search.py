@@ -64,15 +64,23 @@ from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
 # Serving default. Two stops is as deep as a US domestic itinerary plausibly
-# needs, and {0,3} costs far too much to be the default. Measured over 40 pairs
-# from the 60 busiest origins, repeat-warm, limit=20, guard on:
+# needs, and {0,3} costs far too much to be the default. Measured over 40 pairs,
+# repeat-warm, limit=20, guard on. Ranges are the spread over three runs, and the
+# two samples differ only in how hub-heavy they are — 40 pairs drawn from the 60
+# busiest origins, versus from the top 20:
 #
-#                     depart_after=08:00           whole day
-#   {0,2}    p50  35 ms  p95  64 ms   0/40 >200   p50  85 ms  p95 175 ms   0/40
-#   {0,3}    p50 116 ms  p95 243 ms   5/40 >200   p50 395 ms  p95 595 ms  34/40
+#                   depart_after=08:00                whole day
+#            p50      p95     >200      p50       p95       >200
+#   {0,2}  23-28    54-66     0/40    45-48    171-220     0-2/40   (top 60)
+#          41-44    61-67     0/40   118-125   194-253     1-3/40   (top 20)
+#   {0,3}  70-81   212-223   2-3/40  251-280   573-672    25-27/40  (top 60)
+#         140-154  232-243  12-14/40 492-506   635-657      39/40   (top 20)
 #
-# Two stops holds a 200 ms budget under both conditions; three stops misses on 85%
-# of pairs with no time filter. Depth stays a caller's explicit request.
+# Two stops with a departure-time filter is the only cell that holds 200 ms
+# unconditionally. Whole-day {0,2} sits *on* the budget rather than under it, so
+# don't quote it as "0 of 40" — that was one sample's luck. Three stops misses on
+# most pairs without a filter and on a third of them with one. Depth stays a
+# caller's explicit request.
 DEFAULT_MAX_STOPS = 2
 DEFAULT_LIMIT = 20
 
@@ -87,6 +95,27 @@ _driver_lock = threading.Lock()
 
 class SearchError(ValueError):
     """Invalid search input. Distinct from a driver or Cypher failure."""
+
+
+class CoverageError(SearchError):
+    """
+    Connections were requested on a date with no `CONNECTS_TO` edges.
+
+    A subclass of `SearchError` so existing callers keep mapping it to 4xx: the
+    date is outside what the graph can answer, which is a property of the
+    request, not a fault. `api.py` narrows it to 409 to say "valid request, this
+    date is not built" rather than "malformed input".
+
+    This exists because the failure it replaces was silent and worse than an
+    empty result. The nonstop leg of the search reads `Schedule` directly and
+    never traverses `CONNECTS_TO`, so on an unbuilt date a `{0,2}` search
+    returned *nonstops only* -- a plausible, well-formed, incomplete answer with
+    nothing to distinguish it from a full one. Measured on the dev graph:
+    LGA->DFW on 2025-03-14 returned 18 itineraries, all 0-stop, while the same
+    search on 2025-07-18 returned 22 nonstops among 500. 358 of the 365 loaded
+    dates behaved that way, so picking a date off a calendar in a demo silently
+    dropped every connecting itinerary.
+    """
 
 
 def get_driver():
@@ -381,6 +410,22 @@ def search_itineraries(
     driver = driver or get_driver()
     database = database or get_database()
 
+    # Refuse rather than under-answer. Only when connections are actually being
+    # asked for: a max_stops=0 search touches no CONNECTS_TO edge, so it is
+    # exactly as correct on an unbuilt date as on a built one and must keep
+    # working. Costs one indexed lookup that stops at the first row -- measured
+    # p50 0.39 ms on a built date, against a p50 of 34 ms for the whole {0,2}
+    # search -- so this is ~1% overhead to close a silent-wrong-answer hole.
+    if max_stops > 0 and not is_searchable(search_date, driver, database):
+        raise CoverageError(
+            f"{search_date} has no CONNECTS_TO edges, so a search allowing "
+            f"{max_stops} stop(s) could only return nonstops -- a silently "
+            "incomplete answer. Run load_bts_data.py --solve-offsets then "
+            "--build-connections for this date, use max_stops=0 to ask for "
+            "nonstops deliberately, or call searchable_dates() for the dates "
+            "that are built."
+        )
+
     query = build_search_query(min_stops, max_stops, depart_after, arrive_before)
     with driver.session(database=database) as session:
         return [_to_itinerary(record) for record in session.run(query, **params)]
@@ -404,19 +449,25 @@ def _to_itinerary(record) -> Itinerary:
 
 def is_searchable(date, driver=None, database: Optional[str] = None) -> bool:
     """
-    Whether `date` has `CONNECTS_TO` edges, i.e. whether searching it can return
-    anything at all.
+    Whether `date` has `CONNECTS_TO` edges, i.e. whether a connecting search on
+    it can return anything at all.
 
-    Cheap (one indexed lookup with `LIMIT 1`) and meant to be called only when a
-    search came back empty, to tell "no routes on this city pair" apart from "this
-    date was never built". Those are very different answers and both look like an
-    empty list.
+    On the serving path: `search_itineraries()` calls this before every search
+    that allows a stop, so it has to be genuinely cheap rather than merely
+    look it.
+
+    `RETURN true ... LIMIT 1`, not `RETURN count(*) > 0`. They give the same
+    answer and the second is 86x slower on a built date -- p50 33.6 ms against
+    0.39 ms -- because an aggregation cannot short-circuit: `count(*)` has to
+    drain all 623,508 edges for the date before there is anything to compare,
+    and the `LIMIT 1` then applies to the single aggregated row, far too late to
+    help. Existence questions must not be phrased as counts.
     """
     driver = driver or get_driver()
     database = database or get_database()
     query = """
     MATCH (s:Schedule {flightdate: date($date)})-[:CONNECTS_TO]->()
-    RETURN count(*) > 0 AS built LIMIT 1
+    RETURN true AS built LIMIT 1
     """
     with driver.session(database=database) as session:
         record = session.run(query, date=_normalise_date(date)).single()

@@ -161,9 +161,11 @@ supernode with no date property.
 - **Bottlenecks**: quantifier expansion, the per-path acyclicity guard, ranking
 - **Optimization**: `ORDER BY total_minutes LIMIT $limit` must plan as `Top`, not
   `Sort` — a bounded heap rather than buffering every path. Also gated.
-- **Serve `{0,2}`, not `{0,3}`**: measured over 40 pairs, `{0,2}` holds a 200 ms
-  p95 filtered or unfiltered; `{0,3}` is p95 595 ms unfiltered with 34 of 40 pairs
-  over 200 ms.
+- **Serve `{0,2}`, not `{0,3}`**: measured over 40 pairs, `{0,2}` holds a 200 ms p95
+  comfortably with a departure-time filter (54–66 ms) and marginally without one
+  (171–220 ms); `{0,3}` is p95 573–672 ms unfiltered with 25–27 of 40 pairs over
+  200 ms. Figures depend on the route mix as well as the filter — see the table in
+  `ROUTING_QUERY_REFERENCE.md` for both conditions.
 
 > ⚠️ Do **not** add `AND s.cancelled = 0` to any of these. Cancelled flights are
 > filtered out during loading and `cancelled` is never stored as a property, so

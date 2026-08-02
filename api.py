@@ -27,13 +27,19 @@ from fastapi import FastAPI, HTTPException, Query
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 import flight_search
-from flight_search import DEFAULT_LIMIT, DEFAULT_MAX_STOPS, SearchError
+from flight_search import (
+    DEFAULT_LIMIT,
+    DEFAULT_MAX_STOPS,
+    CoverageError,
+    SearchError,
+)
 
 # Bound on `max_stops`. Three stops is already beyond what a US domestic
 # itinerary plausibly needs, and the traversal cost grows fast enough that leaving
 # it unbounded would let one request degrade the service for everyone: measured
-# p95 595 ms at {0,3} against 175 ms at {0,2} with no departure-time filter (243 ms
-# vs 64 ms with one), and it keeps climbing with depth.
+# p95 573-672 ms at {0,3} against 171-220 ms at {0,2} with no departure-time filter
+# (212-223 ms vs 54-66 ms with one), and it keeps climbing with depth. Full table
+# and its conditions are on DEFAULT_MAX_STOPS in flight_search.py.
 MAX_ALLOWED_STOPS = 3
 MAX_ALLOWED_LIMIT = 100
 
@@ -102,6 +108,20 @@ def dates():
         raise HTTPException(status_code=503, detail=f"graph unavailable: {exc}")
 
 
+def _searchable_dates_or_none():
+    """
+    The searchable dates, or None if that lookup itself fails.
+
+    Same rule as the `date_is_searchable` diagnostic below: a helpful extra must
+    never convert a correct 409 into a 500. The caller already has the actionable
+    error text without this.
+    """
+    try:
+        return flight_search.searchable_dates()
+    except (ServiceUnavailable, Neo4jError, RuntimeError):
+        return None
+
+
 @app.get("/itineraries")
 def itineraries(
     origin: str = Query(..., description="3-letter IATA origin, e.g. LGA"),
@@ -127,9 +147,15 @@ def itineraries(
     absolute instants, which is what to compare across timezones.
 
     An empty `itineraries` list is a valid answer — plenty of city pairs genuinely
-    have no same-carrier routing within the layover window on a given day. But an
-    unbuilt date returns empty too, so on a zero-result search the response also
-    carries `date_is_searchable`, which distinguishes the two.
+    have no same-carrier routing within the layover window on a given day. On a
+    zero-result search the response also carries `date_is_searchable`, which tells
+    "no routes on this pair" apart from a date this graph cannot route on.
+
+    A date with no `CONNECTS_TO` edges is a **409**, not an empty 200, whenever
+    `max_stops > 0`. Such a search can only reach nonstops, and returning those as
+    if they were the whole answer is the one silently-wrong result this service
+    could produce. Ask for `max_stops=0` to request nonstops deliberately, or see
+    `GET /dates`.
     """
     try:
         results = flight_search.search_itineraries(
@@ -141,6 +167,19 @@ def itineraries(
             max_stops=max_stops,
             min_stops=min_stops,
             limit=limit,
+        )
+    except CoverageError as exc:
+        # Must precede SearchError — CoverageError subclasses it. 409 rather than
+        # 400: the request is well-formed and the date is real, but this graph
+        # holds connections for only 7 of the 365 loaded dates, so answering
+        # would mean returning nonstops only and calling it a complete result.
+        # `searchable_dates` is echoed because the fix is to pick one of them.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(exc),
+                "searchable_dates": _searchable_dates_or_none(),
+            },
         )
     except SearchError as exc:
         # The caller's input is wrong, not the service — 400, with the reason.

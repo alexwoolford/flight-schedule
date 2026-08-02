@@ -30,15 +30,35 @@ class FakeResult(list):
 
 
 class FakeSession:
-    """Captures the query and params a call would have sent."""
+    """Captures the query and params a call would have sent.
 
-    def __init__(self, records=None):
+    `search_itineraries` asks `is_searchable()` whether the date has any
+    CONNECTS_TO edges before running any search that allows a stop, so this fake
+    has to answer that probe as well as the search. It reports the date as built
+    by default -- the interesting assertions here are about the search query, and
+    a fake that answered "not built" would make every one of them raise
+    CoverageError instead. `coverage=False` opts into the other case.
+
+    `search_calls` excludes the probe, so index 0 is the search regardless of
+    whether the probe ran (it does not when max_stops=0).
+    """
+
+    _PROBE_MARKER = "RETURN true AS built"
+
+    def __init__(self, records=None, coverage=True):
         self.records = records or []
+        self.coverage = coverage
         self.calls = []
 
     def run(self, query, **params):
         self.calls.append((query, params))
+        if self._PROBE_MARKER in query:
+            return FakeResult([{"built": True}] if self.coverage else [])
         return FakeResult(self.records)
+
+    @property
+    def search_calls(self):
+        return [c for c in self.calls if self._PROBE_MARKER not in c[0]]
 
     def __enter__(self):
         return self
@@ -48,8 +68,8 @@ class FakeSession:
 
 
 class FakeDriver:
-    def __init__(self, records=None):
-        self.session_obj = FakeSession(records)
+    def __init__(self, records=None, coverage=True):
+        self.session_obj = FakeSession(records, coverage=coverage)
         self.sessions = 0
 
     def session(self, **kwargs):
@@ -63,7 +83,7 @@ class TestAirportNormalisation:
         flight_search.search_itineraries(
             " lga ", "boi", "2025-07-18", driver=driver, database="neo4j"
         )
-        _, params = driver.session_obj.calls[0]
+        _, params = driver.session_obj.search_calls[0]
         assert params["origin"] == "LGA"
         assert params["dest"] == "BOI"
 
@@ -92,7 +112,7 @@ class TestDateAndTimeNormalisation:
             flight_search.search_itineraries(
                 "LGA", "BOI", value, driver=driver, database="neo4j"
             )
-            assert driver.session_obj.calls[-1][1]["date"] == "2025-07-18"
+            assert driver.session_obj.search_calls[-1][1]["date"] == "2025-07-18"
 
     @pytest.mark.parametrize(
         "bad", ["18/07/2025", "2025-13-01", "July 18", "", 20250718]
@@ -113,7 +133,10 @@ class TestDateAndTimeNormalisation:
             driver=driver,
             database="neo4j",
         )
-        assert driver.session_obj.calls[0][1]["depart_after"] == "2025-07-18T09:00:00"
+        assert (
+            driver.session_obj.search_calls[0][1]["depart_after"]
+            == "2025-07-18T09:00:00"
+        )
 
     def test_full_timestamp_is_passed_through(self):
         # The escape hatch for "allow landing after midnight": a caller who wants
@@ -128,7 +151,10 @@ class TestDateAndTimeNormalisation:
             driver=driver,
             database="neo4j",
         )
-        assert driver.session_obj.calls[0][1]["arrive_before"] == "2025-07-19T02:00:00"
+        assert (
+            driver.session_obj.search_calls[0][1]["arrive_before"]
+            == "2025-07-19T02:00:00"
+        )
 
     @pytest.mark.parametrize("bad", ["9am", "25:00", "noon", "9", ""])
     def test_bad_times_are_rejected(self, bad):
@@ -250,11 +276,51 @@ class TestSearchExecution:
         # Iterative deepening was measured far slower at the tail (p95 1,323ms vs
         # 63ms with a morning departure filter) and gives up global ranking. If
         # someone reintroduces the loop, this fails.
+        #
+        # Counts *search* queries, not all queries: the coverage probe is a
+        # deliberate second round trip (p50 0.39 ms) and would otherwise mask a
+        # reintroduced per-depth loop by making the total 2 either way. One
+        # traversal is the property under test.
         driver = FakeDriver()
         flight_search.search_itineraries(
             "LGA", "BOI", "2025-07-18", max_stops=2, driver=driver, database="neo4j"
         )
+        assert len(driver.session_obj.search_calls) == 1
+        # And exactly one probe — not one per depth either.
+        assert len(driver.session_obj.calls) == 2
+
+    def test_nonstop_search_skips_the_coverage_probe(self):
+        # max_stops=0 touches no CONNECTS_TO edge, so it is exactly as correct on
+        # an unbuilt date as a built one and must not pay for the probe or be
+        # refused by it. This is what keeps 358 of the 365 loaded dates usable
+        # for nonstop lookups.
+        driver = FakeDriver(coverage=False)
+        flight_search.search_itineraries(
+            "LGA", "BOI", "2025-07-18", max_stops=0, driver=driver, database="neo4j"
+        )
         assert len(driver.session_obj.calls) == 1
+        assert len(driver.session_obj.search_calls) == 1
+
+    def test_connecting_search_on_an_unbuilt_date_raises_rather_than_underanswers(
+        self,
+    ):
+        # The bug this guards: the nonstop leg reads Schedule directly and never
+        # traverses CONNECTS_TO, so before this check a {0,2} search on an
+        # unbuilt date returned nonstops only -- a plausible, well-formed,
+        # silently incomplete answer. Measured LGA->DFW 2025-03-14: 18 results,
+        # all 0-stop, indistinguishable from a complete one.
+        driver = FakeDriver(coverage=False)
+        with pytest.raises(flight_search.CoverageError, match="no CONNECTS_TO edges"):
+            flight_search.search_itineraries(
+                "LGA", "BOI", "2025-03-14", max_stops=2, driver=driver, database="neo4j"
+            )
+        # Refused before the traversal, not after filtering its results.
+        assert driver.session_obj.search_calls == []
+
+    def test_coverage_error_is_a_search_error(self):
+        # Subclassing matters for callers that already catch SearchError: they
+        # must not start seeing an unhandled exception because of this change.
+        assert issubclass(flight_search.CoverageError, SearchError)
 
     def test_records_become_itineraries(self):
         record = {
@@ -373,6 +439,69 @@ class TestApiStatusMapping:
         )
         assert response.status_code == 400
         assert "IATA" in response.json()["detail"]
+
+    def test_unbuilt_date_with_stops_is_409_not_an_empty_200(self, client, monkeypatch):
+        import api
+
+        def boom(**kwargs):
+            raise api.CoverageError("2025-03-14 has no CONNECTS_TO edges")
+
+        monkeypatch.setattr(api.flight_search, "search_itineraries", boom)
+        monkeypatch.setattr(
+            api.flight_search, "searchable_dates", lambda: ["2025-07-18"]
+        )
+        response = client.get(
+            "/itineraries",
+            params={"origin": "LGA", "dest": "BOI", "date": "2025-03-14"},
+        )
+        # 409, not 400: the request is well-formed and the date is real. And not
+        # an empty 200, which is what it used to be -- worse, a 200 carrying
+        # nonstops only, which looks like a complete answer.
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "CONNECTS_TO" in detail["error"]
+        # The actionable part: which dates would have worked.
+        assert detail["searchable_dates"] == ["2025-07-18"]
+
+    def test_coverage_error_precedes_search_error_in_the_handler(
+        self, client, monkeypatch
+    ):
+        # CoverageError subclasses SearchError, so an `except SearchError` placed
+        # first would swallow it and report 400. Ordering is the whole test.
+        import api
+
+        def boom(**kwargs):
+            raise api.CoverageError("unbuilt")
+
+        monkeypatch.setattr(api.flight_search, "search_itineraries", boom)
+        monkeypatch.setattr(api.flight_search, "searchable_dates", lambda: [])
+        response = client.get(
+            "/itineraries",
+            params={"origin": "LGA", "dest": "BOI", "date": "2025-03-14"},
+        )
+        assert response.status_code == 409, "SearchError handler caught it first"
+
+    def test_searchable_dates_failure_still_yields_409(self, client, monkeypatch):
+        # The dates list is a nicety; losing it must not turn a correct 409 into
+        # a 500. Same rule as the date_is_searchable diagnostic.
+        from neo4j.exceptions import ServiceUnavailable
+
+        import api
+
+        def boom(**kwargs):
+            raise api.CoverageError("unbuilt")
+
+        def dead():
+            raise ServiceUnavailable("dropped")
+
+        monkeypatch.setattr(api.flight_search, "search_itineraries", boom)
+        monkeypatch.setattr(api.flight_search, "searchable_dates", dead)
+        response = client.get(
+            "/itineraries",
+            params={"origin": "LGA", "dest": "BOI", "date": "2025-03-14"},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["searchable_dates"] is None
 
     def test_out_of_range_stops_is_422(self, client):
         response = client.get(
