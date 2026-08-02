@@ -195,6 +195,35 @@ python download_bts_flight_data.py --year 2024 --month 3
 Property names are the BTS CSV column names lowercased with spaces → underscores.
 `load_bts_data.py` is authoritative; `CLAUDE.md` has the full detail.
 
+#### ⏱️ Two lessons from pinning the loader's timestamp semantics
+
+Both are general; neither is about timestamps specifically.
+
+1. **A default you rely on but never set is not a decision — it's a bet.** The
+   loader read BTS times correctly only because Spark 3.5 happens to default
+   `spark.sql.parquet.inferTimestampNTZ.enabled` to `true`. Nothing in the repo
+   set it, nothing tested it, and no comment mentioned it. The code was right and
+   the *reason* it was right was invisible, which is indistinguishable from luck.
+   Both governing keys are now explicit in `create_spark_session()` with the
+   measured cost of losing them.
+
+2. **A gate that runs in only one environment cannot see an environment bug.**
+   CI ran on `ubuntu-latest`, i.e. UTC — the single timezone in which correct and
+   offset-baked code paths produce identical output. Every gate would have stayed
+   green while a laptop load produced a different graph. The `integration-test`
+   job now runs `TZ: America/Denver` deliberately.
+
+There's a corollary worth internalising: **defence in depth defeats end-to-end
+testing.** Those two keys are each independently sufficient, so removing one
+changes no observable output and no integration test can catch it. Redundant
+protection has to be asserted *structurally* — on the config itself — not
+behaviourally. When you add a second safeguard, add a test that the first one
+still exists.
+
+Also note: `spark.sql.*` keys passed to `DataFrameReader.option()` are **inert**.
+Reader options are per-source, not session config. There are several in the
+fallback reader that look load-bearing and do nothing.
+
 #### 🚀 Spark Loading Best Practice:
 **CRITICAL**: Schema (constraints and indexes) are automatically managed by the Python loading scripts:
 
@@ -427,15 +456,32 @@ pre-commit run --all-files
 
 ### 🚨 CI.yml Compliance Status Check
 
-**BEFORE COMMITTING**, verify your changes pass CI by running this quick command:
+**BEFORE COMMITTING**, verify your changes pass CI by running this quick command.
+It mirrors the `test` job's file list exactly — the version that used to be here
+named 8 files against CI's 13 and silently skipped six, so check
+`.github/workflows/ci.yml` if you suspect these have drifted again:
+
 ```bash
 echo "🔍 CI.yml Compliance Check" && \
-pytest tests/test_ci_unit.py tests/test_flight_search_unit.py tests/test_download_bts_unit.py tests/test_load_bts_unit.py tests/test_system_validation_unit.py tests/test_data_transformations.py tests/test_business_rules.py tests/test_error_scenarios.py --quiet && \
+pytest tests/test_ci_unit.py tests/test_flight_search_unit.py \
+       tests/test_download_bts_unit.py tests/test_load_bts_unit.py \
+       tests/test_system_validation_unit.py \
+       tests/test_flight_search_service_unit.py \
+       tests/test_business_rules.py tests/test_data_quality_checks.py \
+       tests/test_data_transformations.py tests/test_environment_scenarios.py \
+       tests/test_error_scenarios.py tests/test_performance_boundaries.py \
+       tests/test_pipeline_integration.py --quiet && \
+pytest tests/test_load_testing_framework.py --quiet && \
 black --check . && \
 isort --check-only . && \
 flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics && \
 echo "✅ CI.yml WILL PASS - Safe to commit!"
 ```
+
+Note the **second `pytest` invocation is a separate process on purpose** — folding
+`test_load_testing_framework.py` into the first list makes the run *hang* rather
+than fail, because locust gevent-patches `threading` and deadlocks FastAPI's
+`TestClient`. CI keeps them separate for the same reason.
 
 If ANY step fails, you MUST fix it before committing. The CI will fail otherwise.
 

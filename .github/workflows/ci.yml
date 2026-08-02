@@ -188,6 +188,19 @@ jobs:
       NEO4J_DATABASE: neo4j
       # The date held by tests/fixtures/bts_flights_2025_07_18.parquet.
       FIXTURE_DATE: "2025-07-18"
+      # Deliberately NOT UTC. GitHub runners default to UTC, which is the one
+      # zone where a timezone bug in the loader is invisible: correct and
+      # offset-baked code paths agree there. Denver reproduces the exact +7h
+      # signature of the fabricated README block removed in f20f20c, so if the
+      # loader ever starts writing zoned timestamps, `flightdate` lands on
+      # 2025-07-17 and the "Verify the graph is actually loaded" step below
+      # fails on FIXTURE_DATE instead of the whole job passing on a shifted day.
+      #
+      # This is a backstop, not the primary gate: the two Spark keys that
+      # prevent it each independently suffice (see create_spark_session), so
+      # removing just one is invisible end-to-end and is caught by
+      # test_timezone_semantics_are_pinned_not_inherited instead.
+      TZ: America/Denver
 
     steps:
     - uses: actions/checkout@v4
