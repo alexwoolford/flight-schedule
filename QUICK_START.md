@@ -66,7 +66,9 @@ LIMIT 5;
 > time at the origin and arrival is local time at the destination, so the
 > difference is wrong whenever the two airports are in different timezones.
 > `scheduled_duration_minutes` is BTS's own reported block time, which is
-> timezone- and DST-independent.
+> timezone- and DST-independent. If you need to compare or subtract instants
+> across airports, use the `scheduled_departure_utc` / `scheduled_arrival_utc`
+> pair that `--solve-offsets` writes.
 
 See [README.md](README.md) for the multi-hop routing query.
 

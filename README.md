@@ -268,16 +268,24 @@ Direct, 1-stop, or 2-stop itineraries from **one query with one number to change
 query until you build the edges. Pass every date you intend to search:
 
 ```bash
+# Offsets first — the layover arithmetic reads the UTC properties this writes.
+python load_bts_data.py --solve-offsets 2025-07-18
 python load_bts_data.py --build-connections 2025-07-18
-python load_bts_data.py --build-connections 2025-07-14 2025-07-15 2025-07-16   # several at once
+
+# Several at once, same ordering:
+python load_bts_data.py --solve-offsets 2025-07-14 2025-07-15 2025-07-16
+python load_bts_data.py --build-connections 2025-07-14 2025-07-15 2025-07-16
 ```
 
 That materialises `(:Schedule)-[:CONNECTS_TO {layover_minutes}]->(:Schedule)` for
 every bookable connection — same carrier or its wholly-owned regional affiliate,
-45-300 minute layover, no backtracking, no overnight inbound leg. Measured over
-2025-07-14…20: **514K-625K edges per day** (mean 577K; the spread is real weekday
-/ weekend schedule variation, lowest on Saturday the 19th), ~7s per date,
+45-300 minute layover measured in **UTC**, no backtracking. Measured over
+2025-07-14…20: **512K-624K edges per day** (mean 575K; the spread is real weekday
+/ weekend schedule variation, lowest on Saturday the 19th), ~9s per date,
 idempotent.
+
+`--build-connections` raises if a date has flights but no UTC timestamps, rather
+than writing zero edges and reporting success.
 
 Scoping is deliberate. A full year would be ~211M edges — roughly 10x the rest of
 the graph — and a date-specific search never touches them. But it does mean the
@@ -416,7 +424,9 @@ enforced by the `schedule_composite_unique` constraint. Minting a synthetic
 |---|---|---|
 | `flightdate` | `Date` | |
 | `scheduled_departure_time` | `LocalDateTime` | local wall-clock **at the origin** |
-| `scheduled_arrival_time` | `LocalDateTime` | local wall-clock **at the destination** |
+| `scheduled_arrival_time` | `LocalDateTime` | local wall-clock **at the destination**, on the destination's calendar day |
+| `scheduled_departure_utc` | `LocalDateTime` | the same instant in UTC — written by `--solve-offsets` |
+| `scheduled_arrival_utc` | `LocalDateTime` | the same instant in UTC — **compare across airports with these** |
 | `scheduled_duration_minutes` | `Integer` | BTS scheduled block time — **use this for duration** |
 | `actual_duration_minutes` | `Integer` | BTS actual elapsed time |
 | `origin`, `dest` | `String` | IATA codes (also reachable via relationships) |
@@ -425,14 +435,19 @@ enforced by the `schedule_composite_unique` constraint. Minting a synthetic
 
 Property names are BTS CSV column names, lowercased with spaces → underscores.
 
-> ⚠️ **Never compute a flight duration as arrival − departure.** The two
-> timestamps are local to *different* airports, so their difference is wrong
-> for every flight that crosses a timezone — roughly half the dataset. Use
-> `scheduled_duration_minutes`, which is BTS's own reported block time and is
-> both timezone- and DST-independent.
+> ⚠️ **There are two time frames, and mixing them is the one way to get a wrong
+> answer.** Subtracting the *local* pair (`scheduled_arrival_time −
+> scheduled_departure_time`) is wrong for every flight that crosses a timezone —
+> roughly half the dataset — because the two clocks belong to different airports.
+> Subtract the **UTC** pair instead, or just read `scheduled_duration_minutes`
+> (BTS's own block time, timezone- and DST-independent). Both agree exactly:
+> verified on all 21,376 flights of the CI fixture.
 >
-> Layover arithmetic at a connecting hub *is* sound, because both timestamps
-> there are local to the same airport.
+> Use the local pair only for questions a passenger asks in local terms —
+> "departs after 09:00", "arrives before 15:00". Those are sound, including for
+> red-eyes: `--solve-offsets` stamps each arrival on the **destination's**
+> calendar day, so no overnight guard is needed. Layovers at a hub are sound in
+> either frame, since both clocks there belong to the same airport.
 
 ## 🧪 Testing
 

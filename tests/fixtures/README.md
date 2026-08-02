@@ -27,13 +27,16 @@ nothing. Measured on this day:
 
 | property | count | gates |
 |---|---|---|
-| legs whose stored arrival precedes departure and reconcile as true overnights | 893 | `test_connects_to_has_no_overnight_inbound_legs` |
+| legs landing on a later local day than they departed | 915 | `test_connects_to_has_no_overnight_inbound_legs`, `test_deadline_query_needs_no_overnight_guard` |
 | `CONNECTS_TO` edges joining a mainline to its wholly-owned regional (AA↔MQ/OH) | 110,642 | `test_connects_to_carrier_is_sellable` |
 | distinct airports acting as a connecting hub | 341 | `test_connects_to_hubs_are_real` |
+| airports reachable in the UTC-offset solve, in one component | 341 | `test_solves_every_airport_in_the_data` |
+| airports whose offset spans the dateline (GUM, SPN) | 2 | `test_dateline_airports_are_normalised` |
 
-Both test methods assert those counts are non-zero as well as asserting the
-defect is absent, so replacing this fixture with a day lacking either property
-fails loudly rather than silently weakening the suite.
+Those test methods assert the counts are non-zero as well as asserting the defect
+is absent, so replacing this fixture with a day lacking any of these properties
+fails loudly rather than silently weakening the suite. The dateline pair matters
+in particular: without GUM/SPN the offset normalisation is never exercised.
 
 ### Regenerating
 
@@ -64,9 +67,16 @@ pq.write_table(
 ```bash
 python load_bts_data.py --single-file bts_flights_2025_07_18.parquet \
                         --data-path tests/fixtures
+python load_bts_data.py --solve-offsets 2025-07-18      # must precede the next
 python load_bts_data.py --build-connections 2025-07-18
 ```
 
+`--solve-offsets` is not optional and must run first: it writes the
+`scheduled_*_utc` properties that `--build-connections` computes layovers from, and
+repairs the local arrival date. Skipping it makes `--build-connections` raise
+rather than silently build nothing.
+
 Produces 21,376 `Schedule`, 341 `Airport`, 14 `Carrier`, 5,325 `ROUTE` and
-625,220 `CONNECTS_TO` in about 35 seconds. The loader is **not idempotent** for
-`Schedule` (see `CLAUDE.md`), so load into an empty database.
+623,508 `CONNECTS_TO` in about 35 seconds. The loader is **not idempotent** for
+`Schedule` (see `CLAUDE.md`), so load into an empty database. `--solve-offsets`
+*is* idempotent — re-running it is a fixed point.

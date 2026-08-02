@@ -132,47 +132,41 @@ class TestBasicConnectivity:
             ).single()["count"]
             if total == 0:
                 pytest.skip("No CONNECTS_TO edges — see --build-connections")
-            # s1's stored arrival is local at the hub with no timezone, so its
-            # DATE is unreliable. scheduled_duration_minutes (BTS
-            # CRSElapsedTime) is timezone-independent: a negative apparent
-            # duration that reconciles with the block time once a day is added
-            # means s1 really lands the NEXT morning, so a same-day connection
-            # off it is not bookable. This caught 17,502 false edges (3.29%).
+            # An inbound leg that lands the day AFTER the outbound departs cannot
+            # be connected off, and the UTC instants settle it exactly: the
+            # builder computes its layover as a positive UTC interval, so such an
+            # edge cannot exist. Earlier revisions of this test asked the same
+            # question with a block-time heuristic on the local pair, which
+            # tolerated only +/-180 minutes of timezone skew and missed the
+            # widest spans -- it passed while 11,975 such edges were in the graph.
             false_edges = session.run(
                 """
-                MATCH (s1:Schedule)-[r:CONNECTS_TO]->()
-                WITH r, duration.inSeconds(s1.scheduled_departure_time,
-                                           s1.scheduled_arrival_time
-                                           ).seconds / 60 AS apparent,
-                     s1.scheduled_duration_minutes AS block
-                WHERE apparent < 0 AND abs(apparent + 1440 - block) <= 180
+                MATCH (s1:Schedule)-[r:CONNECTS_TO]->(s2:Schedule)
+                WHERE s1.scheduled_arrival_utc >= s2.scheduled_departure_utc
                 RETURN count(r) AS count
                 """
             ).single()["count"]
             # Anti-vacuity: the assertion above is only meaningful if the graph
-            # actually contains overnight legs for the builder to have excluded.
-            # On a dataset with none it would pass no matter what the builder
-            # did. One BTS day holds ~900 of them (893 on 2025-07-18).
+            # actually contains legs landing on a later local day for the builder
+            # to have excluded. On a dataset with none it would pass no matter
+            # what the builder did. One BTS day holds ~900 (915 on 2025-07-18).
             overnight_legs = session.run(
                 """
                 MATCH (s:Schedule)
-                WITH duration.inSeconds(s.scheduled_departure_time,
-                                        s.scheduled_arrival_time
-                                        ).seconds / 60 AS apparent,
-                     s.scheduled_duration_minutes AS block
-                WHERE apparent < 0 AND abs(apparent + 1440 - block) <= 180
+                WHERE date(s.scheduled_arrival_time) > s.flightdate
                 RETURN count(*) AS count
                 """
             ).single()["count"]
 
         assert false_edges == 0, (
-            f"{false_edges:,} of {total:,} CONNECTS_TO edges connect off an "
-            "inbound leg that actually arrives the next calendar day"
+            f"{false_edges:,} of {total:,} CONNECTS_TO edges depart at or before "
+            "their inbound leg lands, in UTC. These are absolute instants, so "
+            "this is not a timezone artefact — the connection is unflyable."
         )
         assert overnight_legs > 0, (
-            "No overnight legs in the graph at all, so the assertion above "
-            "proves nothing — the dataset under test cannot detect a "
-            "regression in the builder's overnight exclusion"
+            "No leg in the graph lands on a later local day than it departed, so "
+            "the assertion above proves nothing — this dataset cannot detect a "
+            "regression in the builder's cross-midnight handling"
         )
 
     def test_connects_to_carrier_is_sellable(
@@ -602,33 +596,37 @@ class TestDeadlineFilters:
             "cannot demonstrate that the localdatetime form matches rows"
         )
 
-    def test_deadline_query_excludes_overnight_final_legs(
+    def test_deadline_query_needs_no_overnight_guard(
         self, neo4j_driver, neo4j_database, loaded_graph
     ):
-        """A deadline filter must reject legs that land the following day"""
+        """Overnight terminal legs fail a same-day deadline on their own
+
+        This test previously asserted the OPPOSITE -- that overnight terminal legs
+        wrongly passed a "< 15:00" filter -- and required every deadline query to
+        carry a guard. That was a symptom of the loader stamping the arrival with
+        the ORIGIN's date. `--solve-offsets` now rewrites the local arrival off the
+        UTC instant, so its date is the destination's and the guard is unnecessary.
+        See "Deadline filters" in ROUTING_QUERY_REFERENCE.md.
+
+        Every query-side guard tried here was wrong, which is why the fix moved
+        into the loader: a ±180-minute block-time tolerance cannot span the widest
+        US offset gaps (HNL->DFW needs 240-360), and
+        `date(arrival_utc) = date(departure_utc)` tests UTC midnight rather than
+        local -- on 2025-07-18 it drops 3,135 ordinary evening flights and admits
+        876 real red-eyes.
+        """
         with neo4j_driver.session(database=neo4j_database) as session:
             total = session.run(
                 "MATCH ()-[r:CONNECTS_TO]->() RETURN count(r) AS count"
             ).single()["count"]
             if total == 0:
                 pytest.skip("No CONNECTS_TO edges — see --build-connections")
-            # CONNECTS_TO excludes overnight INBOUND legs, but the final leg of
-            # an itinerary is nobody's inbound, so it keeps the origin-derived
-            # date. A red-eye landing 00:01 the next morning is stored as 00:01
-            # on the departure date and passes "< 15:00". Measured on
-            # 2025-07-18: 862 of 16,212 terminal legs (5.32%).
             record = session.run(
                 """
                 MATCH ()-[:CONNECTS_TO]->(f:Schedule)
                 WITH DISTINCT f
-                WITH f, duration.inSeconds(f.scheduled_departure_time,
-                                           f.scheduled_arrival_time
-                                           ).seconds / 60 AS apparent
-                WITH f, apparent,
-                     apparent < 0
-                     AND abs(apparent + 1440
-                             - f.scheduled_duration_minutes) <= 180 AS overnight
-                WITH f, overnight,
+                WITH f, date(f.scheduled_arrival_time) > f.flightdate
+                        AS overnight,
                      f.scheduled_arrival_time
                        < localdatetime(toString(f.flightdate) + 'T15:00:00')
                      AS before_cutoff
@@ -639,18 +637,20 @@ class TestDeadlineFilters:
                 """
             ).single()
 
-        # Anti-vacuity: without overnight terminal legs in the graph, a deadline
-        # query with no guard would pass this file and still be wrong in
-        # production. Assert the hazard is present before asserting it is handled.
+        # Anti-vacuity: without overnight terminal legs in the graph this test
+        # passes while checking nothing, and a regression in the date repair
+        # would be undetectable. Assert the hazard exists before asserting it is
+        # handled.
         assert record["overnights"] > 0, (
-            f"None of the {record['terminal_legs']:,} terminal legs is an "
-            "overnight, so this dataset cannot detect a deadline query that "
-            "forgets the overnight guard"
+            f"None of the {record['terminal_legs']:,} terminal legs lands on the "
+            "following local day, so this dataset cannot detect a regression in "
+            "the arrival-date repair"
         )
-        assert record["false_accepts"] > 0, (
-            "No overnight terminal leg falls before the 15:00 cutoff, so the "
-            "guard documented in ROUTING_QUERY_REFERENCE.md is untestable "
-            "against this dataset"
+        assert record["false_accepts"] == 0, (
+            f"{record['false_accepts']:,} of {record['overnights']:,} overnight "
+            "terminal legs still satisfy a same-day 15:00 deadline. The local "
+            "arrival date is not the destination's -- run --solve-offsets, or "
+            "the repair in write_utc_times() has regressed."
         )
 
     def test_documented_deadline_query_is_correct(
@@ -705,13 +705,8 @@ class TestDeadlineFilters:
                                         ).seconds / 60 AS apparent,
                      s1.scheduled_duration_minutes
                        + s2.scheduled_duration_minutes AS block,
-                     duration.inSeconds(s2.scheduled_departure_time,
-                                        s2.scheduled_arrival_time
-                                        ).seconds / 60 AS final_apparent
-                WITH d, s1, s2, apparent, block,
-                     final_apparent < 0
-                     AND abs(final_apparent + 1440
-                             - s2.scheduled_duration_minutes) <= 180 AS overnight
+                     date(s2.scheduled_arrival_time) > s2.flightdate AS overnight
+                WITH d, s1, s2, apparent, block, overnight
                 WITH d, s1.origin AS origin, s2.dest AS dest, count(*) AS options,
                      max(abs(apparent - block)) AS tz_skew,
                      sum(CASE WHEN overnight THEN 1 ELSE 0 END) AS overnights,
@@ -742,15 +737,11 @@ class TestDeadlineFilters:
                     MATCH p = (first)-[:CONNECTS_TO]->{1,2}(last:Schedule)
                     MATCH (last)-[:ARRIVES_AT]->(:Airport {code: $dst})
                     WITH nodes(p) AS legs, relationships(p) AS conns, last AS f
+                    // One predicate, no overnight guard: the stored arrival now
+                    // carries the DESTINATION's date, so a red-eye compares as
+                    // the next day. The assertions below re-derive the true
+                    // arrival independently and would catch it if it did not.
                     WHERE f.scheduled_arrival_time < localdatetime($deadline)
-                      AND NOT (
-                          duration.inSeconds(f.scheduled_departure_time,
-                                             f.scheduled_arrival_time
-                                             ).seconds / 60 < 0
-                      AND abs(duration.inSeconds(f.scheduled_departure_time,
-                                                 f.scheduled_arrival_time
-                                                 ).seconds / 60
-                              + 1440 - f.scheduled_duration_minutes) <= 180)
                     RETURN size(legs) - 1 AS stops,
                            [x IN legs | x.origin] AS origins,
                            [x IN legs | x.dest] AS dests,
@@ -763,6 +754,12 @@ class TestDeadlineFilters:
                                               f.scheduled_arrival_time
                                               ).seconds / 60 AS final_apparent,
                            f.scheduled_duration_minutes AS final_block,
+                           // Independent ground truth for the overnight check:
+                           // the true elapsed local days, from the UTC instants
+                           // plus the block time, not from the stored local pair.
+                           duration.inSeconds(legs[0].scheduled_departure_utc,
+                                              f.scheduled_arrival_utc
+                                              ).seconds / 60 AS utc_elapsed,
                            reduce(t = 0, x IN legs |
                                   t + x.scheduled_duration_minutes) +
                            reduce(t = 0, c IN conns |
@@ -806,26 +803,27 @@ class TestDeadlineFilters:
                 f"{where}: returned an itinerary arriving {row['arrival']}, "
                 f"past the deadline"
             )
-            # Comparing the STORED arrival against the cutoff cannot detect an
-            # overnight: its date is a day early, so it looks earlier than the
-            # deadline, which is precisely the bug. Recompute the overnight test
-            # from block time -- the same evidence the builder uses -- so this
-            # assertion is independent of the query under test.
-            assert not (
-                row["final_apparent"] < 0
-                and abs(row["final_apparent"] + 1440 - row["final_block"]) <= 180
-            ), (
-                f"{where}: itinerary ending {row['dests'][-1]} arrives "
-                f"{row['arrival']}, but its final leg departs later than it "
-                "lands and the block time reconciles a day later — it really "
-                "arrives the NEXT day and misses the deadline. The overnight "
-                "guard is missing from the query."
-            )
             # Recompute the journey from its parts. A range check alone is too
             # weak: endpoint subtraction lands inside any plausible range on
             # plenty of routes, so it would pass while being wrong. Exact
             # equality against sum(blocks) + sum(layovers) does not.
             expected = sum(row["blocks"]) + sum(row["layovers"])
+            # The stored arrival is what the query filtered on, so re-checking it
+            # against the cutoff proves nothing. Re-derive the journey from the
+            # UTC instants instead: they are real timestamps, so their difference
+            # must equal the same blocks-plus-layovers total. Because the deadline
+            # is derived from a genuinely achievable same-day arrival, an
+            # itinerary that truly lands the next day cannot satisfy both this and
+            # the cutoff above. This is the assertion that fails if the
+            # arrival-date repair regresses to the origin's date.
+            assert row["utc_elapsed"] == expected, (
+                f"{where}: itinerary ending {row['dests'][-1]} reports arrival "
+                f"{row['arrival']}, but its UTC instants span "
+                f"{row['utc_elapsed']} min against {expected} min of block time "
+                "plus layovers. The stored local arrival and the UTC pair "
+                "disagree, so one is wrong — most likely the arrival-date repair "
+                "in write_utc_times() has regressed."
+            )
             assert row["total_minutes"] == expected, (
                 f"{where}: journey reported as {row['total_minutes']} min but "
                 f"its {len(row['blocks'])} block times and "
